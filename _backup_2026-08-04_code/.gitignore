@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+.cache/
+*.grib
+ERA5_ClimateTool/**/*.nc
+ERA5_ClimateTool/**/tmp_*/
+*.part
+.env
+.cdsapirc

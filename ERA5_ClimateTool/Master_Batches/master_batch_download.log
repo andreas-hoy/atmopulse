@@ -1,0 +1,247 @@
+2026-07-13 08:56:15,196 | INFO | Starte gebündelten Dekaden-Download (1940-2025) für Pan-Europa
+2026-07-13 08:56:15,198 | INFO | DEKADE | Verarbeite Block 2020 bis 2025
+2026-07-13 08:56:15,198 | INFO | START | Beantrage Batch: era5_surface_extreme_batch_2020_2025.nc
+2026-07-13 08:56:16,152 | INFO | Request ID is 73131537-37fd-45b3-9799-58e863c3c913
+2026-07-13 08:56:16,475 | INFO | status has been updated to accepted
+2026-07-13 08:56:38,112 | INFO | status has been updated to running
+2026-07-13 09:14:46,408 | INFO | status has been updated to successful
+2026-07-13 09:14:46,687 | INFO | Downloading https://object-store.os-api.cci2.ecmwf.int:443/cci2-prod-cache-1/2026-07-13/4ee5092291cb9d9171154d951f5a6fd2.zip
+2026-07-13 09:16:53,173 | INFO | DONE | era5_surface_extreme_batch_2020_2025.nc | 932.0 MiB | 20.6 min
+2026-07-13 09:16:53,175 | INFO | START | Beantrage Batch: era5_z500_batch_2020_2025.nc
+2026-07-13 09:16:54,340 | INFO | Request ID is 7245c4e0-7bed-44ed-92e4-88a3e9385503
+2026-07-13 09:16:54,471 | INFO | status has been updated to accepted
+2026-07-13 09:17:10,261 | INFO | status has been updated to running
+2026-07-13 09:27:20,816 | INFO | status has been updated to successful
+2026-07-13 09:27:23,735 | INFO | Downloading https://object-store.os-api.cci2.ecmwf.int:443/cci2-prod-cache-3/2026-07-13/addd3807d9f392f23015bae98b5c8531.nc
+2026-07-13 09:27:46,590 | INFO | DONE | era5_z500_batch_2020_2025.nc | 294.8 MiB | 10.9 min
+2026-07-13 09:27:46,591 | INFO | DEKADE | Verarbeite Block 2010 bis 2019
+2026-07-13 09:27:46,592 | INFO | START | Beantrage Batch: era5_surface_extreme_batch_2010_2019.nc
+2026-07-13 09:27:48,916 | ERROR | FAILED | era5_surface_extreme_batch_2010_2019.nc
+Traceback (most recent call last):
+  File "C:\Users\liina\Andreas ERA5\era5_master_decade_downloader.py", line 59, in retrieve_batch
+    client.retrieve(dataset, request, str(part))
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\legacy_client.py", line 167, in retrieve
+    submitted = self.client.submit_and_wait_on_results(
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\client.py", line 430, in submit_and_wait_on_results
+    return self._retrieve_api.submit(collection_id, request).get_results()
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 753, in submit
+    return self.get_process(collection_id).submit(request)
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 316, in submit
+    job = Job.from_request(
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 176, in from_request
+    cads_raise_for_status(response)
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 99, in cads_raise_for_status
+    raise requests.HTTPError(message, response=response)
+requests.exceptions.HTTPError: 403 Client Error: Forbidden for url: https://cds.climate.copernicus.eu/api/retrieve/v1/processes/reanalysis-era5-single-levels/execution
+cost limits exceeded
+Your request is too large, please reduce your selection.
+2026-07-13 09:27:48,938 | INFO | START | Beantrage Batch: era5_z500_batch_2010_2019.nc
+2026-07-13 09:27:49,476 | INFO | Request ID is cb7fae88-b39b-4443-94fe-87ca7b8f8f8e
+2026-07-13 09:27:49,606 | INFO | status has been updated to accepted
+2026-07-13 09:28:04,147 | INFO | status has been updated to running
+2026-07-13 09:42:15,027 | INFO | status has been updated to successful
+2026-07-13 09:42:15,317 | INFO | Downloading https://object-store.os-api.cci2.ecmwf.int:443/cci2-prod-cache-3/2026-07-13/6aac38b1cc1baa939074317001e0653c.nc
+2026-07-13 09:42:59,920 | INFO | DONE | era5_z500_batch_2010_2019.nc | 476.2 MiB | 15.2 min
+2026-07-13 09:42:59,922 | INFO | DEKADE | Verarbeite Block 2000 bis 2009
+2026-07-13 09:42:59,922 | INFO | START | Beantrage Batch: era5_surface_extreme_batch_2000_2009.nc
+2026-07-13 09:43:00,348 | ERROR | FAILED | era5_surface_extreme_batch_2000_2009.nc
+Traceback (most recent call last):
+  File "C:\Users\liina\Andreas ERA5\era5_master_decade_downloader.py", line 59, in retrieve_batch
+    client.retrieve(dataset, request, str(part))
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\legacy_client.py", line 167, in retrieve
+    submitted = self.client.submit_and_wait_on_results(
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\client.py", line 430, in submit_and_wait_on_results
+    return self._retrieve_api.submit(collection_id, request).get_results()
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 753, in submit
+    return self.get_process(collection_id).submit(request)
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 316, in submit
+    job = Job.from_request(
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 176, in from_request
+    cads_raise_for_status(response)
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 99, in cads_raise_for_status
+    raise requests.HTTPError(message, response=response)
+requests.exceptions.HTTPError: 403 Client Error: Forbidden for url: https://cds.climate.copernicus.eu/api/retrieve/v1/processes/reanalysis-era5-single-levels/execution
+cost limits exceeded
+Your request is too large, please reduce your selection.
+2026-07-13 09:43:00,349 | INFO | START | Beantrage Batch: era5_z500_batch_2000_2009.nc
+2026-07-13 09:43:00,848 | INFO | Request ID is 08d072ef-787b-46c1-bb4b-3734f79ad8fc
+2026-07-13 09:43:03,191 | INFO | status has been updated to accepted
+2026-07-13 09:43:18,928 | INFO | status has been updated to running
+2026-07-13 09:57:31,479 | INFO | status has been updated to successful
+2026-07-13 09:57:31,978 | INFO | Downloading https://object-store.os-api.cci2.ecmwf.int:443/cci2-prod-cache-2/2026-07-13/21cb78fbb94d262b520541c891e8ee85.nc
+2026-07-13 09:59:11,234 | INFO | DONE | era5_z500_batch_2000_2009.nc | 469.4 MiB | 16.2 min
+2026-07-13 09:59:11,235 | INFO | DEKADE | Verarbeite Block 1990 bis 1999
+2026-07-13 09:59:11,236 | INFO | START | Beantrage Batch: era5_surface_extreme_batch_1990_1999.nc
+2026-07-13 09:59:11,991 | ERROR | FAILED | era5_surface_extreme_batch_1990_1999.nc
+Traceback (most recent call last):
+  File "C:\Users\liina\Andreas ERA5\era5_master_decade_downloader.py", line 59, in retrieve_batch
+    client.retrieve(dataset, request, str(part))
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\legacy_client.py", line 167, in retrieve
+    submitted = self.client.submit_and_wait_on_results(
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\client.py", line 430, in submit_and_wait_on_results
+    return self._retrieve_api.submit(collection_id, request).get_results()
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 753, in submit
+    return self.get_process(collection_id).submit(request)
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 316, in submit
+    job = Job.from_request(
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 176, in from_request
+    cads_raise_for_status(response)
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 99, in cads_raise_for_status
+    raise requests.HTTPError(message, response=response)
+requests.exceptions.HTTPError: 403 Client Error: Forbidden for url: https://cds.climate.copernicus.eu/api/retrieve/v1/processes/reanalysis-era5-single-levels/execution
+cost limits exceeded
+Your request is too large, please reduce your selection.
+2026-07-13 09:59:11,992 | INFO | START | Beantrage Batch: era5_z500_batch_1990_1999.nc
+2026-07-13 09:59:12,461 | INFO | Request ID is 1a2a8b60-6c7a-43ee-8ecb-45477f877ed1
+2026-07-13 09:59:12,591 | INFO | status has been updated to accepted
+2026-07-13 09:59:34,827 | INFO | status has been updated to running
+2026-07-13 10:13:43,382 | INFO | status has been updated to successful
+2026-07-13 10:13:44,882 | INFO | Downloading https://object-store.os-api.cci2.ecmwf.int:443/cci2-prod-cache-1/2026-07-13/745e95bfbc387bd52ec217afafbd0bc7.nc
+2026-07-13 10:14:48,721 | INFO | DONE | era5_z500_batch_1990_1999.nc | 477.0 MiB | 15.6 min
+2026-07-13 10:14:48,722 | INFO | DEKADE | Verarbeite Block 1980 bis 1989
+2026-07-13 10:14:48,722 | INFO | START | Beantrage Batch: era5_surface_extreme_batch_1980_1989.nc
+2026-07-13 10:14:49,494 | ERROR | FAILED | era5_surface_extreme_batch_1980_1989.nc
+Traceback (most recent call last):
+  File "C:\Users\liina\Andreas ERA5\era5_master_decade_downloader.py", line 59, in retrieve_batch
+    client.retrieve(dataset, request, str(part))
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\legacy_client.py", line 167, in retrieve
+    submitted = self.client.submit_and_wait_on_results(
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\client.py", line 430, in submit_and_wait_on_results
+    return self._retrieve_api.submit(collection_id, request).get_results()
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 753, in submit
+    return self.get_process(collection_id).submit(request)
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 316, in submit
+    job = Job.from_request(
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 176, in from_request
+    cads_raise_for_status(response)
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 99, in cads_raise_for_status
+    raise requests.HTTPError(message, response=response)
+requests.exceptions.HTTPError: 403 Client Error: Forbidden for url: https://cds.climate.copernicus.eu/api/retrieve/v1/processes/reanalysis-era5-single-levels/execution
+cost limits exceeded
+Your request is too large, please reduce your selection.
+2026-07-13 10:14:49,495 | INFO | START | Beantrage Batch: era5_z500_batch_1980_1989.nc
+2026-07-13 10:14:50,044 | INFO | Request ID is b3fc53d1-dc8f-49b4-a0cf-6658da5fd655
+2026-07-13 10:14:50,183 | INFO | status has been updated to accepted
+2026-07-13 10:15:25,165 | INFO | status has been updated to running
+2026-07-13 10:29:17,365 | INFO | status has been updated to successful
+2026-07-13 10:29:17,735 | INFO | Downloading https://object-store.os-api.cci2.ecmwf.int:443/cci2-prod-cache-2/2026-07-13/1edda5eb3eeddcb93a07ec8408d7bb19.nc
+2026-07-13 10:29:49,388 | INFO | DONE | era5_z500_batch_1980_1989.nc | 470.1 MiB | 15.0 min
+2026-07-13 10:29:49,388 | INFO | DEKADE | Verarbeite Block 1970 bis 1979
+2026-07-13 10:29:49,389 | INFO | START | Beantrage Batch: era5_surface_extreme_batch_1970_1979.nc
+2026-07-13 10:29:49,835 | ERROR | FAILED | era5_surface_extreme_batch_1970_1979.nc
+Traceback (most recent call last):
+  File "C:\Users\liina\Andreas ERA5\era5_master_decade_downloader.py", line 59, in retrieve_batch
+    client.retrieve(dataset, request, str(part))
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\legacy_client.py", line 167, in retrieve
+    submitted = self.client.submit_and_wait_on_results(
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\client.py", line 430, in submit_and_wait_on_results
+    return self._retrieve_api.submit(collection_id, request).get_results()
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 753, in submit
+    return self.get_process(collection_id).submit(request)
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 316, in submit
+    job = Job.from_request(
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 176, in from_request
+    cads_raise_for_status(response)
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 99, in cads_raise_for_status
+    raise requests.HTTPError(message, response=response)
+requests.exceptions.HTTPError: 403 Client Error: Forbidden for url: https://cds.climate.copernicus.eu/api/retrieve/v1/processes/reanalysis-era5-single-levels/execution
+cost limits exceeded
+Your request is too large, please reduce your selection.
+2026-07-13 10:29:49,836 | INFO | START | Beantrage Batch: era5_z500_batch_1970_1979.nc
+2026-07-13 10:29:51,915 | WARNING | Recovering from HTTP error [502 Bad Gateway], attempt 1 of 500
+2026-07-13 10:29:51,915 | WARNING | Retrying in 120 seconds
+2026-07-13 10:31:51,917 | INFO | Retrying now...
+2026-07-13 10:31:52,718 | INFO | Request ID is ce8df742-901d-451b-88c9-ccc06a820ca2
+2026-07-13 10:31:52,858 | INFO | status has been updated to accepted
+2026-07-13 10:33:11,651 | INFO | status has been updated to running
+2026-07-13 10:50:22,694 | INFO | status has been updated to successful
+2026-07-13 10:50:22,984 | INFO | Downloading https://object-store.os-api.cci2.ecmwf.int:443/cci2-prod-cache-2/2026-07-13/dbbaba80da9bcdb560ed11c318b2fc88.nc
+2026-07-13 10:51:01,733 | INFO | DONE | era5_z500_batch_1970_1979.nc | 477.3 MiB | 21.2 min
+2026-07-13 10:51:01,734 | INFO | DEKADE | Verarbeite Block 1960 bis 1969
+2026-07-13 10:51:01,735 | INFO | START | Beantrage Batch: era5_surface_extreme_batch_1960_1969.nc
+2026-07-13 10:51:02,255 | ERROR | FAILED | era5_surface_extreme_batch_1960_1969.nc
+Traceback (most recent call last):
+  File "C:\Users\liina\Andreas ERA5\era5_master_decade_downloader.py", line 59, in retrieve_batch
+    client.retrieve(dataset, request, str(part))
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\legacy_client.py", line 167, in retrieve
+    submitted = self.client.submit_and_wait_on_results(
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\client.py", line 430, in submit_and_wait_on_results
+    return self._retrieve_api.submit(collection_id, request).get_results()
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 753, in submit
+    return self.get_process(collection_id).submit(request)
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 316, in submit
+    job = Job.from_request(
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 176, in from_request
+    cads_raise_for_status(response)
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 99, in cads_raise_for_status
+    raise requests.HTTPError(message, response=response)
+requests.exceptions.HTTPError: 403 Client Error: Forbidden for url: https://cds.climate.copernicus.eu/api/retrieve/v1/processes/reanalysis-era5-single-levels/execution
+cost limits exceeded
+Your request is too large, please reduce your selection.
+2026-07-13 10:51:02,257 | INFO | START | Beantrage Batch: era5_z500_batch_1960_1969.nc
+2026-07-13 10:51:02,675 | INFO | Request ID is 20e69ff7-74c9-4884-abab-65430233fff1
+2026-07-13 10:51:03,415 | INFO | status has been updated to accepted
+2026-07-13 10:51:26,063 | INFO | status has been updated to running
+2026-07-13 11:07:29,857 | INFO | status has been updated to successful
+2026-07-13 11:07:30,127 | INFO | Downloading https://object-store.os-api.cci2.ecmwf.int:443/cci2-prod-cache-3/2026-07-13/a0ca129f7b2b882f13afc6000c10db5b.nc
+2026-07-13 11:08:29,313 | INFO | DONE | era5_z500_batch_1960_1969.nc | 469.6 MiB | 17.5 min
+2026-07-13 11:08:29,313 | INFO | DEKADE | Verarbeite Block 1950 bis 1959
+2026-07-13 11:08:29,315 | INFO | START | Beantrage Batch: era5_surface_extreme_batch_1950_1959.nc
+2026-07-13 11:08:30,148 | ERROR | FAILED | era5_surface_extreme_batch_1950_1959.nc
+Traceback (most recent call last):
+  File "C:\Users\liina\Andreas ERA5\era5_master_decade_downloader.py", line 59, in retrieve_batch
+    client.retrieve(dataset, request, str(part))
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\legacy_client.py", line 167, in retrieve
+    submitted = self.client.submit_and_wait_on_results(
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\client.py", line 430, in submit_and_wait_on_results
+    return self._retrieve_api.submit(collection_id, request).get_results()
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 753, in submit
+    return self.get_process(collection_id).submit(request)
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 316, in submit
+    job = Job.from_request(
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 176, in from_request
+    cads_raise_for_status(response)
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 99, in cads_raise_for_status
+    raise requests.HTTPError(message, response=response)
+requests.exceptions.HTTPError: 403 Client Error: Forbidden for url: https://cds.climate.copernicus.eu/api/retrieve/v1/processes/reanalysis-era5-single-levels/execution
+cost limits exceeded
+Your request is too large, please reduce your selection.
+2026-07-13 11:08:30,150 | INFO | START | Beantrage Batch: era5_z500_batch_1950_1959.nc
+2026-07-13 11:08:30,668 | INFO | Request ID is 40541262-1c94-4fe6-b551-132d002c6f93
+2026-07-13 11:08:30,798 | INFO | status has been updated to accepted
+2026-07-13 11:08:55,200 | INFO | status has been updated to running
+2026-07-13 11:27:09,026 | INFO | status has been updated to successful
+2026-07-13 11:27:09,296 | INFO | Downloading https://object-store.os-api.cci2.ecmwf.int:443/cci2-prod-cache-2/2026-07-13/343362dc94af298d019daee49f907ee2.nc
+2026-07-13 11:27:59,280 | INFO | DONE | era5_z500_batch_1950_1959.nc | 468.4 MiB | 19.5 min
+2026-07-13 11:27:59,281 | INFO | DEKADE | Verarbeite Block 1940 bis 1949
+2026-07-13 11:27:59,282 | INFO | START | Beantrage Batch: era5_surface_extreme_batch_1940_1949.nc
+2026-07-13 11:27:59,310 | WARNING | Recovering from connection error [('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))], attempt 1 of 500
+2026-07-13 11:27:59,312 | WARNING | Retrying in 120 seconds
+2026-07-13 11:29:59,319 | INFO | Retrying now...
+2026-07-13 11:30:00,300 | ERROR | FAILED | era5_surface_extreme_batch_1940_1949.nc
+Traceback (most recent call last):
+  File "C:\Users\liina\Andreas ERA5\era5_master_decade_downloader.py", line 59, in retrieve_batch
+    client.retrieve(dataset, request, str(part))
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\legacy_client.py", line 167, in retrieve
+    submitted = self.client.submit_and_wait_on_results(
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\client.py", line 430, in submit_and_wait_on_results
+    return self._retrieve_api.submit(collection_id, request).get_results()
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 753, in submit
+    return self.get_process(collection_id).submit(request)
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 316, in submit
+    job = Job.from_request(
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 176, in from_request
+    cads_raise_for_status(response)
+  File "C:\Users\liina\miniconda3\envs\cee_env\lib\site-packages\ecmwf\datastores\processing.py", line 99, in cads_raise_for_status
+    raise requests.HTTPError(message, response=response)
+requests.exceptions.HTTPError: 403 Client Error: Forbidden for url: https://cds.climate.copernicus.eu/api/retrieve/v1/processes/reanalysis-era5-single-levels/execution
+cost limits exceeded
+Your request is too large, please reduce your selection.
+2026-07-13 11:30:00,301 | INFO | START | Beantrage Batch: era5_z500_batch_1940_1949.nc
+2026-07-13 11:30:00,750 | INFO | Request ID is b3561aef-03aa-4ba9-8846-2b354b5e808f
+2026-07-13 11:30:00,900 | INFO | status has been updated to accepted
+2026-07-13 11:30:25,106 | INFO | status has been updated to running
+2026-07-13 11:48:35,646 | INFO | status has been updated to successful
+2026-07-13 11:48:35,896 | INFO | Downloading https://object-store.os-api.cci2.ecmwf.int:443/cci2-prod-cache-2/2026-07-13/2ff60156d981f82a9f2f74585fb7a39f.nc
+2026-07-13 11:49:33,127 | INFO | DONE | era5_z500_batch_1940_1949.nc | 466.4 MiB | 19.5 min
+2026-07-13 11:49:33,127 | INFO | Master-Download beendet. Alle Dekaden-Pakete wurden verarbeitet.
