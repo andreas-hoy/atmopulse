@@ -1,10 +1,27 @@
+# Python & Environments
 .venv/
+venv/
 __pycache__/
 *.py[cod]
 .cache/
+
+# AtmoPulse Raw Data & Binaries
 *.grib
+*.nc
+*.parquet
+*.zarr/
+*.zarr
+*.part
+
+# Specific Tool Directories
 ERA5_ClimateTool/**/*.nc
 ERA5_ClimateTool/**/tmp_*/
-*.part
+
+# Security & API Keys
 .env
 .cdsapirc
+
+# Additional API Credentials & Logs
+.ecmwfapirc
+*.log
+_backup_*/

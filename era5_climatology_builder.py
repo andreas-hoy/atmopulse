@@ -14,16 +14,34 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 OUT_FILE = OUT_DIR / "climatology_reference.nc"
 TEMP_PROGRESS_FILE = OUT_DIR / "climatology_progress_temp.nc"
 
+
+def _harmonize_master_batch(ds):
+    """Normalize time-dim naming across the unified master batches
+    (era5_master_daily_YYYY.nc) and reconcile ERA5T's expver axis, same as
+    backend_maps.py's loader."""
+    if "time" in ds.dims and "valid_time" not in ds.dims:
+        ds = ds.rename({"time": "valid_time"})
+    if "expver" in ds.dims:
+        ds = ds.dropna(dim="expver", how="all").isel(expver=0)
+        if "expver" in ds.coords:
+            ds = ds.drop_vars("expver")
+    if "pressure_level" in ds.dims and ds.sizes.get("pressure_level", 0) == 1:
+        ds = ds.squeeze("pressure_level", drop=True)
+    return ds
+
+
 def build_climatology():
     print("🚀 Starte beschleunigten Climatology Builder (inkl. P5/P95 & Auto-Resume)...")
-    
-    txtn_files = sorted(list(DATA_DIR.glob("era5_txtn_batch_*.nc")))
-    if not txtn_files:
-        raise FileNotFoundError(f"Keine Batches gefunden in {DATA_DIR}")
-    
+
+    master_files = sorted(list(DATA_DIR.glob("era5_master_daily_*.nc")))
+    if not master_files:
+        raise FileNotFoundError(f"Keine era5_master_daily_*.nc Batches gefunden in {DATA_DIR}")
+
     # 1. Metadaten lazily laden und sortieren
     print("Lese Dateistrukturen...")
-    ds = xr.open_mfdataset(txtn_files, combine='nested', concat_dim='valid_time')
+    ds = xr.open_mfdataset(
+        master_files, combine='nested', concat_dim='valid_time', preprocess=_harmonize_master_batch,
+    )
     ds = ds.sortby('valid_time')
     
     # Zeitachsen extrahieren
@@ -106,26 +124,26 @@ def build_climatology():
             print(f"Lade JJA & DJF für Epoche {ep_name}...")
             
             # Masken auf NumPy-Ebene für Speed
+            # Daily TX (JJA) / TN (DJF) are now true 24h daily statistics
+            # from the master batches (one value per calendar day) — no more
+            # combining two 12h "since previous post-processing" steps.
             jja_idx = np.where((years >= start_yr) & (years <= end_yr) & (np.isin(times.month, [6, 7, 8])))[0]
-            ds_jja = ds.isel(valid_time=jja_idx).compute()
-            tx_jja = ds_jja['mx2t'].values - 273.15
-            
-            # Gebündelte Berechnung
+            tx_jja = ds.isel(valid_time=jja_idx)["tx"].values - 273.15
+
             tx_pcts = np.nanpercentile(tx_jja, [75, 90, 95], axis=0)
             ds_clim[f"tx_p75_{ep_name}"] = (("latitude", "longitude"), tx_pcts[0])
             ds_clim[f"tx_p90_{ep_name}"] = (("latitude", "longitude"), tx_pcts[1])
             ds_clim[f"tx_p95_{ep_name}"] = (("latitude", "longitude"), tx_pcts[2])
-            del ds_jja, tx_jja, tx_pcts
-            
+            del tx_jja, tx_pcts
+
             djf_idx = np.where((years >= start_yr) & (years <= end_yr) & (np.isin(times.month, [12, 1, 2])))[0]
-            ds_djf = ds.isel(valid_time=djf_idx).compute()
-            tn_djf = ds_djf['mn2t'].values - 273.15
-            
+            tn_djf = ds.isel(valid_time=djf_idx)["tn"].values - 273.15
+
             tn_pcts = np.nanpercentile(tn_djf, [5, 10, 25], axis=0)
             ds_clim[f"tn_p5_{ep_name}"]  = (("latitude", "longitude"), tn_pcts[0])
             ds_clim[f"tn_p10_{ep_name}"] = (("latitude", "longitude"), tn_pcts[1])
             ds_clim[f"tn_p25_{ep_name}"] = (("latitude", "longitude"), tn_pcts[2])
-            del ds_djf, tn_djf, tn_pcts
+            del tn_djf, tn_pcts
 
     # --- TEIL 2: GLEITENDE FENSTER (HIGH SPEED & CHECKPOINT) ---
     print("\n--- TEIL 2: Berechne tägliche 5-Tage-Fenster ---")
@@ -155,8 +173,8 @@ def build_climatology():
         
         # Daten für diese Indizes physisch in RAM laden
         ds_win = ds.isel(valid_time=win_idx).compute()
-        tx_win = ds_win['mx2t'].values - 273.15
-        tn_win = ds_win['mn2t'].values - 273.15
+        tx_win = ds_win['tx'].values - 273.15
+        tn_win = ds_win['tn'].values - 273.15
         win_years = years[win_idx]
         
         idx = target_doy - 1

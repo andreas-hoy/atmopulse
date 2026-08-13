@@ -1,1 +1,0 @@
-TX/TN use ERA5 parameters affected by the known +1-hour time-assignment issue. Prototype use only; replace before beta/production.
