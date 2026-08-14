@@ -1,251 +1,192 @@
+#!/usr/bin/env python3
+"""
+AtmoPulse Backend: High-Performance Climatology Builder
+- Single-Variable RAM-Load Architektur (Beseitigt I/O Flaschenhals)
+- Speichert exaktes Datum (YYYYMMDD) für Rekorde
+- Mit Live-Timer pro Verarbeitungsschritt
+"""
+
 import xarray as xr
 import numpy as np
 import pandas as pd
 from pathlib import Path
 import os
+import gc
+import time
 import warnings
 
-# Unterdrückt Warnungen für Ozean-Pixel (All-NaN)
 warnings.filterwarnings('ignore', message='All-NaN slice encountered')
+warnings.filterwarnings('ignore', category=RuntimeWarning) 
 
 DATA_DIR = Path("ERA5_ClimateTool/Master_Batches")
 OUT_DIR = Path("ERA5_ClimateTool/Reference_Climatology")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 OUT_FILE = OUT_DIR / "climatology_reference.nc"
-TEMP_PROGRESS_FILE = OUT_DIR / "climatology_progress_temp.nc"
+TEMP_FILE = OUT_DIR / "climatology_progress_temp.nc"
 
+EPOCH_A = (1961, 1990)
+EPOCH_B = (1996, 2025)
+PARAMS = ['tx', 'tn', 'tg', 't850']
+PCTS_DOY = [5, 10, 25, 75, 90, 95]
+PCTS_DJF = [5, 10, 25]
+PCTS_JJA = [75, 90, 95]
+CUTOFF_DATE = '2026-07-31'
 
-def _harmonize_master_batch(ds):
-    """Normalize time-dim naming across the unified master batches
-    (era5_master_daily_YYYY.nc) and reconcile ERA5T's expver axis, same as
-    backend_maps.py's loader."""
-    if "time" in ds.dims and "valid_time" not in ds.dims:
-        ds = ds.rename({"time": "valid_time"})
-    if "expver" in ds.dims:
-        ds = ds.dropna(dim="expver", how="all").isel(expver=0)
-        if "expver" in ds.coords:
-            ds = ds.drop_vars("expver")
-    if "pressure_level" in ds.dims and ds.sizes.get("pressure_level", 0) == 1:
-        ds = ds.squeeze("pressure_level", drop=True)
+def preprocess_era5t(ds):
+    if 'expver' in ds.dims:
+        if ds.sizes['expver'] > 1:
+            ds = ds.sel(expver=1).combine_first(ds.sel(expver=5))
+        else:
+            ds = ds.squeeze('expver', drop=True)
+    if 'expver' in ds.coords:
+        ds = ds.drop_vars('expver', errors='ignore')
     return ds
 
+def get_window_doys(target_doy):
+    window = []
+    for offset in range(-2, 3):
+        d = target_doy + offset
+        if d < 1: d += 366
+        elif d > 366: d -= 366
+        window.append(d)
+    return window
 
 def build_climatology():
-    print("🚀 Starte beschleunigten Climatology Builder (inkl. P5/P95 & Auto-Resume)...")
-
-    master_files = sorted(list(DATA_DIR.glob("era5_master_daily_*.nc")))
-    if not master_files:
-        raise FileNotFoundError(f"Keine era5_master_daily_*.nc Batches gefunden in {DATA_DIR}")
-
-    # 1. Metadaten lazily laden und sortieren
-    print("Lese Dateistrukturen...")
-    ds = xr.open_mfdataset(
-        master_files, combine='nested', concat_dim='valid_time', preprocess=_harmonize_master_batch,
-    )
-    ds = ds.sortby('valid_time')
+    total_start_time = time.time()
+    print("🚀 STARTE ATMOPULSE CLIMATOLOGY BUILDER (RAM-Optimized I/O Mode)")
     
-    # Zeitachsen extrahieren
-    times = pd.to_datetime(ds.valid_time.values)
-    _, index = np.unique(times, return_index=True)
-    ds = ds.isel(valid_time=index)
-    times = pd.to_datetime(ds.valid_time.values)
+    files = sorted(list(DATA_DIR.glob("era5_master_daily_*.nc")))
+    ds_master = xr.open_mfdataset(files, combine='by_coords', parallel=True, preprocess=preprocess_era5t)
+    ds_master = ds_master.sel(time=slice(None, CUTOFF_DATE))
+    print(f"📅 Daten-Cutoff: {CUTOFF_DATE}")
     
-    # Globale Arrays für extrem schnelles Suchen (ohne Xarray-Overhead)
-    doys = times.dayofyear.values
-    years = times.year.values
+    doys = ds_master['time'].dt.dayofyear.values
+    years = ds_master['time'].dt.year.values
+    # Konvertiere Zeitachse in Integer YYYYMMDD für den Frontend-Tooltip
+    dates_int = ds_master.time.dt.strftime("%Y%m%d").values.astype(np.int32)
     
-    current_year = times.max().year if times.max().month >= 12 else times.max().year - 1
-    
-    epoch_A_start, epoch_A_end = 1961, 1990
-    epoch_B_start, epoch_B_end = current_year - 29, current_year
-    
-    lats = ds.latitude.values
-    lons = ds.longitude.values
+    lats = ds_master.latitude.values
+    lons = ds_master.longitude.values
     n_lats, n_lons = len(lats), len(lons)
-    
-    # --- PRÜFEN OB EIN CHECKPOINT EXISTIERT ---
-    start_doy = 1
-    if TEMP_PROGRESS_FILE.exists():
-        try:
-            print("🔄 Bestehenden Fortschritt gefunden! Analysiere Checkpoint...")
-            ds_clim = xr.open_dataset(TEMP_PROGRESS_FILE).load()
-            
-            # Prüfe, ob die neuen P5/P95 Variablen im alten Checkpoint existieren
-            if "tx_p95_doy_A" not in ds_clim.data_vars:
-                print("⚠️ Alter Checkpoint enthält keine P5/P95 Struktur. Starte sauber neu...")
-                ds_clim.close()
-                TEMP_PROGRESS_FILE.unlink(missing_ok=True)
-                start_doy = 1
-            else:
-                test_var = ds_clim["tx_p90_doy_A"].values
-                for d in range(366):
-                    if np.all(np.isnan(test_var[d])):
-                        start_doy = d + 1
-                        break
-                else:
-                    start_doy = 367
-            
-            if start_doy <= 366 and "tx_p95_doy_A" in ds_clim.data_vars:
-                print(f"▶️ Setze Berechnung nahtlos bei Tag {start_doy}/366 fort!")
-            elif start_doy > 366:
-                print("✅ Alle Tage bereits berechnet. Konsolidiere finale Datei...")
-                ds_clim.close()
-                if OUT_FILE.exists(): os.remove(OUT_FILE)
-                os.rename(TEMP_PROGRESS_FILE, OUT_FILE)
-                return
-        except Exception as e:
-            print(f"⚠️ Checkpoint beschädigt ({e}). Starte Berechnung neu...")
-            TEMP_PROGRESS_FILE.unlink(missing_ok=True)
-            start_doy = 1
-            
-    if start_doy == 1:
-        print("🆕 Initialisiere neue Datenstruktur (inklusive P5 und P95)...")
-        # Datensatz komplett mit P5 und P95 vorbereiten
-        empty_3d = lambda: (("dayofyear", "latitude", "longitude"), np.full((366, n_lats, n_lons), np.nan, dtype=np.float32))
+
+    # Initialisierung der Ziel-Matrix
+    print("🆕 Initialisiere neue NetCDF-Matrix...")
+    data_vars = {}
+    empty_2d = lambda: (("latitude", "longitude"), np.full((n_lats, n_lons), np.nan, dtype=np.float32))
+    empty_3d = lambda: (("dayofyear", "latitude", "longitude"), np.full((366, n_lats, n_lons), np.nan, dtype=np.float32))
+    empty_3d_int = lambda: (("dayofyear", "latitude", "longitude"), np.full((366, n_lats, n_lons), -1, dtype=np.int32))
+
+    for param in PARAMS:
+        for p in PCTS_DOY:
+            data_vars[f"{param}_p{p}_doy_A"] = empty_3d()
+            data_vars[f"{param}_p{p}_doy_B"] = empty_3d()
+        for p in PCTS_DJF:
+            data_vars[f"{param}_djf_p{p}_A"] = empty_2d()
+            data_vars[f"{param}_djf_p{p}_B"] = empty_2d()
+        for p in PCTS_JJA:
+            data_vars[f"{param}_jja_p{p}_A"] = empty_2d()
+            data_vars[f"{param}_jja_p{p}_B"] = empty_2d()
         
-        ds_clim = xr.Dataset(
-            coords={"dayofyear": np.arange(1, 367), "latitude": lats, "longitude": lons},
-            data_vars={
-                "tx_p75_doy_A": empty_3d(), "tx_p90_doy_A": empty_3d(), "tx_p95_doy_A": empty_3d(),
-                "tn_p25_doy_A": empty_3d(), "tn_p10_doy_A": empty_3d(), "tn_p5_doy_A": empty_3d(),
-                
-                "tx_p75_doy_B": empty_3d(), "tx_p90_doy_B": empty_3d(), "tx_p95_doy_B": empty_3d(),
-                "tn_p25_doy_B": empty_3d(), "tn_p10_doy_B": empty_3d(), "tn_p5_doy_B": empty_3d(),
-                
-                "tx_max_val": empty_3d(), "tx_max_year": (("dayofyear", "latitude", "longitude"), np.full((366, n_lats, n_lons), -1, dtype=np.int32)),
-                "tn_min_val": empty_3d(), "tn_min_year": (("dayofyear", "latitude", "longitude"), np.full((366, n_lats, n_lons), -1, dtype=np.int32)),
-            }
-        )
+        # Geändert: max_date / min_date statt max_year
+        data_vars[f"{param}_max_val"] = empty_3d()
+        data_vars[f"{param}_max_date"] = empty_3d_int()
+        data_vars[f"{param}_min_val"] = empty_3d()
+        data_vars[f"{param}_min_date"] = empty_3d_int()
 
-    # --- TEIL 1: SAISONALE KONSTANTEN (NUR BEI START_DOY == 1) ---
-    if start_doy == 1:
-        print("\n--- TEIL 1: Berechne saisonale Konstanten für Wellen (JJA / DJF) ---")
-        for ep_name, start_yr, end_yr in [("A", epoch_A_start, epoch_A_end), ("B", epoch_B_start, epoch_B_end)]:
-            print(f"Lade JJA & DJF für Epoche {ep_name}...")
+    ds_clim = xr.Dataset(coords={"dayofyear": np.arange(1, 367), "latitude": lats, "longitude": lons}, data_vars=data_vars)
+
+    print("\n=======================================================")
+    print("⚡ BERECHNUNG PARAMETER FÜR PARAMETER (RAM-ISOLIERT)")
+    print("=======================================================")
+
+    mask_A_yr = (years >= EPOCH_A[0]) & (years <= EPOCH_A[1])
+    mask_B_yr = (years >= EPOCH_B[0]) & (years <= EPOCH_B[1])
+
+    for param in PARAMS:
+        param_start = time.time()
+        print(f"\n📥 Lade '{param}' vollständig in den RAM (ca. 2.5 GB)...")
+        # I/O Flaschenhals eliminieren: Lade die gesamte 86-Jahre Zeitreihe für diesen einen Parameter in den RAM
+        arr_full = ds_master[param].compute().values
+        load_time = time.time() - param_start
+        print(f"✅ Geladen in {load_time:.1f}s. Starte Matrix-Berechnungen...")
+
+        # --- PHASE 1: SAISONAL (JJA & DJF) ---
+        t0 = time.time()
+        for ep_name, mask_ep in [("A", mask_A_yr), ("B", mask_B_yr)]:
+            # DJF
+            mask_djf = mask_ep & np.isin(ds_master.time.dt.month.values, [12, 1, 2])
+            if np.any(mask_djf):
+                pcts = np.nanpercentile(arr_full[mask_djf], PCTS_DJF, axis=0)
+                for i, p in enumerate(PCTS_DJF):
+                    ds_clim[f"{param}_djf_p{p}_{ep_name}"].values = pcts[i]
             
-            # Masken auf NumPy-Ebene für Speed
-            # Daily TX (JJA) / TN (DJF) are now true 24h daily statistics
-            # from the master batches (one value per calendar day) — no more
-            # combining two 12h "since previous post-processing" steps.
-            jja_idx = np.where((years >= start_yr) & (years <= end_yr) & (np.isin(times.month, [6, 7, 8])))[0]
-            tx_jja = ds.isel(valid_time=jja_idx)["tx"].values - 273.15
-
-            tx_pcts = np.nanpercentile(tx_jja, [75, 90, 95], axis=0)
-            ds_clim[f"tx_p75_{ep_name}"] = (("latitude", "longitude"), tx_pcts[0])
-            ds_clim[f"tx_p90_{ep_name}"] = (("latitude", "longitude"), tx_pcts[1])
-            ds_clim[f"tx_p95_{ep_name}"] = (("latitude", "longitude"), tx_pcts[2])
-            del tx_jja, tx_pcts
-
-            djf_idx = np.where((years >= start_yr) & (years <= end_yr) & (np.isin(times.month, [12, 1, 2])))[0]
-            tn_djf = ds.isel(valid_time=djf_idx)["tn"].values - 273.15
-
-            tn_pcts = np.nanpercentile(tn_djf, [5, 10, 25], axis=0)
-            ds_clim[f"tn_p5_{ep_name}"]  = (("latitude", "longitude"), tn_pcts[0])
-            ds_clim[f"tn_p10_{ep_name}"] = (("latitude", "longitude"), tn_pcts[1])
-            ds_clim[f"tn_p25_{ep_name}"] = (("latitude", "longitude"), tn_pcts[2])
-            del tn_djf, tn_pcts
-
-    # --- TEIL 2: GLEITENDE FENSTER (HIGH SPEED & CHECKPOINT) ---
-    print("\n--- TEIL 2: Berechne tägliche 5-Tage-Fenster ---")
-    
-    # Referenzen aufbauen für direktes Schreiben
-    v_tx_p75_A, v_tx_p90_A, v_tx_p95_A = ds_clim["tx_p75_doy_A"].values, ds_clim["tx_p90_doy_A"].values, ds_clim["tx_p95_doy_A"].values
-    v_tn_p25_A, v_tn_p10_A, v_tn_p5_A  = ds_clim["tn_p25_doy_A"].values, ds_clim["tn_p10_doy_A"].values, ds_clim["tn_p5_doy_A"].values
-    
-    v_tx_p75_B, v_tx_p90_B, v_tx_p95_B = ds_clim["tx_p75_doy_B"].values, ds_clim["tx_p90_doy_B"].values, ds_clim["tx_p95_doy_B"].values
-    v_tn_p25_B, v_tn_p10_B, v_tn_p5_B  = ds_clim["tn_p25_doy_B"].values, ds_clim["tn_p10_doy_B"].values, ds_clim["tn_p5_doy_B"].values
-    
-    v_tx_max_val, v_tx_max_yr = ds_clim["tx_max_val"].values, ds_clim["tx_max_year"].values
-    v_tn_min_val, v_tn_min_yr = ds_clim["tn_min_val"].values, ds_clim["tn_min_year"].values
-
-    for target_doy in range(start_doy, 367):
-        print(f"  -> Verarbeite Tag {target_doy}/366... [Speed-Mode & Auto-Save]", end="\r", flush=True)
+            # JJA
+            mask_jja = mask_ep & np.isin(ds_master.time.dt.month.values, [6, 7, 8])
+            if np.any(mask_jja):
+                pcts = np.nanpercentile(arr_full[mask_jja], PCTS_JJA, axis=0)
+                for i, p in enumerate(PCTS_JJA):
+                    ds_clim[f"{param}_jja_p{p}_{ep_name}"].values = pcts[i]
         
-        window_doys = []
-        for offset in range(-2, 3):
-            d = target_doy + offset
-            if d < 1: d += 366
-            elif d > 366: d -= 366
-            window_doys.append(d)
+        print(f"   -> Saisonale Perzentile (DJF/JJA) berechnet in {time.time() - t0:.1f}s")
+
+        # --- PHASE 2: TÄGLICHE 5-TAGE-FENSTER & REKORDE ---
+        t0 = time.time()
+        for target_doy in range(1, 367):
+            idx = target_doy - 1
+            win_doys = get_window_doys(target_doy)
             
-        # Hocheffizientes Integer-Indexing statt Boolean/Datetime Search
-        win_idx = np.where(np.isin(doys, window_doys))[0]
-        
-        # Daten für diese Indizes physisch in RAM laden
-        ds_win = ds.isel(valid_time=win_idx).compute()
-        tx_win = ds_win['tx'].values - 273.15
-        tn_win = ds_win['tn'].values - 273.15
-        win_years = years[win_idx]
-        
-        idx = target_doy - 1
-        
-        # --- EPOCHE A ---
-        mask_A = (win_years >= epoch_A_start) & (win_years <= epoch_A_end)
-        if np.any(mask_A):
-            # 3 Perzentile in einer einzigen Vektoroperation berechnen!
-            pct_tx_A = np.nanpercentile(tx_win[mask_A], [75, 90, 95], axis=0)
-            v_tx_p75_A[idx], v_tx_p90_A[idx], v_tx_p95_A[idx] = pct_tx_A[0], pct_tx_A[1], pct_tx_A[2]
-            
-            pct_tn_A = np.nanpercentile(tn_win[mask_A], [5, 10, 25], axis=0)
-            v_tn_p5_A[idx], v_tn_p10_A[idx], v_tn_p25_A[idx] = pct_tn_A[0], pct_tn_A[1], pct_tn_A[2]
-            
-        # --- EPOCHE B ---
-        mask_B = (win_years >= epoch_B_start) & (win_years <= epoch_B_end)
-        if np.any(mask_B):
-            pct_tx_B = np.nanpercentile(tx_win[mask_B], [75, 90, 95], axis=0)
-            v_tx_p75_B[idx], v_tx_p90_B[idx], v_tx_p95_B[idx] = pct_tx_B[0], pct_tx_B[1], pct_tx_B[2]
-            
-            pct_tn_B = np.nanpercentile(tn_win[mask_B], [5, 10, 25], axis=0)
-            v_tn_p5_B[idx], v_tn_p10_B[idx], v_tn_p25_B[idx] = pct_tn_B[0], pct_tn_B[1], pct_tn_B[2]
-            
-        # --- REKORDE ---
-        max_idx = np.nanargmax(tx_win, axis=0)
-        v_tx_max_val[idx] = np.take_along_axis(tx_win, np.expand_dims(max_idx, axis=0), axis=0).squeeze()
-        yr_grid_tx = np.broadcast_to(win_years[:, None, None], tx_win.shape)
-        v_tx_max_yr[idx] = np.take_along_axis(yr_grid_tx, np.expand_dims(max_idx, axis=0), axis=0).squeeze()
-        
-        min_idx = np.nanargmin(tn_win, axis=0)
-        v_tn_min_val[idx] = np.take_along_axis(tn_win, np.expand_dims(min_idx, axis=0), axis=0).squeeze()
-        yr_grid_tn = np.broadcast_to(win_years[:, None, None], tn_win.shape)
-        v_tn_min_yr[idx] = np.take_along_axis(yr_grid_tn, np.expand_dims(min_idx, axis=0), axis=0).squeeze()
+            # Sub-Maske für das 5-Tage Fenster (über 86 Jahre)
+            mask_win = np.isin(doys, win_doys)
+            arr_win = arr_full[mask_win]
+            dates_win = dates_int[mask_win]
+            years_win = years[mask_win]
 
-        # --- ZURÜCKSCHREIBEN IN DATASET ---
-        ds_clim["tx_p75_doy_A"] = (("dayofyear", "latitude", "longitude"), v_tx_p75_A)
-        ds_clim["tx_p90_doy_A"] = (("dayofyear", "latitude", "longitude"), v_tx_p90_A)
-        ds_clim["tx_p95_doy_A"] = (("dayofyear", "latitude", "longitude"), v_tx_p95_A)
-        ds_clim["tn_p25_doy_A"] = (("dayofyear", "latitude", "longitude"), v_tn_p25_A)
-        ds_clim["tn_p10_doy_A"] = (("dayofyear", "latitude", "longitude"), v_tn_p10_A)
-        ds_clim["tn_p5_doy_A"]  = (("dayofyear", "latitude", "longitude"), v_tn_p5_A)
-        
-        ds_clim["tx_p75_doy_B"] = (("dayofyear", "latitude", "longitude"), v_tx_p75_B)
-        ds_clim["tx_p90_doy_B"] = (("dayofyear", "latitude", "longitude"), v_tx_p90_B)
-        ds_clim["tx_p95_doy_B"] = (("dayofyear", "latitude", "longitude"), v_tx_p95_B)
-        ds_clim["tn_p25_doy_B"] = (("dayofyear", "latitude", "longitude"), v_tn_p25_B)
-        ds_clim["tn_p10_doy_B"] = (("dayofyear", "latitude", "longitude"), v_tn_p10_B)
-        ds_clim["tn_p5_doy_B"]  = (("dayofyear", "latitude", "longitude"), v_tn_p5_B)
+            mask_A_win = (years_win >= EPOCH_A[0]) & (years_win <= EPOCH_A[1])
+            mask_B_win = (years_win >= EPOCH_B[0]) & (years_win <= EPOCH_B[1])
 
-        ds_clim["tx_max_val"] = (("dayofyear", "latitude", "longitude"), v_tx_max_val)
-        ds_clim["tx_max_year"] = (("dayofyear", "latitude", "longitude"), v_tx_max_yr)
-        ds_clim["tn_min_val"] = (("dayofyear", "latitude", "longitude"), v_tn_min_val)
-        ds_clim["tn_min_year"] = (("dayofyear", "latitude", "longitude"), v_tn_min_yr)
+            # Perzentile Epoche A & B
+            if np.any(mask_A_win):
+                pcts_A = np.nanpercentile(arr_win[mask_A_win], PCTS_DOY, axis=0)
+                for i, p in enumerate(PCTS_DOY):
+                    ds_clim[f"{param}_p{p}_doy_A"].values[idx] = pcts_A[i]
+            
+            if np.any(mask_B_win):
+                pcts_B = np.nanpercentile(arr_win[mask_B_win], PCTS_DOY, axis=0)
+                for i, p in enumerate(PCTS_DOY):
+                    ds_clim[f"{param}_p{p}_doy_B"].values[idx] = pcts_B[i]
 
-        # CHECKPOINT SPEICHERN (Atomares Schreiben gegen Korruption)
-        TEMP_WRITE_FILE = OUT_DIR / "progress_step_temp.nc"
-        ds_clim.to_netcdf(TEMP_WRITE_FILE)
-        ds_clim.close() # Schließt den Speicherzugriff
-        
-        if TEMP_PROGRESS_FILE.exists(): TEMP_PROGRESS_FILE.unlink()
-        os.rename(TEMP_WRITE_FILE, TEMP_PROGRESS_FILE)
-        
-        # Wieder öffnen für den nächsten Schleifendurchlauf
-        ds_clim = xr.open_dataset(TEMP_PROGRESS_FILE).load()
+            # Absolute Rekorde & Exaktes Datum
+            max_idx = np.nanargmax(arr_win, axis=0)
+            ds_clim[f"{param}_max_val"].values[idx] = np.take_along_axis(arr_win, np.expand_dims(max_idx, axis=0), axis=0).squeeze()
+            date_grid = np.broadcast_to(dates_win[:, None, None], arr_win.shape)
+            ds_clim[f"{param}_max_date"].values[idx] = np.take_along_axis(date_grid, np.expand_dims(max_idx, axis=0), axis=0).squeeze()
 
-    print("\n🎉 Alle 366 Tage inklusive P5/P95 erfolgreich abgeschlossen!")
-    ds_clim.close()
-    
-    if OUT_FILE.exists(): os.remove(OUT_FILE)
-    os.rename(TEMP_PROGRESS_FILE, OUT_FILE)
-    print("✅ Klimatologie final, wasserdicht und extrem schnell auf der Festplatte gesichert!")
+            min_idx = np.nanargmin(arr_win, axis=0)
+            ds_clim[f"{param}_min_val"].values[idx] = np.take_along_axis(arr_win, np.expand_dims(min_idx, axis=0), axis=0).squeeze()
+            ds_clim[f"{param}_min_date"].values[idx] = np.take_along_axis(date_grid, np.expand_dims(min_idx, axis=0), axis=0).squeeze()
+            
+            # Terminal Update (alle 30 Tage überschreiben für sauberes Log)
+            if target_doy % 30 == 0 or target_doy == 366:
+                print(f"   -> DOY {target_doy}/366 berechnet...", end="\r", flush=True)
+
+        print(f"   -> Alle 366 Tagesfenster berechnet in {time.time() - t0:.1f}s")
+        
+        # RAM rigoros leeren vor dem nächsten Parameter
+        del arr_full
+        gc.collect()
+
+        # Checkpointing nach jedem fertigen Parameter
+        print(f"💾 Speichere Zwischenstand für '{param}'...")
+        temp_write = OUT_DIR / "temp_step.nc"
+        ds_clim.to_netcdf(temp_write)
+        os.replace(temp_write, TEMP_FILE)
+        print(f"🏁 Parameter '{param}' vollständig in {(time.time() - param_start)/60:.1f} Min.")
+
+    ds_master.close()
+    os.replace(TEMP_FILE, OUT_FILE)
+    print("\n=======================================================")
+    print(f"🎉 ALLES FERTIG! Gesamtdauer: {(time.time() - total_start_time)/60:.1f} Minuten.")
+    print(f"✅ Finale Klimatologie gesichert in: {OUT_FILE.name}")
 
 if __name__ == "__main__":
     build_climatology()
