@@ -4,6 +4,7 @@ AtmoPulse Backend: High-Performance Climatology Builder
 - Single-Variable RAM-Load Architektur (Beseitigt I/O Flaschenhals)
 - Speichert exaktes Datum (YYYYMMDD) für Rekorde
 - Mit Live-Timer pro Verarbeitungsschritt
+- ETCCDI 365-Tage Standardkalender integriert
 """
 
 import xarray as xr
@@ -46,8 +47,8 @@ def get_window_doys(target_doy):
     window = []
     for offset in range(-2, 3):
         d = target_doy + offset
-        if d < 1: d += 366
-        elif d > 366: d -= 366
+        if d < 1: d += 365
+        elif d > 365: d -= 365
         window.append(d)
     return window
 
@@ -58,9 +59,17 @@ def build_climatology():
     files = sorted(list(DATA_DIR.glob("era5_master_daily_*.nc")))
     ds_master = xr.open_mfdataset(files, combine='by_coords', parallel=True, preprocess=preprocess_era5t)
     ds_master = ds_master.sel(time=slice(None, CUTOFF_DATE))
-    print(f"📅 Daten-Cutoff: {CUTOFF_DATE}")
     
-    doys = ds_master['time'].dt.dayofyear.values
+    # ETCCDI-STANDARD: Exzision des 29. Februar für einen homogenen 365-Tage-Kalender
+    ds_master = ds_master.sel(time=~((ds_master.time.dt.month == 2) & (ds_master.time.dt.day == 29)))
+    print(f"📅 Daten-Cutoff: {CUTOFF_DATE} (365-Tage Kalender erzwungen)")
+    
+    # Standardisierte DOYs generieren (1-365, auch in Schaltjahren)
+    raw_doys = ds_master['time'].dt.dayofyear.values
+    is_leap = ds_master['time'].dt.is_leap_year.values
+    months = ds_master['time'].dt.month.values
+    doys = np.where(is_leap & (months >= 3), raw_doys - 1, raw_doys)
+    
     years = ds_master['time'].dt.year.values
     # Konvertiere Zeitachse in Integer YYYYMMDD für den Frontend-Tooltip
     dates_int = ds_master.time.dt.strftime("%Y%m%d").values.astype(np.int32)
@@ -73,8 +82,8 @@ def build_climatology():
     print("🆕 Initialisiere neue NetCDF-Matrix...")
     data_vars = {}
     empty_2d = lambda: (("latitude", "longitude"), np.full((n_lats, n_lons), np.nan, dtype=np.float32))
-    empty_3d = lambda: (("dayofyear", "latitude", "longitude"), np.full((366, n_lats, n_lons), np.nan, dtype=np.float32))
-    empty_3d_int = lambda: (("dayofyear", "latitude", "longitude"), np.full((366, n_lats, n_lons), -1, dtype=np.int32))
+    empty_3d = lambda: (("dayofyear", "latitude", "longitude"), np.full((365, n_lats, n_lons), np.nan, dtype=np.float32))
+    empty_3d_int = lambda: (("dayofyear", "latitude", "longitude"), np.full((365, n_lats, n_lons), -1, dtype=np.int32))
 
     for param in PARAMS:
         for p in PCTS_DOY:
@@ -87,13 +96,12 @@ def build_climatology():
             data_vars[f"{param}_jja_p{p}_A"] = empty_2d()
             data_vars[f"{param}_jja_p{p}_B"] = empty_2d()
         
-        # Geändert: max_date / min_date statt max_year
         data_vars[f"{param}_max_val"] = empty_3d()
         data_vars[f"{param}_max_date"] = empty_3d_int()
         data_vars[f"{param}_min_val"] = empty_3d()
         data_vars[f"{param}_min_date"] = empty_3d_int()
 
-    ds_clim = xr.Dataset(coords={"dayofyear": np.arange(1, 367), "latitude": lats, "longitude": lons}, data_vars=data_vars)
+    ds_clim = xr.Dataset(coords={"dayofyear": np.arange(1, 366), "latitude": lats, "longitude": lons}, data_vars=data_vars)
 
     print("\n=======================================================")
     print("⚡ BERECHNUNG PARAMETER FÜR PARAMETER (RAM-ISOLIERT)")
@@ -105,7 +113,7 @@ def build_climatology():
     for param in PARAMS:
         param_start = time.time()
         print(f"\n📥 Lade '{param}' vollständig in den RAM (ca. 2.5 GB)...")
-        # I/O Flaschenhals eliminieren: Lade die gesamte 86-Jahre Zeitreihe für diesen einen Parameter in den RAM
+        # I/O Flaschenhals eliminieren
         arr_full = ds_master[param].compute().values
         load_time = time.time() - param_start
         print(f"✅ Geladen in {load_time:.1f}s. Starte Matrix-Berechnungen...")
@@ -131,11 +139,11 @@ def build_climatology():
 
         # --- PHASE 2: TÄGLICHE 5-TAGE-FENSTER & REKORDE ---
         t0 = time.time()
-        for target_doy in range(1, 367):
+        for target_doy in range(1, 366):
             idx = target_doy - 1
             win_doys = get_window_doys(target_doy)
             
-            # Sub-Maske für das 5-Tage Fenster (über 86 Jahre)
+            # Sub-Maske für das 5-Tage Fenster
             mask_win = np.isin(doys, win_doys)
             arr_win = arr_full[mask_win]
             dates_win = dates_int[mask_win]
@@ -165,11 +173,10 @@ def build_climatology():
             ds_clim[f"{param}_min_val"].values[idx] = np.take_along_axis(arr_win, np.expand_dims(min_idx, axis=0), axis=0).squeeze()
             ds_clim[f"{param}_min_date"].values[idx] = np.take_along_axis(date_grid, np.expand_dims(min_idx, axis=0), axis=0).squeeze()
             
-            # Terminal Update (alle 30 Tage überschreiben für sauberes Log)
-            if target_doy % 30 == 0 or target_doy == 366:
-                print(f"   -> DOY {target_doy}/366 berechnet...", end="\r", flush=True)
+            if target_doy % 30 == 0 or target_doy == 365:
+                print(f"   -> DOY {target_doy}/365 berechnet...", end="\r", flush=True)
 
-        print(f"   -> Alle 366 Tagesfenster berechnet in {time.time() - t0:.1f}s")
+        print(f"   -> Alle 365 Tagesfenster berechnet in {time.time() - t0:.1f}s")
         
         # RAM rigoros leeren vor dem nächsten Parameter
         del arr_full

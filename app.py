@@ -264,7 +264,12 @@ def get_persistence_arrays(target_date_str, baseline_type, map_var="TG", anchor_
     (daily_dates, tx_vals, tn_vals), _meta = loaded
 
     tx_hist, tn_hist = tx_vals - 273.15, tn_vals - 273.15
-    doys = pd.to_datetime(daily_dates).dayofyear
+    dates_dt = pd.to_datetime(daily_dates)
+    raw_doys = dates_dt.dayofyear.values
+    is_leap = dates_dt.is_leap_year.values
+    months = dates_dt.month.values
+    # ETCCDI 365-Tage Mapping: 29.2. (DOY 60) und alle Folgetage im Schaltjahr um -1 verschieben
+    doys = np.where(is_leap & (months >= 3), raw_doys - 1, raw_doys)
     suffix = "A" if baseline_type == "A" else "B"
     n_days, n_lats, n_lons = tx_hist.shape
     
@@ -787,7 +792,14 @@ def get_meteogram_traces(df_live, ref_clim, lat, lon, target_date, epoch, show_a
     pt_clim = ref_clim.sel(latitude=lat, longitude=lon, method='nearest')
     df_live['Date'] = pd.to_datetime(df_live['Date']).dt.tz_localize(None)
     tgt_dt_norm = pd.to_datetime(target_date).tz_localize(None)
-    doys = (df_live['Date'].dt.dayofyear.values - 1) % 366
+    
+    # ETCCDI 365-Tage Mapping für das Point Meteogram
+    raw_doys = df_live['Date'].dt.dayofyear.values
+    is_leap = df_live['Date'].dt.is_leap_year.values
+    months = df_live['Date'].dt.month.values
+    doy_365 = np.where(is_leap & (months >= 3), raw_doys - 1, raw_doys)
+    doys = doy_365 - 1  # 0-basiert für die Array-Abfrage
+    
     dates = df_live['Date']
     
     if meteo_var == "Mean Temp (TG)":
@@ -900,7 +912,15 @@ def build_yearly_extremes_chart(lat, lon, epoch, is_warm):
     
     df = pd.DataFrame({'time': pt_data.valid_time.values, 'val': val}).drop_duplicates(subset=['time'])
     dates = pd.to_datetime(df['time'])
-    df['year'], doys = dates.dt.year, dates.dt.dayofyear - 1
+    df['year'] = dates.dt.year
+    
+    # ETCCDI 365-Tage Mapping für die historischen Extreme
+    raw_doys = dates.dt.dayofyear.values
+    is_leap = dates.dt.is_leap_year.values
+    months = dates.dt.month.values
+    doy_365 = np.where(is_leap & (months >= 3), raw_doys - 1, raw_doys)
+    doys = doy_365 - 1  # 0-basiert für Array-Abfrage
+    
     v = df['val'].values
     
     if is_warm and f'tx_p95_doy_{epoch}' in pt_clim.variables:

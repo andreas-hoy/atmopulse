@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-AtmoPulse Backend: Operational AIFS Ingestion (Zero-Latency Forecast)
-Downloads the latest available AIFS deterministic run via ecmwf-opendata.
-Applies rigorous Conservative Area-Weighted Regridding using pre-computed CDO weights 
-via SciPy to ensure mass/energy preservation and physical consistency with ERA5.
+AtmoPulse Backend: Operational IFS Ingestion
+Downloads the stable IFS deterministic run, resolves xarray time-coordinate conflicts,
+aggregates daily extremes (0-0Z) & 12Z synoptics, and applies CDO conservative regridding.
 ETCCDI 365-day DOY mapping and fracarea coastal normalisation included.
 """
 
@@ -22,9 +21,8 @@ import warnings
 
 warnings.filterwarnings("ignore", module="cfgrib")
 
-# --- KUGELSICHERE PFADKONFIGURATION ---
 BASE_DIR = Path.cwd() / "ERA5_ClimateTool"
-TMP_DIR = BASE_DIR / ".tmp_aifs"
+TMP_DIR = BASE_DIR / ".tmp_ifs"
 OUT_DIR = BASE_DIR / "Live_Forecasts"
 REF_DIR = BASE_DIR / "Reference_Climatology"
 
@@ -35,57 +33,28 @@ ERA5_GRID_REF = REF_DIR / "climatology_synoptics.nc"
 WEIGHTS_FILE = REF_DIR / "regrid_weights_cdo.nc"
 
 def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)]
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", handlers=[logging.StreamHandler(sys.stdout)])
 
-def download_aifs_gribs():
-    sources = ["azure"]
-    steps = list(range(6, 73, 6))
-    
-    target_sfc = str(TMP_DIR / "aifs_sfc.grib")
-    target_pl = str(TMP_DIR / "aifs_pl.grib")
+def download_ifs_gribs():
+    client = Client(source="ecmwf", model="ifs", resol="0p25")
+    steps = list(range(0, 73, 6))
+    target_sfc = str(TMP_DIR / "ifs_sfc.grib")
+    target_pl = str(TMP_DIR / "ifs_pl.grib")
     
     now = datetime.now(timezone.utc)
-    candidates = [
-        (now, 12), 
-        (now, 0),
-        (now - timedelta(days=1), 12), 
-        (now - timedelta(days=1), 0)
-    ]
+    candidates = [(now - timedelta(hours=12*i), 12 if (now - timedelta(hours=12*i)).hour >= 12 else 0) for i in range(6)]
     
-    for src in sources:
-        logging.info(f"🌐 Verbinde mit Cloud-Mirror: {src.upper()}...")
-        client = Client(source=src, model="aifs-single", resol="0p25")
-        
-        for dt, hour in candidates:
-            date_str = dt.strftime("%Y%m%d")
-            logging.info(f"🔍 Prüfe {src.upper()} auf AIFS-Lauf: {date_str} {hour:02d}Z...")
-            
-            try:
-                client.retrieve(
-                    date=date_str, time=hour, type="fc", levtype="sfc", 
-                    param=["2t", "msl"], step=steps, target=target_sfc
-                )
-                logging.info(f"✅ Surface-Daten ({date_str} {hour:02d}Z) via {src.upper()} geladen.")
-                
-                client.retrieve(
-                    date=date_str, time=hour, type="fc", levtype="pl", levelist=[300, 500, 850],
-                    param=["t", "z", "u", "v"], step=steps, target=target_pl
-                )
-                logging.info(f"✅ Pressure-Level-Daten ({date_str} {hour:02d}Z) via {src.upper()} geladen.")
-                
-                return target_sfc, target_pl, date_str, hour
-                
-            except Exception as e:
-                logging.warning(f"⚠️ Lauf {date_str} {hour:02d}Z auf {src.upper()} nicht bereit: {e}")
-                if Path(target_sfc).exists(): Path(target_sfc).unlink()
-                if Path(target_pl).exists(): Path(target_pl).unlink()
-                time.sleep(1)
-                
-    raise RuntimeError("❌ FEHLER: Kein AIFS-Lauf auf Azure gefunden.")
+    for dt, hour in candidates:
+        date_str = dt.strftime("%Y%m%d")
+        logging.info(f"🔍 Prüfe Lauf {date_str} {hour:02d}Z...")
+        try:
+            client.retrieve(date=date_str, time=hour, type="fc", levtype="sfc", param=["2t", "msl"], step=steps, target=target_sfc)
+            client.retrieve(date=date_str, time=hour, type="fc", levtype="pl", levelist=[300, 500, 850], param=["t", "z", "u", "v"], step=steps, target=target_pl)
+            return target_sfc, target_pl, date_str, hour
+        except Exception as e:
+            logging.warning(f"⚠️ Lauf nicht verfügbar. Gehe zu vorherigem...")
+            time.sleep(2)
+    raise RuntimeError("❌ Kein Lauf gefunden.")
 
 def apply_conservative_weights(ds_source, weights_file, ds_target_grid):
     logging.info("⚙️ Harmoniere Gitter und appliziere flächenkonservative CDO-Matrix (fracarea) via SciPy...")
@@ -105,7 +74,6 @@ def apply_conservative_weights(ds_source, weights_file, ds_target_grid):
         ).tocsr()
     
     shape_out = (ds_target_grid.sizes['latitude'], ds_target_grid.sizes['longitude'])
-    
     ds_out = xr.Dataset(coords={
         'time': ds_source_cropped.time, 
         'latitude': ds_target_grid.latitude, 
@@ -124,6 +92,7 @@ def apply_conservative_weights(ds_source, weights_file, ds_target_grid):
             y_num = weights.dot(source_filled)
             y_den = weights.dot(valid_mask.astype(np.float32))
             
+            # Division durch Null abfangen für Ozean-Pixel ohne valide Nachbarn
             with np.errstate(divide='ignore', invalid='ignore'):
                 y_corrected = np.where(y_den > 0, y_num / y_den, np.nan)
             
@@ -133,8 +102,8 @@ def apply_conservative_weights(ds_source, weights_file, ds_target_grid):
         
     return ds_out
 
-def process_and_align_aifs(sfc_file, pl_file):
-    logging.info("Lade GRIB files via cfgrib in den RAM...")
+def process_and_align_ifs(sfc_file, pl_file):
+    logging.info("Lade GRIBs und behebe xarray 'time' Konflikte...")
     ds_sfc = xr.open_dataset(sfc_file, engine='cfgrib')
     ds_pl = xr.open_dataset(pl_file, engine='cfgrib')
     
@@ -150,7 +119,7 @@ def process_and_align_aifs(sfc_file, pl_file):
     t2m_celsius = ds_sfc['t2m'] - 273.15
     mslp_hpa = ds_sfc['msl'] / 100.0  
     
-    logging.info("Aggregiere nach ETCCDI-Standards (Tagesextreme & 12Z Synoptik)...")
+    logging.info("Aggregiere 0-0Z für T-Extreme und 12Z für Synoptik...")
     tx = t2m_celsius.resample(time='1D').max()
     tn = t2m_celsius.resample(time='1D').min()
     tg = t2m_celsius.resample(time='1D').mean()
@@ -174,7 +143,7 @@ def process_and_align_aifs(sfc_file, pl_file):
     with xr.open_dataset(ERA5_GRID_REF) as ds_era5:
         ds_aligned = apply_conservative_weights(ds_forecast, WEIGHTS_FILE, ds_era5)
         
-    # ETCCDI-STANDARD: 365-Tage Kalender Mapping für das Frontend
+    # ETCCDI-STANDARD: 365-Tage Kalender Mapping für das Frontend und QDM
     raw_doys = ds_aligned.time.dt.dayofyear.values
     is_leap = ds_aligned.time.dt.is_leap_year.values
     months = ds_aligned.time.dt.month.values
@@ -184,9 +153,9 @@ def process_and_align_aifs(sfc_file, pl_file):
     return ds_aligned
 
 def purge_old_forecasts(days_to_keep=10):
-    logging.info(f"Garbage Collection: Lösche AIFS-Rückstände älter als {days_to_keep} Tage...")
+    logging.info(f"Garbage Collection: Lösche IFS-Rückstände älter als {days_to_keep} Tage...")
     now = time.time()
-    for f in OUT_DIR.glob("aifs_daily_forecast_*.nc"):
+    for f in OUT_DIR.glob("ifs_daily_forecast_*.nc"):
         if os.stat(f).st_mtime < now - (days_to_keep * 86400):
             try:
                 f.unlink()
@@ -196,36 +165,28 @@ def purge_old_forecasts(days_to_keep=10):
 
 def main():
     setup_logging()
-    start_time = time.time()
     
-    if not ERA5_GRID_REF.exists():
-        logging.error(f"ERA5 Referenzgitter fehlt. Gesucht in: {ERA5_GRID_REF}")
-        sys.exit(1)
-        
-    if not WEIGHTS_FILE.exists():
-        logging.error(f"Interpolationsmatrix fehlt. Gesucht in: {WEIGHTS_FILE}")
+    if not ERA5_GRID_REF.exists() or not WEIGHTS_FILE.exists():
+        logging.error("Referenz- oder Gewichtsdatei fehlt!")
         sys.exit(1)
         
     try:
-        sfc_file, pl_file, run_date, run_hour = download_aifs_gribs() 
-        ds_aligned = process_and_align_aifs(sfc_file, pl_file)
+        sfc_file, pl_file, run_date, run_hour = download_ifs_gribs() 
+        ds_aligned = process_and_align_ifs(sfc_file, pl_file)
         
-        out_path = OUT_DIR / f"aifs_daily_forecast_{run_date}_{run_hour:02d}z.nc"
+        out_path = OUT_DIR / f"ifs_daily_forecast_{run_date}_{run_hour:02d}z.nc"
         
         encoding = {v: {"zlib": True, "complevel": 4, "dtype": "float32"} for v in ds_aligned.data_vars}
         ds_aligned.to_netcdf(out_path, encoding=encoding)
         logging.info(f"🎉 SUCCESS! Live Vorhersage gespeichert: {out_path.name}")
         
     except Exception as e:
-        logging.error(f"AIFS Pipeline fehlgeschlagen: {str(e)}")
-        
+        logging.error(f"IFS Pipeline fehlgeschlagen: {str(e)}")
     finally:
         if TMP_DIR.exists():
             import shutil
             shutil.rmtree(TMP_DIR, ignore_errors=True)
         purge_old_forecasts(days_to_keep=10)
-            
-    logging.info(f"Gesamtdauer: {(time.time() - start_time):.1f} Sekunden.")
 
 if __name__ == "__main__":
     main()

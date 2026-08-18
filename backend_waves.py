@@ -108,6 +108,10 @@ def _wave_season_thresholds(lat: float, lon: float, suffix: str) -> dict:
     pt = ds_archive.sel(latitude=lat, longitude=lon, method="nearest").compute()
     times = pd.to_datetime(pt.valid_time.values)
 
+    # ETCCDI-STANDARD: Lösche den 29. Februar zur Gewährleistung der Homoskedastizität
+    pt = pt.sel(valid_time=~((times.month == 2) & (times.day == 29)))
+    times = pd.to_datetime(pt.valid_time.values)
+
     if suffix == "A":
         y0, y1 = 1961, 1990
     else:
@@ -181,6 +185,10 @@ def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", thresho
 
     df_raw = pd.DataFrame({'Temp': raw_vals}, index=pd.to_datetime(pt.valid_time.values))
     df_raw = df_raw[~df_raw.index.duplicated(keep='first')].sort_index()
+    
+    # ETCCDI-STANDARD: Exzision des 29. Februar aus der Kyselý-Wave Detection
+    df_raw = df_raw[~((df_raw.index.month == 2) & (df_raw.index.day == 29))]
+    
     # tx/tn are now true 24h daily statistics (one value per calendar day)
     # from era5_master_daily_*.nc. resample('D') is kept as a harmless
     # idempotent safety net against any leftover duplicate/sub-daily steps.

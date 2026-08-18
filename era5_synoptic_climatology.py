@@ -4,6 +4,7 @@ AtmoPulse Backend: Synoptic Baseline Builder (MSLP & Z500)
 - Berechnet 5-Tage gleitende Mittelwerte für Zirkulationsanomalien.
 - Epochen: 1961-1990 (A) und 1996-2025 (B).
 - Hochgeschwindigkeits-Architektur über direkte NumPy-Means.
+- ETCCDI 365-Tage Standardkalender integriert
 """
 
 import xarray as xr
@@ -39,8 +40,8 @@ def get_window_doys(target_doy):
     window = []
     for offset in range(-2, 3):
         d = target_doy + offset
-        if d < 1: d += 366
-        elif d > 366: d -= 366
+        if d < 1: d += 365
+        elif d > 365: d -= 365
         window.append(d)
     return window
 
@@ -52,7 +53,15 @@ def build_synoptic_climatology():
     ds_master = xr.open_mfdataset(files, combine='by_coords', parallel=True, preprocess=preprocess_era5t)
     ds_master = ds_master.sel(time=slice(None, CUTOFF_DATE))
     
-    doys = ds_master['time'].dt.dayofyear.values
+    # ETCCDI-STANDARD: Exzision des 29. Februar für einen homogenen 365-Tage-Kalender
+    ds_master = ds_master.sel(time=~((ds_master.time.dt.month == 2) & (ds_master.time.dt.day == 29)))
+    
+    # Standardisierte DOYs generieren (1-365, auch in Schaltjahren)
+    raw_doys = ds_master['time'].dt.dayofyear.values
+    is_leap = ds_master['time'].dt.is_leap_year.values
+    months = ds_master['time'].dt.month.values
+    doys = np.where(is_leap & (months >= 3), raw_doys - 1, raw_doys)
+    
     years = ds_master['time'].dt.year.values
     lats = ds_master.latitude.values
     lons = ds_master.longitude.values
@@ -61,13 +70,13 @@ def build_synoptic_climatology():
     # Initialisierung
     print("🆕 Initialisiere Synoptik-Matrix...")
     data_vars = {}
-    empty_3d = lambda: (("dayofyear", "latitude", "longitude"), np.full((366, n_lats, n_lons), np.nan, dtype=np.float32))
+    empty_3d = lambda: (("dayofyear", "latitude", "longitude"), np.full((365, n_lats, n_lons), np.nan, dtype=np.float32))
 
     for param in PARAMS:
         data_vars[f"{param}_mean_doy_A"] = empty_3d()
         data_vars[f"{param}_mean_doy_B"] = empty_3d()
 
-    ds_syn = xr.Dataset(coords={"dayofyear": np.arange(1, 367), "latitude": lats, "longitude": lons}, data_vars=data_vars)
+    ds_syn = xr.Dataset(coords={"dayofyear": np.arange(1, 366), "latitude": lats, "longitude": lons}, data_vars=data_vars)
 
     mask_A_yr = (years >= EPOCH_A[0]) & (years <= EPOCH_A[1])
     mask_B_yr = (years >= EPOCH_B[0]) & (years <= EPOCH_B[1])
@@ -82,7 +91,7 @@ def build_synoptic_climatology():
         arr_full = ds_master[param].compute().values
         
         t0 = time.time()
-        for target_doy in range(1, 367):
+        for target_doy in range(1, 366):
             idx = target_doy - 1
             win_doys = get_window_doys(target_doy)
             
@@ -100,8 +109,8 @@ def build_synoptic_climatology():
             if np.any(mask_B_win):
                 ds_syn[f"{param}_mean_doy_B"].values[idx] = np.nanmean(arr_win[mask_B_win], axis=0)
                 
-            if target_doy % 60 == 0 or target_doy == 366:
-                print(f"   -> DOY {target_doy}/366 berechnet...", end="\r", flush=True)
+            if target_doy % 60 == 0 or target_doy == 365:
+                print(f"   -> DOY {target_doy}/365 berechnet...", end="\r", flush=True)
 
         print(f"   -> '{param}' vollständig in {time.time() - param_start:.1f} Sekunden.")
         
