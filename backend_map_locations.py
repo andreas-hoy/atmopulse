@@ -1,4 +1,20 @@
-"""Grid-cell location labels (country / sea) for synoptic map hovers."""
+"""
+AtmoPulse Geospatial Location & Top-10 Country Indexing (backend_map_locations.py)
+
+This module handles the spatial hashing and intersection logic required for 
+the AtmoPulse synoptic map hovers and the automated Top-10 impact tables. 
+It ingests Natural Earth vector data, constructs highly efficient STRtree 
+spatial indexes, and maps ERA5/IFS grid cells to specific European countries 
+and marine regions.
+
+Core functionalities:
+- Pre-computes area-weighted fractional overlaps between meteorological grid 
+  cells and national borders to ensure accurate Top-10 impact rankings.
+- Excludes non-European nations and micro-territories from impact tables 
+  based on a strict 3000 km² threshold and canonical naming aliases.
+- Provides point-to-polygon lookups for interactive map hover labels 
+  (e.g., identifying if a coordinate lies over a specific country or the Open Ocean).
+"""
 from __future__ import annotations
 
 import requests
@@ -56,6 +72,7 @@ _LOCATION_INDEX: dict | None = None
 
 
 def _geodesic_area_km2(geom) -> float:
+    """Calculate the precise geodesic area of a geometry in square kilometers."""
     if geom.is_empty:
         return 0.0
     if geom.geom_type == "Polygon":
@@ -67,10 +84,12 @@ def _geodesic_area_km2(geom) -> float:
 
 
 def _country_lookup_key(name: str) -> str:
+    """Normalize country names for robust dictionary lookups."""
     return name.strip().lower().rstrip(".")
 
 
 def _feature_name(props: dict, *keys: str) -> str | None:
+    """Extract the primary feature name from GeoJSON properties using fallback keys."""
     for key in keys:
         val = props.get(key)
         if val:
@@ -79,12 +98,17 @@ def _feature_name(props: dict, *keys: str) -> str | None:
 
 
 def _load_geojson(url: str) -> list[dict]:
+    """Fetch and parse GeoJSON feature collections from a given URL."""
     resp = requests.get(url, timeout=30)
     resp.raise_for_status()
     return resp.json()["features"]
 
 
 def _prepare_features(features: list[dict], name_keys: tuple[str, ...]) -> tuple[list[str], list, STRtree]:
+    """
+    Parse geometries, filter by the European bounding box, and build an 
+    STRtree spatial index for highly efficient intersection queries.
+    """
     names, geoms = [], []
     for feat in features:
         name = _feature_name(feat.get("properties", {}), *name_keys)
@@ -96,21 +120,30 @@ def _prepare_features(features: list[dict], name_keys: tuple[str, ...]) -> tuple
             continue
         if geom.is_empty:
             continue
+        
+        # Fast bounding-box exclusion before adding to the spatial tree
         minx, miny, maxx, maxy = geom.bounds
         if maxx < EUROPE_BBOX[0] or minx > EUROPE_BBOX[2] or maxy < EUROPE_BBOX[1] or miny > EUROPE_BBOX[3]:
             continue
+            
         names.append(name)
         geoms.append(geom)
+        
     return names, geoms, STRtree(geoms)
 
 
 def _get_location_index() -> dict:
+    """
+    Singleton spatial index initializer. Fetches global vector polygons, calculates 
+    areas, and builds queryable trees for both terrestrial and marine regions.
+    """
     global _LOCATION_INDEX
     if _LOCATION_INDEX is not None:
         return _LOCATION_INDEX
 
     raw_features = _load_geojson(COUNTRIES_URL)
     country_areas: dict[str, float] = {}
+    
     for feat in raw_features:
         name = _feature_name(feat.get("properties", {}), "NAME", "ADMIN", "name")
         if not name:
@@ -128,6 +161,7 @@ def _get_location_index() -> dict:
     sea_names, sea_geoms, sea_tree = _prepare_features(
         _load_geojson(MARINE_URL), ("NAME", "name")
     )
+    
     _LOCATION_INDEX = {
         "country_names": country_names,
         "country_geoms": country_geoms,
@@ -141,6 +175,7 @@ def _get_location_index() -> dict:
 
 
 def _hits_for_cell(cell, tree: STRtree, geoms: list, names: list[str]) -> list[tuple[float, str]]:
+    """Query the STRtree for geometries intersecting the given cell and return their overlap areas."""
     hits: list[tuple[float, str]] = []
     for idx in tree.query(cell, predicate="intersects"):
         geom = geoms[int(idx)]
@@ -155,7 +190,7 @@ def _hits_for_cell(cell, tree: STRtree, geoms: list, names: list[str]) -> list[t
 
 
 def _canonical_top10_country(raw_name: str, area_km2: float | None = None) -> str | None:
-    """Normalize Natural Earth country names for Top-10 tables; None = exclude."""
+    """Normalize Natural Earth country names for AtmoPulse Top-10 tables; None = exclude."""
     name = raw_name.strip()
     lower = _country_lookup_key(name)
     if lower in _EXCLUDED_TOP10_NAMES:
@@ -221,19 +256,23 @@ def build_country_weight_grid(lons, lats, cell_size: float = 0.25) -> tuple[dict
     half = cell_size / 2.0
     shape = (len(lats), len(lons))
     weights: dict[str, np.ndarray] = {}
+    
     for i, lat in enumerate(lats):
         for j, lon in enumerate(lons):
             cell = box(float(lon) - half, float(lat) - half, float(lon) + half, float(lat) + half)
             cell_area = cell.area
+            
             for area, name in _hits_for_cell(cell, idx["country_tree"], idx["country_geoms"], idx["country_names"]):
                 if area <= 0:
                     continue
                 area_km2 = idx["country_areas"].get(name)
                 canonical = _canonical_top10_country(name, area_km2)
+                
                 if canonical is None:
                     continue
                 if canonical not in weights:
                     weights[canonical] = np.zeros(shape, dtype=np.float32)
+                    
                 weights[canonical][i, j] += area / cell_area
 
     sizes = {name: float(w.sum()) for name, w in weights.items()}

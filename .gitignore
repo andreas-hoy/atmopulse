@@ -4,6 +4,7 @@ venv/
 __pycache__/
 *.py[cod]
 .cache/
+.cache.sqlite
 
 # AtmoPulse Raw Data & Binaries
 *.grib
@@ -13,16 +14,18 @@ __pycache__/
 *.zarr
 *.part
 
-# Specific Tool Directories
-ERA5_ClimateTool/**/*.nc
-ERA5_ClimateTool/**/tmp_*/
+# Local ERA5 archives (never publish)
+ERA5_ClimateTool/
 
-# Security & API Keys
+# Security & API Keys (never publish)
 .env
 .cdsapirc
-
-# Additional API Credentials & Logs
 .ecmwfapirc
 *.log
+
+# Local snapshots and Office lock files
 _backup_*/
+backup_*/
+backup_*_code/
+~$*
 LinkedIn Figures/

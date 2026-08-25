@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ERA5 Phase 2: Two-Pass Decoupled Raw Data Downloader & Local Aggregator (V4 - Final & Robust)
-Autor: Dr. Andreas Hoy / SynEx Pipeline
+Autor: Dr. Andreas Hoy / Atmopulse Pipeline
 Architektur: 
 - PASS 1 (TX/TN) & PASS 2 (TG) in strikter Entkopplung (Micro-Batching).
 - Resume-Fähigkeit: Erkennt bereits teilweise geladene Temp-Dateien und spart Download-Zeit.

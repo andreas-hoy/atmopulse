@@ -1,31 +1,31 @@
 @echo off
 echo ==========================================
-echo  AtmoPulse Operative Pipeline
+echo  AtmoPulse operational pipeline
 echo ==========================================
 
-:: 1. Anaconda Umgebung aktivieren
+:: 1. Activate the Conda environment
 call "C:\Users\liina\miniconda3\condabin\activate.bat" cee_env
 
 cd /d "C:\Users\liina\Andreas ERA5"
 
-:: 2. Live-Vorhersage AIFS (Dauert ca. 2 Minuten)
+:: 2. Live AIFS forecast (~2 minutes)
 echo.
-echo ---> Lade AIFS (Machine Learning) Vorhersage...
+echo ---> Downloading AIFS (machine-learning) forecast...
 python aifs_ingestion.py
 
-:: 3. Live-Vorhersage IFS (Dauert ca. 1.5 Minuten)
+:: 3. Live IFS forecast (~1.5 minutes)
 echo.
-echo ---> Lade IFS (Physikalisches Modell) Vorhersage...
+echo ---> Downloading IFS (physics) forecast...
 python ifs_ingestion.py
 
-:: 4. ERA5 Historie (Dauert ca. 22 Minuten)
+:: 4. ERA5 history (~22 minutes)
 echo.
-echo ---> Aktualisiere ERA5 Baseline...
-:: Das 'cmd /c' fängt einen eventuellen Absturz/Exit des ERA5-Skripts ab!
+echo ---> Updating ERA5 baseline...
+:: cmd /c isolates an ERA5-script crash/exit from this parent batch
 cmd /c run_era5_update.bat
 
 echo.
 echo ==========================================
-echo Pipeline vollstaendig durchgelaufen!
+echo Pipeline finished.
 echo ==========================================
 pause

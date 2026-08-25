@@ -1,3 +1,20 @@
+"""
+AtmoPulse Wave Detection & Ridge-Plot Analytics (backend_waves.py)
+
+This module handles the extraction, dynamic thresholding, and visualization of 
+synoptic extreme events (summer heatwaves and winter coldwaves) using an adapted 
+Kyselý definition. 
+
+Core functionalities:
+- Manages high-speed, Zarr-backed extraction of ERA5 point time-series.
+- Dynamically calculates seasonal climatological thresholds (P95, P90, P75 for JJA; 
+  P5, P10, P25 for DJF) based on shifting reference periods (1961-1990 or 1996-2025).
+- Excises leap days (Feb 29th) to ensure statistical homoscedasticity per ETCCDI norms.
+- Identifies consecutive threshold exceedances and applies trailing tolerance drops.
+- Renders highly customized, interactive Plotly ridge-plots and annual intensity 
+  bar charts representing cumulative thermal stress (K·days).
+"""
+
 import xarray as xr
 import numpy as np
 import pandas as pd
@@ -6,26 +23,33 @@ import streamlit as st
 from pathlib import Path
 from scipy.interpolate import make_interp_spline
 
-from synex_theme import SYnex_COLD, SYnex_FONTS, SYnex_WARM, plotly_title_font, plotly_typography
+from atmopulse_theme import (
+    ATMOPULSE_COLD, 
+    ATMOPULSE_FONTS, 
+    ATMOPULSE_WARM, 
+    plotly_title_font, 
+    plotly_typography
+)
 
 DATA_DIR = Path("ERA5_ClimateTool/Master_Batches")
 CLIM_FILE = Path("ERA5_ClimateTool/Reference_Climatology/climatology_reference_complete.nc")
-if not CLIM_FILE.exists(): CLIM_FILE = Path("ERA5_ClimateTool/Reference_Climatology/climatology_reference.nc")
+if not CLIM_FILE.exists(): 
+    CLIM_FILE = Path("ERA5_ClimateTool/Reference_Climatology/climatology_reference.nc")
 
 # --- Ridge-plot layout (tune wave shape / break aesthetics here) ---
-WAVE_RIDGE_SPLINE_PTS = 100      # smoothness of the ridge curve
-WAVE_RIDGE_SKEW_FACTOR = 2.5     # horizontal bulge vs. intensity (0 = symmetric)
-WAVE_RIDGE_HEIGHT_SCALE = 20.0   # vertical extent in axis-year units (÷ intensity)
-WAVE_BREAK_TAIL_LEN = 1.0        # x-axis length of the post-peak decay tail
-WAVE_BREAK_TAIL_STEPS = 30       # number of points along the decay tail
-WAVE_BREAK_CTRL_X = -0.25        # Bezier ctrl-x (× tail_len); negative → mid-fall bulges left
+WAVE_RIDGE_SPLINE_PTS = 100      # Smoothness of the ridge curve
+WAVE_RIDGE_SKEW_FACTOR = 2.5     # Horizontal bulge vs. intensity (0 = symmetric)
+WAVE_RIDGE_HEIGHT_SCALE = 20.0   # Vertical extent in axis-year units (÷ intensity)
+WAVE_BREAK_TAIL_LEN = 1.0        # X-axis length of the post-peak decay tail
+WAVE_BREAK_TAIL_STEPS = 30       # Number of points along the decay tail
+WAVE_BREAK_CTRL_X = -0.25        # Bezier ctrl-x (× tail_len); negative -> mid-fall bulges left
 WAVE_BREAK_CTRL_Y = 0.42         # Bezier ctrl-y (× peak height); shapes the curl
 WAVE_LINE_WIDTH = 1.0
-WAVE_FILL_ALPHA_BASE = 0.55      # gradient fill opacity at ridge base
-WAVE_FILL_ALPHA_PEAK = 0.88      # gradient fill opacity at ridge peak
+WAVE_FILL_ALPHA_BASE = 0.55      # Gradient fill opacity at ridge base
+WAVE_FILL_ALPHA_PEAK = 0.88      # Gradient fill opacity at ridge peak
 WAVE_LINE_ALPHA = 0.92
-WAVE_INTENSITY_CAP_TX = 100.0    # intensity (K·days) mapped to full warm colour
-WAVE_INTENSITY_CAP_TN = 200.0    # intensity (K·days) mapped to full cold colour
+WAVE_INTENSITY_CAP_TX = 100.0    # Intensity (K·days) mapped to full warm colour
+WAVE_INTENSITY_CAP_TN = 200.0    # Intensity (K·days) mapped to full cold colour
 
 
 def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
@@ -45,13 +69,13 @@ def _lerp_hex(c0: str, c1: str, t: float) -> tuple[int, int, int]:
 
 
 def _wave_ridge_colors(parameter: str, norm_val: float) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    """SynEx map palette: warm p75→rec / cold p25→rec by severity."""
+    """AtmoPulse map palette: warm p75->rec / cold p25->rec by severity."""
     if parameter == "TX":
-        base = _hex_to_rgb(SYnex_WARM["p75"])
-        peak = _lerp_hex(SYnex_WARM["p90"], SYnex_WARM["rec"], norm_val)
+        base = _hex_to_rgb(ATMOPULSE_WARM["p75"])
+        peak = _lerp_hex(ATMOPULSE_WARM["p90"], ATMOPULSE_WARM["rec"], norm_val)
     else:
-        base = _hex_to_rgb(SYnex_COLD["p25"])
-        peak = _lerp_hex(SYnex_COLD["p10"], SYnex_COLD["rec"], norm_val)
+        base = _hex_to_rgb(ATMOPULSE_COLD["p25"])
+        peak = _lerp_hex(ATMOPULSE_COLD["p10"], ATMOPULSE_COLD["rec"], norm_val)
     return base, peak
 
 
@@ -59,10 +83,12 @@ def _wave_break_tail(x_end: float, y_peak: float) -> tuple[np.ndarray, np.ndarra
     """Visual-only post-peak closure (Bezier); Kyselý data ends at the peak."""
     if y_peak <= 0:
         return np.array([x_end]), np.array([0.0])
+    
     t = np.linspace(0, 1, WAVE_BREAK_TAIL_STEPS)
     x_ctrl = x_end + WAVE_BREAK_TAIL_LEN * WAVE_BREAK_CTRL_X
     y_ctrl = y_peak * WAVE_BREAK_CTRL_Y
     x_out = x_end + WAVE_BREAK_TAIL_LEN
+    
     x_break = (1 - t) ** 2 * x_end + 2 * (1 - t) * t * x_ctrl + t ** 2 * x_out
     y_break = (1 - t) ** 2 * y_peak + 2 * (1 - t) * t * y_ctrl
     return x_break, y_break
@@ -105,10 +131,11 @@ def _wave_season_thresholds(lat: float, lon: float, suffix: str) -> dict:
     ds_archive = _load_waves_archive_ds()
     if ds_archive is None:
         return {}
+    
     pt = ds_archive.sel(latitude=lat, longitude=lon, method="nearest").compute()
     times = pd.to_datetime(pt.valid_time.values)
 
-    # ETCCDI-STANDARD: Lösche den 29. Februar zur Gewährleistung der Homoskedastizität
+    # ETCCDI-STANDARD: Remove February 29th to ensure statistical homoscedasticity.
     pt = pt.sel(valid_time=~((times.month == 2) & (times.day == 29)))
     times = pd.to_datetime(pt.valid_time.values)
 
@@ -127,6 +154,7 @@ def _wave_season_thresholds(lat: float, lon: float, suffix: str) -> dict:
         raw = np.asarray(pt[var].values, dtype=np.float64)
         if np.nanmean(raw[np.isfinite(raw)]) > 100:
             raw -= 273.15
+        
         df = pd.DataFrame({var: raw}, index=times).sort_index()
         df = df[~df.index.duplicated(keep="first")]
         agg = "max" if var == "tx" else "min"
@@ -141,6 +169,7 @@ def _wave_season_thresholds(lat: float, lon: float, suffix: str) -> dict:
 
     tx_p75, tx_p90, tx_p95 = np.nanpercentile(jja, [75, 90, 95])
     tn_p5, tn_p10, tn_p25 = np.nanpercentile(djf, [5, 10, 25])
+    
     return {
         "tx_p75": float(tx_p75), "tx_p90": float(tx_p90), "tx_p95": float(tx_p95),
         "tn_p5": float(tn_p5), "tn_p10": float(tn_p10), "tn_p25": float(tn_p25),
@@ -149,7 +178,7 @@ def _wave_season_thresholds(lat: float, lon: float, suffix: str) -> dict:
 
 
 def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", threshold_level="Strong (P90/10)", stat_metric="Cumulative Annual Wave Intensity"):
-    empty_fig = go.Figure().add_annotation(text="Data Missing or Processing.", x=0.5, y=0.5, showarrow=False, font=dict(size=16, color="red", family=SYnex_FONTS["sora_css"]))
+    empty_fig = go.Figure().add_annotation(text="Data Missing or Processing.", x=0.5, y=0.5, showarrow=False, font=dict(size=16, color="red", family=ATMOPULSE_FONTS["sora_css"]))
     empty_fig.update_layout(**plotly_typography())
 
     ds_archive = _load_waves_archive_ds()
@@ -169,7 +198,9 @@ def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", thresho
         p_t_str, p_d_str = thr["tn_p10"], thr["tn_p25"]
 
     p_thresh, p_drop = (p_t_ext, p_d_ext) if "Extreme" in threshold_level else (p_t_str, p_d_str)
-    if np.isnan(p_thresh) or np.isnan(p_drop): return empty_fig, empty_fig
+    
+    if np.isnan(p_thresh) or np.isnan(p_drop): 
+        return empty_fig, empty_fig
 
     var_key = 'tx' if parameter == "TX" else 'tn'
     pt = ds_archive.sel(latitude=lat, longitude=lon, method='nearest').compute()
@@ -180,13 +211,14 @@ def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", thresho
     raw_vals = np.asarray(pt[var_key].values, dtype=np.float64)
     finite_vals = raw_vals[np.isfinite(raw_vals)]
     is_kelvin = finite_vals.size > 0 and np.nanmean(finite_vals) > 100.0
+    
     if is_kelvin:
         raw_vals = raw_vals - 273.15
 
     df_raw = pd.DataFrame({'Temp': raw_vals}, index=pd.to_datetime(pt.valid_time.values))
     df_raw = df_raw[~df_raw.index.duplicated(keep='first')].sort_index()
     
-    # ETCCDI-STANDARD: Exzision des 29. Februar aus der Kyselý-Wave Detection
+    # ETCCDI-STANDARD: Excision of February 29th from Kyselý wave detection.
     df_raw = df_raw[~((df_raw.index.month == 2) & (df_raw.index.day == 29))]
     
     # tx/tn are now true 24h daily statistics (one value per calendar day)
@@ -196,7 +228,9 @@ def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", thresho
         df_raw = df_raw.resample('D').max()
     else:
         df_raw = df_raw.resample('D').min()
+        
     df = df_raw.copy()
+    
     # Interpolate isolated NaNs (Zarr packing gaps) before building the
     # Kyselý wave-detection series; leaves the detection loop itself untouched.
     df['Temp'] = df['Temp'].interpolate(method='linear', limit_area='inside', limit=3)
@@ -224,9 +258,10 @@ def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", thresho
 
     waves_data = []
 
-    # SOMMER-BUG FIX: Natives Pandas Reindexing erzwingt saubere Datums- und Tageszählung
+    # SUMMER-BUG FIX: Native Pandas reindexing forces clean date and day counting.
     for yr, group in df_season.groupby(group_key):
         group = group.drop_duplicates(subset=['date'], keep='first')
+        
         if parameter == "TX":
             full_dates = pd.date_range(f"{int(yr)}-05-01", f"{int(yr)}-09-30")
         else:
@@ -242,25 +277,42 @@ def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", thresho
         
         i = 0
         while i < n - 2:
-            if np.isnan(temps[i:i+3]).any(): i += 1; continue
+            if np.isnan(temps[i:i+3]).any(): 
+                i += 1
+                continue
                 
             if all((temps[i+k] >= p_thresh) if parameter == "TX" else (temps[i+k] <= p_thresh) for k in range(3)):
                 cand_temps, cand_xs, cand_dates = [], [], []
                 j = i
                 while j < n and not np.isnan(temps[j]):
-                    cand_temps.append(temps[j]); cand_xs.append(xs[j]); cand_dates.append(dates[j])
+                    cand_temps.append(temps[j])
+                    cand_xs.append(xs[j])
+                    cand_dates.append(dates[j])
+                    
                     drop_break = (temps[j] < p_drop) if parameter == "TX" else (temps[j] > p_drop)
                     mean_break = (np.mean(cand_temps) < p_thresh) if parameter == "TX" else (np.mean(cand_temps) > p_thresh)
+                    
                     if drop_break or mean_break:
-                        cand_temps.pop(); cand_xs.pop(); cand_dates.pop()
+                        cand_temps.pop()
+                        cand_xs.pop()
+                        cand_dates.pop()
                         break
                     j += 1
                 
                 intensity = sum(abs(t - p_thresh) for t in cand_temps if ((t >= p_thresh) if parameter == "TX" else (t <= p_thresh)))
+                
                 if intensity > 0 and len(cand_temps) >= 3: 
-                    waves_data.append({'year': yr, 'xs': cand_xs, 'temps': cand_temps, 'intensity': intensity, 'start_date': cand_dates[0], 'end_date': cand_dates[-1]})
+                    waves_data.append({
+                        'year': yr, 
+                        'xs': cand_xs, 
+                        'temps': cand_temps, 
+                        'intensity': intensity, 
+                        'start_date': cand_dates[0], 
+                        'end_date': cand_dates[-1]
+                    })
                 i = j if j > i else i + 1
-            else: i += 1
+            else: 
+                i += 1
 
     # TEMP DIAGNOSTICS (see app.py debug panel) — safe to remove once the
     # TX-vs-TN wave-count discrepancy is root-caused.
@@ -307,8 +359,11 @@ def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", thresho
         height=750, plot_bgcolor='white', paper_bgcolor='white', margin=dict(l=55, r=20, t=50, b=40),
         meta=debug_info,
     )
-    for gl in grid_lines: fig_main.add_vline(x=gl, line_width=1.2, line_color="rgba(30,30,30,0.6)", layer="below")
-    for yr in range(start_year, end_year + 1, 5): fig_main.add_hline(y=yr, line_width=0.7, line_color="rgba(100,100,100,0.4)", layer="below")
+    
+    for gl in grid_lines: 
+        fig_main.add_vline(x=gl, line_width=1.2, line_color="rgba(30,30,30,0.6)", layer="below")
+    for yr in range(start_year, end_year + 1, 5): 
+        fig_main.add_hline(y=yr, line_width=0.7, line_color="rgba(100,100,100,0.4)", layer="below")
         
     if waves_data:
         for w in waves_data:
@@ -336,6 +391,7 @@ def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", thresho
             (r_b, g_b, b_b), (r, g, b) = _wave_ridge_colors(parameter, norm_val)
 
             sd_str, ed_str = pd.to_datetime(w['start_date']).strftime('%d.%m.'), pd.to_datetime(w['end_date']).strftime('%d.%m.%Y')
+            
             fig_main.add_trace(go.Scatter(
                 x=x_full, y=y_coords, mode='lines',
                 line=dict(color=f"rgba({r},{g},{b},{WAVE_LINE_ALPHA})", width=WAVE_LINE_WIDTH, shape='spline'),
@@ -348,7 +404,8 @@ def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", thresho
                 text=f"<b>Duration: {sd_str}–{ed_str}</b><br>Length: {len(w_xs)} days<br>Severity: {w['intensity']:.1f} K",
                 showlegend=False,
             ))
-    else: fig_main.add_annotation(text="No wave events detected.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False, font=dict(size=16, color="gray", family=SYnex_FONTS["sora_css"]))
+    else: 
+        fig_main.add_annotation(text="No wave events detected.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False, font=dict(size=16, color="gray", family=ATMOPULSE_FONTS["sora_css"]))
 
     if stat_metric == "Annual Cycle Frequency":
         df_season['is_str'] = (df_season['Temp'] >= p_t_str) if parameter == "TX" else (df_season['Temp'] <= p_t_str)
@@ -358,12 +415,22 @@ def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", thresho
         
         fig_stats = go.Figure()
         if parameter == "TX":
-            c_str, c_ext = SYnex_WARM["p90"], SYnex_WARM["p95"]
+            c_str, c_ext = ATMOPULSE_WARM["p90"], ATMOPULSE_WARM["p95"]
         else:
-            c_str, c_ext = SYnex_COLD["p10"], SYnex_COLD["p5"]
+            c_str, c_ext = ATMOPULSE_COLD["p10"], ATMOPULSE_COLD["p5"]
+            
         fig_stats.add_trace(go.Scatter(x=f_str.index, y=f_str.values, mode='lines', line=dict(color=c_str, width=2), name="Strong", hovertemplate='%{y:.1f}%<extra></extra>'))
         fig_stats.add_trace(go.Scatter(x=f_ext.index, y=f_ext.values, mode='lines', line=dict(color=c_ext, width=2), name="Extreme", hovertemplate='%{y:.1f}%<extra></extra>'))
-        fig_stats.update_layout(**plotly_typography(), title=f"Annual Cycle Frequency (5-Day Smoothing) | Reference {'1961–1990' if suffix=='A' else '1996–2025'}", xaxis=dict(tickmode='array', tickvals=tick_vals, ticktext=tick_text, showgrid=True), yaxis_title="Relative Frequency (%)", height=350, template="plotly_white", margin=dict(t=40, b=10, l=10, r=10), legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5))
+        
+        fig_stats.update_layout(
+            **plotly_typography(), 
+            title=f"Annual Cycle Frequency (5-Day Smoothing) | Reference {'1961–1990' if suffix=='A' else '1996–2025'}", 
+            xaxis=dict(tickmode='array', tickvals=tick_vals, ticktext=tick_text, showgrid=True), 
+            yaxis_title="Relative Frequency (%)", 
+            height=350, template="plotly_white", 
+            margin=dict(t=40, b=10, l=10, r=10), 
+            legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5)
+        )
         return fig_main, fig_stats
 
     stats = pd.DataFrame(index=np.arange(start_year, end_year + 1))
@@ -387,9 +454,9 @@ def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", thresho
 
     fig_stats = go.Figure()
     if parameter == "TX":
-        bar_color, mean_color = "#E8A8A0", SYnex_WARM["p95"]
+        bar_color, mean_color = "#E8A8A0", ATMOPULSE_WARM["p95"]
     else:
-        bar_color, mean_color = "#9EC5E8", SYnex_COLD["p5"]
+        bar_color, mean_color = "#9EC5E8", ATMOPULSE_COLD["p5"]
 
     fig_stats.add_trace(go.Bar(
         x=stats.index, y=stats[sel_col], marker_color=bar_color, name="Intensity",

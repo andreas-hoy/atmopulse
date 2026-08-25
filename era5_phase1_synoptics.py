@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ERA5 Phase 1: Synoptics Downloader (V4 - Async 4-Worker Architecture)
-Autor: Dr. Andreas Hoy / SynEx Pipeline
+Autor: Dr. Andreas Hoy / Atmopulse Pipeline
 Architektur: 
 - PASS 1: Lädt die synoptischen Treiber (12 UTC) herunter.
 - Beinhaltet: MSLP (Single Levels) sowie Z500, T850, U300, V300 (Pressure Levels).

@@ -1,4 +1,4 @@
-# SynEx – core app (Streamlit dashboard)
+# AtmoPulse – core app (Streamlit dashboard)
 streamlit>=1.32
 xarray>=2024.1
 netCDF4>=1.6
