@@ -1,31 +1,44 @@
-# Python & Environments
-.venv/
-venv/
+# ==========================================
+# AtmoPulse Repository Ignore List
+# ==========================================
+
+# 1. Python & Environments
 __pycache__/
 *.py[cod]
+*$py.class
+.venv/
+venv/
+.conda/
 .cache/
 .cache.sqlite
 
-# AtmoPulse Raw Data & Binaries
+# 2. Large Meteorological Datasets & Binaries
 *.grib
 *.nc
 *.parquet
 *.zarr/
-*.zarr
 *.part
-
-# Local ERA5 archives (never publish)
 ERA5_ClimateTool/
 
-# Security & API Keys (never publish)
+# 3. Security & API Keys (CRITICAL)
 .env
 .cdsapirc
 .ecmwfapirc
 *.log
+secrets.toml
 
-# Local snapshots and Office lock files
+# 4. Media & Documentation (Assets to keep out of version control)
+*.jpg
+*.jpeg
+*.png
+*.docx
+*.xlsx
+*.pdf
+LinkedIn Figures/
+
+# 5. Local Snapshots & OS Files
 _backup_*/
 backup_*/
-backup_*_code/
+.DS_Store
+Thumbs.db
 ~$*
-LinkedIn Figures/
