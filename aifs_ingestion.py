@@ -2,7 +2,7 @@
 """Ingest the latest ECMWF AIFS deterministic run onto the ERA5 grid.
 
 Downloads surface (2t, msl) and pressure-level (T, Z, U, V at 300/500/850 hPa)
-fields via ecmwf-opendata, aggregates daily TX/TN/TG (calendar-day resample)
+fields via ecmwf-opendata, aggregates daily TG (calendar-day resample)
 and 12 UTC synoptics, then applies CDO conservative (fracarea-normalised)
 regridding. Assigns an ETCCDI 365-day ``doy_365`` coordinate for the frontend.
 """
@@ -49,7 +49,8 @@ def setup_logging() -> None:
 def download_aifs_gribs():
     """Retrieve the newest available AIFS run from the Azure open-data mirror."""
     sources = ["azure"]
-    steps = list(range(6, 73, 6))
+    # 6-hourly steps up to 96 hours (4 days).
+    steps = list(range(0, 102, 6))
 
     target_sfc = str(TMP_DIR / "aifs_sfc.grib")
     target_pl = str(TMP_DIR / "aifs_pl.grib")
@@ -199,7 +200,7 @@ def apply_conservative_weights(ds_source, weights_file, ds_target_grid):
 
 
 def process_and_align_aifs(sfc_file, pl_file):
-    """Aggregate daily extremes / 12Z synoptics and regrid onto ERA5."""
+    """Aggregate daily mean temperature / 12Z synoptics and regrid onto ERA5."""
     logging.info("Loading GRIB files via cfgrib into RAM...")
     ds_sfc = xr.open_dataset(sfc_file, engine="cfgrib")
     ds_pl = xr.open_dataset(pl_file, engine="cfgrib")
@@ -219,16 +220,24 @@ def process_and_align_aifs(sfc_file, pl_file):
     mslp_hpa = ds_sfc["msl"] / 100.0
 
     logging.info(
-        "Aggregating to ETCCDI daily extremes and 12Z synoptics..."
+        "Aggregating strict 00-00 UTC daily means and 12Z synoptics..."
     )
-    tx = t2m_celsius.resample(time="1D").max()
-    tn = t2m_celsius.resample(time="1D").min()
-    tg = t2m_celsius.resample(time="1D").mean()
+    logging.warning(
+        "AIFS utilizes discontinuous 6-hourly state jumps. True diurnal TX/TN "
+        "extremes are absent from output tensors. Extreme extraction is OMITTED."
+    )
+    
+    # Calculate daily mean (TG) with right closure to capture the 00:00 step correctly.
+    daily_tg = t2m_celsius.resample(time="1D", closed="right", label="left").mean()
+    
+    # Enforce strict calendar day completeness (exactly 4 steps per day for 6-hourly data).
+    daily_count = t2m_celsius.resample(time="1D", closed="right", label="left").count()
+    tg = daily_tg.where(daily_count == 4, drop=True)
 
     ds_pl_12z = ds_pl.sel(time=ds_pl.time.dt.hour == 12)
     mslp_12z = mslp_hpa.sel(time=mslp_hpa.time.dt.hour == 12)
 
-    mslp = mslp_12z.resample(time="1D").first()
+    mslp = mslp_12z.resample(time="1D").first().sel(time=tg.time)
 
     z500 = (
         ds_pl_12z["z"]
@@ -236,12 +245,14 @@ def process_and_align_aifs(sfc_file, pl_file):
         .resample(time="1D")
         .first()
         .drop_vars("isobaricInhPa")
+        .sel(time=tg.time)
     )
     t850 = (
         (ds_pl_12z["t"].sel(isobaricInhPa=850) - 273.15)
         .resample(time="1D")
         .first()
         .drop_vars("isobaricInhPa")
+        .sel(time=tg.time)
     )
     u300 = (
         ds_pl_12z["u"]
@@ -249,6 +260,7 @@ def process_and_align_aifs(sfc_file, pl_file):
         .resample(time="1D")
         .first()
         .drop_vars("isobaricInhPa")
+        .sel(time=tg.time)
     )
     v300 = (
         ds_pl_12z["v"]
@@ -256,12 +268,11 @@ def process_and_align_aifs(sfc_file, pl_file):
         .resample(time="1D")
         .first()
         .drop_vars("isobaricInhPa")
+        .sel(time=tg.time)
     )
 
     ds_forecast = xr.Dataset(
         {
-            "tx": tx.astype("float32"),
-            "tn": tn.astype("float32"),
             "tg": tg.astype("float32"),
             "mslp": mslp.astype("float32"),
             "z500": z500.astype("float32"),

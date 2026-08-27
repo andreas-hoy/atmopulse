@@ -40,6 +40,33 @@ def harmonize_time(dataset: xr.Dataset) -> xr.Dataset:
         dataset = dataset.rename({'valid_time': 'time'})
     return dataset
 
+def _collapse_aux_for_agg(da: xr.DataArray) -> xr.DataArray:
+    """Drop ERA5T expver/number so daily resample cannot broadcast to all-NaN."""
+    if "expver" in da.dims:
+        da = da.dropna(dim="expver", how="all")
+        if "expver" in da.dims:
+            reduce_dims = [d for d in da.dims if d != "expver"]
+            n_finite = da.notnull().sum(dim=reduce_dims)
+            da = da.isel(expver=int(n_finite.argmax().item()), drop=True)
+    if "number" in da.dims and da.sizes.get("number", 0) == 1:
+        da = da.isel(number=0, drop=True)
+    for name in ("expver", "number"):
+        if name in da.coords:
+            da = da.drop_vars(name, errors="ignore")
+    return da
+
+
+def _daily_on_index(da: xr.DataArray, how: str, target_time) -> xr.DataArray:
+    """Calendar-day stat reindexed onto the synoptic (already-floored) time axis.
+
+    Assigning a 00:00 daily field onto a dataset whose time is still 12:00
+    silently aligns to zero matches and writes TX/TN/TG as all-NaN.
+    """
+    da = _collapse_aux_for_agg(da)
+    agg = getattr(da.resample(time="1D"), how)()
+    agg = agg.assign_coords(time=agg["time"].dt.floor("D"))
+    return agg.reindex(time=target_time)
+
 def main() -> None:
     """Execute the main 90-day rolling update pipeline for ERA5 climate data."""
     root_path = Path("ERA5_ClimateTool/Master_Batches").resolve()
@@ -134,10 +161,10 @@ def main() -> None:
             if "pressure_level" in ds_update.coords:
                 ds_update = ds_update.drop_vars("pressure_level")
 
-            ds_update["tx"] = (ds_mx2t["mx2t"].resample(time='1D').max() - 273.15).astype('float32')
-            ds_update["tn"] = (ds_mn2t["mn2t"].resample(time='1D').min() - 273.15).astype('float32')
-            ds_update["tg"] = (ds_t2m["t2m"].resample(time='1D').mean() - 273.15).astype('float32')
-            ds_update['time'] = ds_update['time'].dt.floor('D')
+            ds_update["time"] = ds_update["time"].dt.floor("D")
+            ds_update["tx"] = (_daily_on_index(ds_mx2t["mx2t"], "max", ds_update.time) - 273.15).astype("float32")
+            ds_update["tn"] = (_daily_on_index(ds_mn2t["mn2t"], "min", ds_update.time) - 273.15).astype("float32")
+            ds_update["tg"] = (_daily_on_index(ds_t2m["t2m"], "mean", ds_update.time) - 273.15).astype("float32")
 
             for var in ["tx", "tn", "tg", "t850"]:
                 ds_update[var].attrs["units"] = "Celsius"

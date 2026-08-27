@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ingest the latest ECMWF IFS deterministic run onto the ERA5 grid.
 
-Downloads surface (2t, msl) and pressure-level (T, Z, U, V at 300/500/850 hPa)
+Downloads surface (mx2t3, mn2t3, 2t, msl) and pressure-level (T, Z, U, V at 300/500/850 hPa)
 fields via ecmwf-opendata, resolves cfgrib time-coordinate conflicts,
 aggregates daily TX/TN/TG (calendar-day 00–00 UTC resample) and 12 UTC
 synoptics, then applies CDO conservative (fracarea-normalised) regridding.
@@ -50,7 +50,12 @@ def setup_logging() -> None:
 def download_ifs_gribs():
     """Retrieve the newest available IFS run from ECMWF open data."""
     client = Client(source="ecmwf", model="ifs", resol="0p25")
-    steps = list(range(0, 73, 6))
+    
+    # 3-hourly steps up to 96 hours.
+    # CRITICAL: step=0 is explicitly omitted to prevent cfgrib duplication and data corruption
+    # for accumulated fields (mx2t3, mn2t3).
+    steps_3h = list(range(3, 99, 3))
+    
     target_sfc = str(TMP_DIR / "ifs_sfc.grib")
     target_pl = str(TMP_DIR / "ifs_pl.grib")
 
@@ -71,19 +76,21 @@ def download_ifs_gribs():
                 date=date_str,
                 time=hour,
                 type="fc",
+                stream="oper",
                 levtype="sfc",
-                param=["2t", "msl"],
-                step=steps,
+                param=["2t", "msl", "mx2t3", "mn2t3"],
+                step=steps_3h,
                 target=target_sfc,
             )
             client.retrieve(
                 date=date_str,
                 time=hour,
                 type="fc",
+                stream="oper",
                 levtype="pl",
                 levelist=[300, 500, 850],
                 param=["t", "z", "u", "v"],
-                step=steps,
+                step=steps_3h,
                 target=target_pl,
             )
             return target_sfc, target_pl, date_str, hour
@@ -179,18 +186,30 @@ def process_and_align_ifs(sfc_file, pl_file):
     ds_sfc = ds_sfc.rename({"valid_time": "time"})
     ds_pl = ds_pl.rename({"valid_time": "time"})
 
-    t2m_celsius = ds_sfc["t2m"] - 273.15
+    tg_inst_c = ds_sfc["t2m"] - 273.15
+    tx_c = ds_sfc["mx2t3"] - 273.15
+    tn_c = ds_sfc["mn2t3"] - 273.15
     mslp_hpa = ds_sfc["msl"] / 100.0
 
-    logging.info("Aggregating 00–00 UTC T-extremes and 12Z synoptics...")
-    tx = t2m_celsius.resample(time="1D").max()
-    tn = t2m_celsius.resample(time="1D").min()
-    tg = t2m_celsius.resample(time="1D").mean()
+    logging.info("Aggregating strict 00-00 UTC T-extremes and 12Z synoptics...")
+    
+    # Shift bin closure to the right to capture the trailing 00:00 UTC step
+    daily_tx = tx_c.resample(time="1D", closed="right", label="left").max()
+    daily_tn = tn_c.resample(time="1D", closed="right", label="left").min()
+    daily_tg = tg_inst_c.resample(time="1D", closed="right", label="left").mean()
+    
+    # Enforce strict 0-0 UTC completeness (exactly 8 steps per calendar day)
+    daily_count = tx_c.resample(time="1D", closed="right", label="left").count()
+    
+    tx = daily_tx.where(daily_count == 8, drop=True)
+    tn = daily_tn.where(daily_count == 8, drop=True)
+    tg = daily_tg.where(daily_count == 8, drop=True)
 
+    # 12Z Synoptic Extraction
     ds_pl_12z = ds_pl.sel(time=ds_pl.time.dt.hour == 12)
     mslp_12z = mslp_hpa.sel(time=mslp_hpa.time.dt.hour == 12)
 
-    mslp = mslp_12z.resample(time="1D").first()
+    mslp = mslp_12z.resample(time="1D").first().sel(time=tx.time)
 
     z500 = (
         ds_pl_12z["z"]
@@ -198,12 +217,14 @@ def process_and_align_ifs(sfc_file, pl_file):
         .resample(time="1D")
         .first()
         .drop_vars("isobaricInhPa")
+        .sel(time=tx.time)
     )
     t850 = (
         (ds_pl_12z["t"].sel(isobaricInhPa=850) - 273.15)
         .resample(time="1D")
         .first()
         .drop_vars("isobaricInhPa")
+        .sel(time=tx.time)
     )
     u300 = (
         ds_pl_12z["u"]
@@ -211,6 +232,7 @@ def process_and_align_ifs(sfc_file, pl_file):
         .resample(time="1D")
         .first()
         .drop_vars("isobaricInhPa")
+        .sel(time=tx.time)
     )
     v300 = (
         ds_pl_12z["v"]
@@ -218,6 +240,7 @@ def process_and_align_ifs(sfc_file, pl_file):
         .resample(time="1D")
         .first()
         .drop_vars("isobaricInhPa")
+        .sel(time=tx.time)
     )
 
     ds_forecast = xr.Dataset(

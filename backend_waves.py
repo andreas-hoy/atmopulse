@@ -23,6 +23,7 @@ import streamlit as st
 from pathlib import Path
 from scipy.interpolate import make_interp_spline
 
+from backend_maps import drop_era5t_aux
 from atmopulse_theme import (
     ATMOPULSE_COLD, 
     ATMOPULSE_FONTS, 
@@ -95,7 +96,7 @@ def _wave_break_tail(x_end: float, y_peak: float) -> tuple[np.ndarray, np.ndarra
 
 
 @st.cache_resource(show_spinner=False)
-def _load_waves_archive_ds():
+def _load_waves_archive_ds(_archive_version=2):
     """
     SINGLETON POINTER (ZARR OPTIMIZED): Opens the pre-consolidated Zarr archive 
     exactly ONCE per server process and keeps the lazy handle alive in memory.
@@ -109,7 +110,15 @@ def _load_waves_archive_ds():
     zarr_path = DATA_DIR / "era5_txtn_archive.zarr"
     if not zarr_path.exists():
         return None
-    return xr.open_zarr(zarr_path, consolidated=True)
+    ds = xr.open_zarr(zarr_path, consolidated=True)
+    rename = {}
+    if "mx2t" in ds.data_vars and "tx" not in ds.data_vars:
+        rename["mx2t"] = "tx"
+    if "mn2t" in ds.data_vars and "tn" not in ds.data_vars:
+        rename["mn2t"] = "tn"
+    if rename:
+        ds = ds.rename(rename)
+    return drop_era5t_aux(ds)
 
 
 @st.cache_resource(show_spinner=False)
@@ -355,7 +364,7 @@ def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", thresho
             font=plotly_title_font(size=13),
         ),
         xaxis=dict(tickmode='array', tickvals=tick_vals, ticktext=tick_text, range=[start_plot_x, end_plot_x], showgrid=False, zeroline=False),
-        yaxis=dict(tickmode='array', tickvals=y_ticks_vals[::5], ticktext=y_ticks_text[::5], range=[2026.5, start_year - 10.0], showgrid=False, zeroline=False, showline=False),
+        yaxis=dict(tickmode='array', tickvals=y_ticks_vals[::5], ticktext=y_ticks_text[::5], range=[2026.5, start_year - (5.0 if parameter == "TX" else 15.0)], showgrid=False, zeroline=False, showline=False),
         height=750, plot_bgcolor='white', paper_bgcolor='white', margin=dict(l=55, r=20, t=50, b=40),
         meta=debug_info,
     )
