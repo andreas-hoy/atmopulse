@@ -504,6 +504,31 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     max-width: 100% !important;
     max-height: 100% !important;
 }}
+/* Opacity-slider map: same EUROPE_BBOX-locked frame as above, plus a bit of
+   extra height so the Plotly layout slider has room beneath the map instead
+   of overlapping it (the slider's own space is reserved via Plotly margin,
+   not by shrinking the map's lon:lat ratio, which stays letterboxed-safe
+   via the shared xaxis/yaxis "constrain: domain" config). */
+.st-key-map_opacity {{
+    position: relative !important;
+    aspect-ratio: 70 / 34 !important;
+    width: 100% !important;
+    height: auto !important;
+    max-width: 100% !important;
+    overflow: hidden !important;
+}}
+.st-key-map_opacity > div,
+.st-key-map_opacity [data-testid="stPlotlyChart"],
+.st-key-map_opacity .js-plotly-plot,
+.st-key-map_opacity .plot-container,
+.st-key-map_opacity .svg-container {{
+    position: absolute !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    max-width: 100% !important;
+    max-height: 100% !important;
+}}
 
 /* Sidebar: Filters & Controls */
 section[data-testid="stSidebar"] {{

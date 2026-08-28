@@ -134,11 +134,42 @@ def _harmonize_live_forecast(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
+def _forecast_model_key(forecast_model: str | None = None) -> str:
+    if forecast_model:
+        return str(forecast_model)
+    return str(st.session_state.get("forecast_model", "IFS (Physics-based)"))
+
+
+def _want_aifs(forecast_model: str | None = None) -> bool:
+    return "AIFS" in _forecast_model_key(forecast_model)
+
+
 @st.cache_resource(show_spinner=False)
-def load_global_datasets(_harmonize_version=6) -> xr.Dataset:
-    """Nearby-year master batches plus the latest IFS daily forecast."""
+def load_global_datasets(_harmonize_version=10, forecast_model: str = "IFS (Physics-based)") -> xr.Dataset:
+    """Nearby-year master batches plus the selected live forecast (IFS or AIFS)."""
     today = pd.Timestamp.now().normalize()
-    return _open_synoptic_range(today - pd.Timedelta(days=400), today + pd.Timedelta(days=10))
+    return _open_synoptic_range(
+        today - pd.Timedelta(days=400), today + pd.Timedelta(days=10),
+        forecast_model=forecast_model,
+    )
+
+
+def _open_master_year_nc(path: Path) -> xr.Dataset | None:
+    """Open one era5_master_daily_YYYY.nc the same way a single-year map load does.
+
+    `xr.open_mfdataset` over 2025+2026 raises NetCDF: HDF error on Windows for the
+    in-progress current-year file; `xr.open_dataset` on that file alone succeeds
+    (Map Tracker only needs 2026 for a ~65-day window). Try netcdf4, then h5netcdf.
+    """
+    for kwargs in (
+        {"engine": "netcdf4"},
+        {"engine": "h5netcdf"},
+    ):
+        try:
+            return xr.open_dataset(path, **kwargs).pipe(_harmonize_master_batch)
+        except Exception:
+            continue
+    return None
 
 
 def _master_files_covering(start: pd.Timestamp, end: pd.Timestamp) -> list[Path]:
@@ -198,43 +229,25 @@ def _open_forecast_glob(pattern: str) -> xr.Dataset | None:
     ]
     if len(opened) == 1:
         return opened[0]
-    shared = [v for v in opened[0].data_vars if all(v in ds.data_vars for ds in opened)]
-    if not shared:
-        return opened[-1]
-    cleaned = [_strip_aux_coords(ds[shared]) for ds in opened]
+    cleaned = [_strip_aux_coords(ds) for ds in opened]
     try:
         out = xr.concat(
             cleaned, dim="valid_time",
-            data_vars="minimal", coords="minimal", join="outer",
+            data_vars="all", coords="minimal", join="outer",
         )
         return drop_era5t_aux(_drop_duplicates_time(out, keep="last"))
     except Exception:
         return opened[-1]
 
 
-def _open_live_forecast_ds() -> xr.Dataset | None:
-    """Prefer IFS daily files; AIFS fills calendar days IFS does not cover."""
+def _open_live_forecast_ds(forecast_model: str | None = None) -> xr.Dataset | None:
+    """Open live forecast files for the selected Expert Mode model (IFS or AIFS)."""
+    if _want_aifs(forecast_model):
+        return _open_forecast_glob("aifs_daily_forecast_*.nc")
+
     ifs = _open_forecast_glob("ifs_daily_forecast_*.nc")
-    aifs = _open_forecast_glob("aifs_daily_forecast_*.nc")
-    if ifs is not None and aifs is not None:
-        shared = [v for v in ifs.data_vars if v in aifs.data_vars]
-        if shared:
-            try:
-                ifs_c = _strip_aux_coords(ifs[shared])
-                aifs_c = _strip_aux_coords(aifs[shared])
-                if "latitude" in ifs_c.coords and "latitude" in aifs_c.coords:
-                    if ifs_c.latitude.shape == aifs_c.latitude.shape:
-                        aifs_c = aifs_c.assign_coords(
-                            latitude=ifs_c.latitude, longitude=ifs_c.longitude,
-                        )
-                return drop_era5t_aux(ifs_c.combine_first(aifs_c))
-            except Exception:
-                return ifs
-        return ifs
     if ifs is not None:
         return ifs
-    if aifs is not None:
-        return aifs
 
     legacy = [
         LIVE_DIR / "live_forecast_mslp.nc",
@@ -269,29 +282,82 @@ def _drop_duplicates_time(ds: xr.Dataset, keep: str = "last") -> xr.Dataset:
         return ds.isel(valid_time=np.sort(unique_idx))
 
 
+# IFS/AIFS may only replace ERA5 master values from this many days before
+# today through the forecast. Historical maps/meteograms/wavograms stay on
+# era5_master_daily_YYYY.nc.
+LIVE_OVERLAY_PAST_DAYS = 6
+
+
+def etccdi_is_feb29(dates) -> np.ndarray:
+    """True on 29 February (the day excised from the ETCCDI 365-day calendar)."""
+    d = pd.DatetimeIndex(pd.to_datetime(np.atleast_1d(dates)))
+    return np.asarray((d.month == 2) & (d.day == 29))
+
+
+def etccdi_date_range(start, end) -> pd.DatetimeIndex:
+    """Daily DatetimeIndex with 29 February removed (ETCCDI 365-day calendar)."""
+    idx = pd.date_range(
+        pd.Timestamp(start).normalize(),
+        pd.Timestamp(end).normalize(),
+        freq="D",
+    )
+    return idx[~((idx.month == 2) & (idx.day == 29))]
+
+
+def etccdi_doy_365(dates):
+    """Day-of-year on the ETCCDI 365-day calendar (1–365), for indexing the
+    365-length climatology reference arrays (dayofyear dim excises 29 Feb).
+
+    Only March 1st onward of a leap year is shifted by −1. 29 February itself
+    (raw dayofyear 60, month 2) is intentionally left unshifted at 60 — the
+    exact same slot March 1st resolves to (raw 61, shifted −1 = 60). This
+    means a live/actual 29 Feb value is plotted on its real calendar date but
+    is judged against March 1st's climatological percentile thresholds, since
+    29 Feb has no dedicated slot in the 365-day baseline. Never returns 366.
+    """
+    if isinstance(dates, (pd.Timestamp, np.datetime64, str)):
+        t = pd.Timestamp(dates)
+        raw = int(t.dayofyear)
+        return raw - 1 if (t.is_leap_year and t.month >= 3) else raw
+    d = pd.DatetimeIndex(pd.to_datetime(dates))
+    raw = d.dayofyear.to_numpy().astype(np.int64)
+    leap = np.asarray(d.is_leap_year)
+    months = d.month.to_numpy()
+    return np.where(leap & (months >= 3), raw - 1, raw).astype(np.int64)
+
+
+def _live_overlay_slice(live: xr.Dataset) -> xr.Dataset:
+    """Keep live forecast from (today-6d) onward; drop any older IFS hindcast."""
+    tdim = "valid_time" if "valid_time" in live.dims else ("time" if "time" in live.dims else None)
+    if tdim is None:
+        return live
+    cut = pd.Timestamp.utcnow().tz_localize(None).normalize() - pd.Timedelta(days=LIVE_OVERLAY_PAST_DAYS)
+    return live.sel({tdim: slice(cut, None)})
+
+
 def _concat_master_and_live(master: xr.Dataset, live: xr.Dataset | None) -> xr.Dataset:
     ds = drop_era5t_aux(master)
     if live is None:
         return ds
-    live = drop_era5t_aux(live)
-    shared = [v for v in ds.data_vars if v in live.data_vars]
-    if not shared:
+    live = _live_overlay_slice(drop_era5t_aux(live))
+    if live.sizes.get("valid_time", live.sizes.get("time", 0)) == 0:
         return ds
-    ds = _strip_aux_coords(ds[shared])
-    live = _strip_aux_coords(live[shared])
+    ds = _strip_aux_coords(ds)
+    live = _strip_aux_coords(live)
     if "latitude" in ds.coords and "latitude" in live.coords:
         if ds.latitude.shape == live.latitude.shape:
             live = live.assign_coords(latitude=ds.latitude, longitude=ds.longitude)
     try:
         # Prefer live (IFS/AIFS) on overlap; archive fills dates the forecast
-        # does not cover. combine_first also backfills NaN cells in live.
+        # does not cover. combine_first also backfills NaN cells in live
+        # and keeps source-only fields (e.g. IFS tx/tn, ERA5 u850/v850).
         out = live.combine_first(ds)
         return drop_era5t_aux(_drop_duplicates_time(out, keep="first"))
     except Exception:
         try:
             out = xr.concat(
                 [ds, live], dim="valid_time",
-                data_vars="minimal", coords="minimal", join="outer",
+                data_vars="all", coords="minimal", join="outer",
             )
             return drop_era5t_aux(_drop_duplicates_time(out, keep="last"))
         except Exception:
@@ -300,36 +366,39 @@ def _concat_master_and_live(master: xr.Dataset, live: xr.Dataset | None) -> xr.D
             return live if live_max > ds_max else ds
 
 
-def _open_synoptic_range(start: pd.Timestamp, end: pd.Timestamp) -> xr.Dataset:
+def _open_synoptic_range(start: pd.Timestamp, end: pd.Timestamp, forecast_model: str | None = None) -> xr.Dataset:
     files = _master_files_covering(start, end)
-    if not files:
-        live = _open_live_forecast_ds()
+    opened = []
+    for path in files:
+        ds_year = _open_master_year_nc(path)
+        if ds_year is not None:
+            opened.append(_strip_aux_coords(ds_year))
+    live = _open_live_forecast_ds(forecast_model)
+    if live is not None:
+        live = live.sel(valid_time=slice(start, end))
+    if not opened:
         if live is not None:
             return live
         raise FileNotFoundError(f"No master or IFS files covering {start.date()}–{end.date()}")
-    if len(files) == 1:
-        ds = xr.open_dataset(files[0], engine="netcdf4").pipe(_harmonize_master_batch)
-    else:
-        ds = xr.open_mfdataset(
-            files, combine="nested", concat_dim="valid_time",
-            engine="netcdf4", parallel=False, preprocess=_harmonize_master_batch,
-            coords="minimal", compat="override", join="override",
-        )
-    ds = ds.sortby("valid_time").drop_duplicates(dim="valid_time")
+    ds = opened[0] if len(opened) == 1 else xr.concat(
+        opened, dim="valid_time", coords="minimal", compat="override", join="override",
+    )
+    ds = ds.sortby("valid_time")
+    ds = _drop_duplicates_time(ds, keep="last")
     ds = ds.sel(valid_time=slice(start, end))
-    live = _open_live_forecast_ds()
-    if live is not None:
-        live = live.sel(valid_time=slice(start, end))
     return _concat_master_and_live(ds, live)
 
 
 @st.cache_resource(show_spinner=False)
-def load_windowed_synoptic_arrays(anchor_date_str: str, pad_past: int = 6, pad_future: int = 6, _loader_version=6) -> xr.Dataset:
-    """Lazy handle for the slider window (nearby year file(s) + latest IFS daily)."""
+def load_windowed_synoptic_arrays(
+    anchor_date_str: str, pad_past: int = 6, pad_future: int = 6,
+    forecast_model: str = "IFS (Physics-based)", _loader_version=9,
+) -> xr.Dataset:
+    """Lazy handle for the slider window (nearby year file(s) + selected live forecast)."""
     anchor = pd.to_datetime(anchor_date_str)
     start = anchor - pd.Timedelta(days=pad_past)
     end = anchor + pd.Timedelta(days=pad_future)
-    ds = _open_synoptic_range(start, end)
+    ds = _open_synoptic_range(start, end, forecast_model=forecast_model)
     return ds.sel(valid_time=slice(start, end))
 
 
@@ -339,14 +408,16 @@ _synoptic_pad_past = 6
 _synoptic_pad_future = 6
 
 
-def set_synoptic_anchor(anchor_date_str: str, pad_past: int = 6, pad_future: int = 6):
+def set_synoptic_anchor(anchor_date_str: str, pad_past: int = 6, pad_future: int = 6, forecast_model: str = "IFS (Physics-based)"):
     """Pre-warms the slider-reachable temporal window around the anchor date."""
     global _synoptic_anchor, _synoptic_pad_past, _synoptic_pad_future
     _synoptic_anchor = anchor_date_str
     _synoptic_pad_past = pad_past
     _synoptic_pad_future = pad_future
     if anchor_date_str is not None:
-        load_windowed_synoptic_arrays(anchor_date_str, pad_past + 3, pad_future + 3)
+        load_windowed_synoptic_arrays(
+            anchor_date_str, pad_past + 3, pad_future + 3, forecast_model=forecast_model,
+        )
 
 
 def _select_calendar_day(ds: xr.Dataset, target_dt: pd.Timestamp):
@@ -385,11 +456,15 @@ def _to_celsius(da: xr.DataArray) -> xr.DataArray:
     return da
 
 
-def get_synoptic_map_data(date_str: str, anchor_date_str: str = None, pad_past: int = None, pad_future: int = None) -> dict:
+def get_synoptic_map_data(
+    date_str: str, anchor_date_str: str = None, pad_past: int = None, pad_future: int = None,
+    forecast_model: str = "IFS (Physics-based)",
+) -> dict:
     """
     Retrieves, standardizes, and applies physical masking to synoptic arrays 
-    for a given date, seamlessly transitioning between ERA5 and IFS data.
+    for a given date, seamlessly transitioning between ERA5 and the selected live forecast.
     """
+    forecast_model = _forecast_model_key(forecast_model)
     target_dt = pd.to_datetime(date_str)
     if anchor_date_str is None:
         anchor_date_str = _synoptic_anchor
@@ -402,12 +477,14 @@ def get_synoptic_map_data(date_str: str, anchor_date_str: str = None, pad_past: 
     if anchor_date_str is not None:
         try:
             # +3 day safety margin for data gaps sitting at the slider's edge
-            ds = load_windowed_synoptic_arrays(anchor_date_str, pad_past + 3, pad_future + 3)
+            ds = load_windowed_synoptic_arrays(
+                anchor_date_str, pad_past + 3, pad_future + 3, forecast_model=forecast_model,
+            )
         except Exception:
             ds = None
             
     if ds is None:
-        ds = load_global_datasets()
+        ds = load_global_datasets(forecast_model=forecast_model)
 
     t_idx, actual_time = _select_calendar_day(ds, target_dt)
     meta = {
@@ -420,7 +497,10 @@ def get_synoptic_map_data(date_str: str, anchor_date_str: str = None, pad_past: 
     if t_idx is None:
         slice_ds = xr.Dataset({v: _empty_field_like(ds, v) for v in field_names if v in ds.data_vars})
     else:
-        slice_ds = ds.isel(valid_time=t_idx).load()
+        # .load() alone can still leave a slice backed by a shared chunk/cache
+        # buffer on lazily-opened datasets; .copy(deep=True) forces an
+        # independent in-memory array per timestep before it reaches Plotly.
+        slice_ds = ds.isel(valid_time=t_idx).load().copy(deep=True)
 
     clean_slices = {"_meta": meta}
     for name in field_names:
@@ -446,5 +526,13 @@ def get_synoptic_map_data(date_str: str, anchor_date_str: str = None, pad_past: 
         if bounds is not None:
             da = _mask_implausible(da, bounds)
         clean_slices[name] = da
+
+    # IFS-only fallback: alias TG onto missing TX/TN so TG maps still render.
+    # AIFS has no native diurnal extremes — do not fabricate TX/TN from TG.
+    if not _want_aifs(forecast_model) and "tg" in clean_slices:
+        if "tx" not in clean_slices:
+            clean_slices["tx"] = clean_slices["tg"]
+        if "tn" not in clean_slices:
+            clean_slices["tn"] = clean_slices["tg"]
 
     return clean_slices

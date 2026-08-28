@@ -39,7 +39,12 @@ HELP: dict[str, str] = {
     ),
     "forecast_offset": (
         "Adjusts the target date. Negative values analyze the past (ERA5 reanalysis), "
-        "positive values look into the future (IFS forecast)."
+        "positive values look into the future (IFS or AIFS forecast)."
+    ),
+    "forecast_model": (
+        "IFS (Physics-based): ECMWF HRES with native diurnal TX/TN extremes.\n\n"
+        "AIFS (Machine Learning): ECMWF AIFS with TG, T850 and synoptic fields. "
+        "TX/TN and associated wave tracking cannot be natively resolved."
     ),
 
     # --- Map Tracker ---

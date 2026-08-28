@@ -54,7 +54,7 @@ def download_ifs_gribs():
     # 3-hourly steps up to 96 hours.
     # CRITICAL: step=0 is explicitly omitted to prevent cfgrib duplication and data corruption
     # for accumulated fields (mx2t3, mn2t3).
-    steps_3h = list(range(3, 99, 3))
+    steps_3h = list(range(3, 120, 3))
     
     target_sfc = str(TMP_DIR / "ifs_sfc.grib")
     target_pl = str(TMP_DIR / "ifs_pl.grib")
@@ -159,11 +159,13 @@ def apply_conservative_weights(ds_source, weights_file, ds_target_grid):
             with np.errstate(divide="ignore", invalid="ignore"):
                 y_corrected = np.where(y_den > 0, y_num / y_den, np.nan)
 
-            data_arrays.append(y_corrected.reshape(shape_out))
+            # Hard copy: severs aliasing to the SciPy .dot() output buffer,
+            # which can otherwise be reused/overwritten on later t_idx passes.
+            data_arrays.append(np.array(y_corrected.reshape(shape_out), copy=True))
 
         ds_out[var] = (
             ("time", "latitude", "longitude"),
-            np.array(data_arrays, dtype=np.float32),
+            np.stack(data_arrays).astype(np.float32),
         )
 
     return ds_out

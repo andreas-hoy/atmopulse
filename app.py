@@ -18,6 +18,11 @@ Core functionalities:
 """
 
 import base64
+import json
+import math
+import os
+import subprocess
+import sys
 import streamlit as st
 import xarray as xr
 import pandas as pd
@@ -29,11 +34,17 @@ import threading
 from pathlib import Path
 from geopy.geocoders import Nominatim
 from datetime import datetime
+try:
+    import folium
+    from streamlit_folium import st_folium
+    _FOLIUM_AVAILABLE = True
+except ImportError:
+    _FOLIUM_AVAILABLE = False
 
 import backend_maps as _backend_maps_mod
 from backend_map_locations import build_location_label_grid, build_country_weight_grid, EUROPE_BBOX
-from backend_time_series import get_live_timeseries
 import backend_waves as _backend_waves_mod
+import backend_narrative as _backend_narrative_mod
 
 # DEV SAFETY NET: Streamlit's autoreload only re-executes THIS script on
 # save; it does NOT automatically re-import already-loaded local modules
@@ -46,9 +57,18 @@ import atmopulse_theme as _atmopulse_theme_mod
 import importlib
 importlib.reload(_backend_maps_mod)
 importlib.reload(_backend_waves_mod)
+importlib.reload(_backend_narrative_mod)
 importlib.reload(_atmopulse_theme_mod)
-from backend_maps import drop_era5t_aux, get_synoptic_map_data, set_synoptic_anchor, _open_synoptic_range
-from backend_waves import get_kiesely_waves_figs
+from backend_maps import drop_era5t_aux, get_synoptic_map_data, set_synoptic_anchor, _open_synoptic_range, load_global_datasets, LIVE_OVERLAY_PAST_DAYS, etccdi_doy_365
+from backend_waves import get_kiesely_waves_figs, get_wave_historical_rank
+from backend_narrative import (
+    EPOCH_LABELS,
+    spatial_extreme_footprint,
+    render_map_tracker_narrative,
+    classify_point_severity,
+    render_point_meteogram_narrative,
+    render_point_wavogram_narrative,
+)
 from labels import HELP
 from atmopulse_theme import (
     ATMOPULSE_BRAND,
@@ -88,10 +108,20 @@ else:
 UI_MODE_STANDARD = "standard"
 UI_MODE_EXPERT = "expert"
 UI_MODE_LABELS = ("Standard", "Expert")
+FORECAST_MODEL_IFS = "IFS (Physics-based)"
+FORECAST_MODEL_AIFS = "AIFS (Machine Learning)"
+FORECAST_MODEL_OPTIONS = (FORECAST_MODEL_IFS, FORECAST_MODEL_AIFS)
 MAP_VIEW_DAILY = "Daily snapshot"
 MAP_VIEW_PERSISTENCE = "Persistence duration"
 LAYOUT_SIDE_BY_SIDE = "Side-by-Side Compare"
 LAYOUT_FLICKER = "Single Map Flicker"
+LAYOUT_OPACITY = "Opacity Slider Compare"
+AIFS_TXTN_WARNING = (
+    "Diurnal extreme analytics (TX/TN and associated Wave Tracking) are currently unavailable "
+    "for the AIFS model. Due to the model's discontinuous 6-hourly autoregressive state jumps, "
+    "true continuous boundary layer extremes cannot be natively resolved. Please switch to the "
+    "IFS model for TX/TN analytics, or utilize Mean Temperature (TG) and T850 for AIFS."
+)
 
 NAV_WELCOME = "Welcome"
 NAV_MAP = "Map Tracker"
@@ -122,6 +152,7 @@ EXPERT_FEATURES = frozenset({
     "meteo_envelope",
     "wave_stat_metric",
     "flicker_layout",
+    "forecast_model",
 })
 
 STANDARD_DEFAULTS = {
@@ -170,6 +201,14 @@ def is_expert_mode() -> bool:
     return st.session_state.get("ui_mode") == UI_MODE_EXPERT
 
 
+def is_aifs_model() -> bool:
+    return "AIFS" in str(st.session_state.get("forecast_model", FORECAST_MODEL_IFS))
+
+
+def selected_forecast_model() -> str:
+    return str(st.session_state.get("forecast_model", FORECAST_MODEL_IFS))
+
+
 _EXTREME_LAYER_LABELS = {
     ("warm", "p75"): ("Warm: Moderate", " (> P75)"),
     ("warm", "p90"): ("Warm: Strong", " (> P90)"),
@@ -200,6 +239,8 @@ def is_daily_map_view(view_mode: str) -> bool:
 
 
 _init_ui_mode()
+if "forecast_model" not in st.session_state:
+    st.session_state.forecast_model = FORECAST_MODEL_IFS
 
 FORECAST_OFFSET_MIN = -7
 FORECAST_OFFSET_MAX = 3
@@ -249,6 +290,110 @@ def load_reference_climatology():
 ref_clim = load_reference_climatology()
 
 @st.cache_resource(show_spinner=False)
+def load_invariant_fields():
+    """ERA5 time-invariant physiography fields (land-sea mask, orography,
+    sub-grid orography variance) used to describe the physical footprint of
+    a 0.25deg grid cell in the point-based tabs."""
+    inv_path = Path("ERA5_ClimateTool/Reference_Climatology/era5_invariants.nc")
+    if not inv_path.exists():
+        return None
+    return xr.open_dataset(inv_path, engine="netcdf4")
+
+INVARIANT_VARS = ("lsm", "z", "sdor")
+
+def _classify_roughness(sdor_m):
+    if sdor_m < 20:
+        return "flat"
+    if sdor_m < 75:
+        return "hilly"
+    if sdor_m < 200:
+        return "low mountains"
+    return "high mountains"
+
+@st.cache_data(show_spinner=False)
+def _create_gridcell_map(target_lat, target_lon):
+    """Renders the macro-scale ERA5 0.25deg grid cell footprint (satellite
+    imagery + bounding rectangle) around the target point."""
+    if not _FOLIUM_AVAILABLE:
+        return None
+    half_res = 0.125
+    lat_south, lat_north = target_lat - half_res, target_lat + half_res
+    lon_west, lon_east = target_lon - half_res, target_lon + half_res
+
+    m = folium.Map(location=[target_lat, target_lon], zoom_start=9, tiles=None)
+    folium.TileLayer(
+        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        attr='Esri', name='Esri World Imagery', overlay=False, control=True,
+    ).add_to(m)
+    folium.Rectangle(
+        bounds=[[lat_south, lon_west], [lat_north, lon_east]],
+        color="#ff7800", weight=2, fill_opacity=0.15,
+    ).add_to(m)
+    folium.CircleMarker(
+        location=[target_lat, target_lon], radius=4, color="red",
+    ).add_to(m)
+    return m
+
+def _on_loc_history_change():
+    """Recent-location pick is the active source; drop leftover typed search."""
+    if st.session_state.get("loc_history_sel", "Select...") == "Select...":
+        return
+    st.session_state.loc_source = "history"
+    st.session_state.new_loc_input = ""
+    st.session_state.last_query = None
+    st.session_state.geocode_results = None
+
+def _on_new_loc_input_change():
+    """Typed search is the active source; clear the recent-location pick."""
+    st.session_state.loc_source = "search"
+    st.session_state.loc_history_sel = "Select..."
+
+def render_grid_cell_profile(location_name, lat, lon):
+    """Collapsible ERA5 grid-cell physical metadata + scientific disclaimer,
+    used only in the Point Meteogram / Point Wavogram tabs."""
+    with st.expander("ℹ️ ERA5 Grid Cell Profile & Spatial Limits", expanded=False):
+        inv_ds = load_invariant_fields()
+        if inv_ds is None or not all(v in inv_ds.variables for v in INVARIANT_VARS):
+            st.caption("Grid cell physiography data is currently unavailable.")
+            return
+
+        pt = inv_ds[list(INVARIANT_VARS)].sel(latitude=lat, longitude=lon, method="nearest")
+
+        lsm = float(pt["lsm"].values)
+        elevation = float(pt["z"].values) / 9.80665
+        sdor = float(pt["sdor"].values)
+
+        ns_extent = 27.8
+        ew_extent = 27.8 * math.cos(math.radians(lat))
+        area = ns_extent * ew_extent
+        roughness_class = _classify_roughness(sdor)
+
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            st.markdown(f"""
+**Grid Cell Dimensions:**
+The meteorological data for [{location_name}; {lat}°N, {lon}°E] is calculated based on a macro-scale ERA5 grid cell covering a total area of **{area:.1f} km²** (North-South: 27.8 km | East-West: {ew_extent:.1f} km).
+
+**Modeled Physical Profile:**
+* **Surface Cover:** {lsm*100:.0f}% Land | {(1-lsm)*100:.0f}% Water
+* **Topography:** Mean elevation {elevation:.0f} m a.s.l. (Terrain roughness: {roughness_class})
+
+⚠️ **Scientific Disclaimer:**
+*AtmoPulse tracks large-scale synoptic anomalies. The displayed values represent a spatial and thermodynamic average over this entire {area:.1f} km² grid cell. Local on-the-ground measurements—especially within urbanized areas, smaller islands and/or highly structured terrain—will deviate significantly from these macro-scale baselines. Note: The underlying 0.25° model physics do not explicitly resolve urban infrastructure.*
+""")
+        with col2:
+            if _FOLIUM_AVAILABLE:
+                st_folium(
+                    _create_gridcell_map(lat, lon),
+                    width="100%",
+                    height=300,
+                    returned_objects=[],
+                    key=f"gridcell_map_{lat:.2f}_{lon:.2f}",
+                )
+            else:
+                st.caption("Map preview unavailable: install `folium` and `streamlit-folium` to enable it.")
+
+@st.cache_resource(show_spinner=False)
 def get_master_files():
     DATA_DIR = Path("ERA5_ClimateTool/Master_Batches")
     return sorted(list(DATA_DIR.glob("era5_master_daily_*.nc")))
@@ -265,58 +410,105 @@ def _harmonize_master_archive(ds):
         ds = ds.squeeze("pressure_level", drop=True)
     return ds
 
+def _open_master_year_file(path):
+    """Maps-style open: netcdf4, no dask chunks. `chunks={}` on the in-progress
+    current-year file is what raised NetCDF: HDF error while maps still rendered."""
+    return xr.open_dataset(path, engine="netcdf4").pipe(_harmonize_master_archive)
+
+
 @st.cache_resource(show_spinner=False)
-def get_master_archive_ds(_harmonize_version=2):
+def get_master_archive_ds(_harmonize_version=6):
     """
-    SINGLETON POINTER: Initializes a unified, dask-backed handle for the ERA5 master archive.
-    Prevents redundant NetCDF I/O operations during interactive UI state changes, ensuring minimal-latency array slicing for downstream extreme value extraction.
+    SINGLETON POINTER: unified handle for the ERA5 master archive.
+    Historical years are opened as a multi-file dataset; the current calendar
+    year is opened the same way Map Tracker does (single netcdf4 handle, no
+    dask chunks), falling back to the already-cached maps window if Windows
+    HDF locking refuses a second open of that file.
     """
     files = get_master_files()
     if not files:
         return None
-    ds = xr.open_mfdataset(
-        files, combine='nested', concat_dim='valid_time', engine='netcdf4',
-        parallel=False, preprocess=_harmonize_master_archive,
-        coords="minimal", compat="override", join="override",
+    this_year = str(pd.Timestamp.utcnow().year)
+    hist_files = [f for f in files if not f.stem.endswith(this_year)]
+    cur_files = [f for f in files if f.stem.endswith(this_year)]
+
+    opened = []
+    if hist_files:
+        if len(hist_files) == 1:
+            opened.append(_open_master_year_file(hist_files[0]))
+        else:
+            opened.append(xr.open_mfdataset(
+                hist_files, combine='nested', concat_dim='valid_time', engine='netcdf4',
+                parallel=False, preprocess=_harmonize_master_archive,
+                coords="minimal", compat="override", join="override",
+            ))
+    if cur_files:
+        try:
+            opened.append(_open_master_year_file(cur_files[0]))
+        except Exception:
+            pass
+    if not opened:
+        return None
+    ds = opened[0] if len(opened) == 1 else xr.concat(
+        opened, dim='valid_time', coords="minimal", compat="override", join="override",
     )
     ds = drop_era5t_aux(ds)
     ds = ds.sortby('valid_time')
-    _, unique_idx = np.unique(ds.valid_time.values, return_index=True)
-    return ds.isel(valid_time=unique_idx)
+    # Keep the LAST occurrence of any duplicated calendar day, not np.unique's
+    # default first-occurrence. When two master batch files overlap on the
+    # same day (e.g. an older, possibly NaN-placeholder "current year" file
+    # re-downloaded/corrected later under a new batch file), sortby's stable
+    # mergesort preserves original file-list order for ties, so "first" would
+    # silently keep the STALE row. "Last" always keeps the most-recently
+    # concatenated (i.e. most recently written) file's value for that day.
+    times = ds.valid_time.values
+    _, first_idx_of_reversed = np.unique(times[::-1], return_index=True)
+    keep_idx = np.sort(len(times) - 1 - first_idx_of_reversed)
+    return ds.isel(valid_time=keep_idx)
 
 @st.cache_resource(show_spinner=False)
-def get_live_txtn_ds(_loader_version=6):
-    """Latest IFS daily forecast (tx/tn), falling back to the legacy txtn bridge."""
+def get_live_txtn_ds(forecast_model=FORECAST_MODEL_IFS, _loader_version=8):
+    """Latest selected-model daily forecast (tx/tn), falling back to the legacy txtn bridge."""
     from backend_maps import _open_live_forecast_ds
-    live = _open_live_forecast_ds()
+    live = _open_live_forecast_ds(forecast_model)
     if live is not None:
         return live
+    if "AIFS" in str(forecast_model):
+        return None
     if not LIVE_TXTN.exists():
         return None
     return xr.open_dataset(LIVE_TXTN, engine='netcdf4')
 
 @st.cache_resource(show_spinner=False)
-def _load_persistence_window_source(anchor_date_str, pad_past=SLIDER_PAD_PAST, pad_future=SLIDER_PAD_FUTURE, lookback_days=65, _loader_version=6):
+def _load_persistence_window_source(
+    start_date_str, end_date_str,
+    forecast_model=FORECAST_MODEL_IFS, _loader_version=9,
+):
     """
-    SINGLETON CACHE: localized 65-day trailing window from the covering
-    yearly master file(s) plus the latest IFS daily forecast — not the
-    full 1940–present archive.
+    SINGLETON CACHE: the requested persistence window from covering
+    era5_master_daily_YYYY.nc files, with IFS/AIFS only from today-6d
+    through the forecast (see LIVE_OVERLAY_PAST_DAYS).
     """
-    anchor = pd.to_datetime(anchor_date_str).normalize()
-    start = anchor - pd.Timedelta(days=pad_past + lookback_days)
-    end = anchor + pd.Timedelta(days=pad_future)
-    ds = _open_synoptic_range(start, end)
-    return ds.sel(valid_time=slice(start, end))
+    start = pd.to_datetime(start_date_str).normalize()
+    end = pd.to_datetime(end_date_str).normalize()
+    try:
+        ds = _open_synoptic_range(start, end, forecast_model=forecast_model)
+        return ds.sel(valid_time=slice(start, end))
+    except Exception:
+        return None
 
 @st.cache_data(show_spinner=False)
-def _load_persistence_daily_series(start_date_str, end_date_str, anchor_date_str=None):
-    """Build a daily TX/TN series from ERA5 archive + IFS live bridge for persistence."""
+def _load_persistence_daily_series(start_date_str, end_date_str, anchor_date_str=None, forecast_model=FORECAST_MODEL_IFS):
+    """Build a daily TX/TN cube from ERA5 masters; IFS/AIFS only in the last 6 days + forecast."""
     start_date = pd.to_datetime(start_date_str).normalize()
     end_date = pd.to_datetime(end_date_str).normalize()
     by_date = {}
+    overlay_cut = pd.Timestamp.utcnow().tz_localize(None).normalize() - pd.Timedelta(days=LIVE_OVERLAY_PAST_DAYS)
 
-    ds_window = _load_persistence_window_source(anchor_date_str) if anchor_date_str else None
-    ds = ds_window if ds_window is not None else get_master_archive_ds()
+    ds = _load_persistence_window_source(
+        start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"),
+        forecast_model=forecast_model,
+    )
     if ds is not None:
         with st.session_state.nc_lock:
             max_arch = pd.to_datetime(ds.valid_time.max().values).normalize()
@@ -327,25 +519,21 @@ def _load_persistence_daily_series(start_date_str, end_date_str, anchor_date_str
                 # calendar day) from era5_master_daily_*.nc; groupby/agg here
                 # is a harmless idempotent no-op that also collapses any
                 # leftover duplicate timestamps.
-                tx_d = sub['tx'].groupby('valid_time.date').max()
-                tn_d = sub['tn'].groupby('valid_time.date').min()
-                for i, d in enumerate(tx_d['date'].values):
-                    day = pd.Timestamp(d).normalize()
-                    by_date[day] = (tx_d.values[i], tn_d.values[i])
+                # 29 Feb is kept as a real day here too — persistence streaks
+                # are a live/actual-data view, not the 365-day baseline array.
+                if "tx" in sub.data_vars and "tn" in sub.data_vars:
+                    tx_d = sub['tx'].groupby('valid_time.date').max()
+                    tn_d = sub['tn'].groupby('valid_time.date').min()
+                    for i, d in enumerate(tx_d['date'].values):
+                        day = pd.Timestamp(d).normalize()
+                        by_date[day] = (tx_d.values[i], tn_d.values[i])
+                elif "tg" in sub.data_vars:
+                    tg_d = sub['tg'].groupby('valid_time.date').mean()
+                    for i, d in enumerate(tg_d['date'].values):
+                        day = pd.Timestamp(d).normalize()
+                        by_date[day] = (tg_d.values[i], tg_d.values[i])
 
-    archive_max = max(by_date) if by_date else None
-
-    lf = get_live_txtn_ds()
-    if lf is not None:
-        with st.session_state.nc_lock:
-            lf_sub = lf.sel(valid_time=slice(start_date, end_date))
-            tx_name = "tx" if "tx" in lf_sub.data_vars else "mx2t"
-            tn_name = "tn" if "tn" in lf_sub.data_vars else "mn2t"
-            if tx_name in lf_sub.data_vars and tn_name in lf_sub.data_vars:
-                for i, t in enumerate(lf_sub.valid_time.values):
-                    day = pd.to_datetime(t).normalize()
-                    if day not in by_date:
-                        by_date[day] = (lf_sub[tx_name].values[i], lf_sub[tn_name].values[i])
+    archive_max = max((d for d in by_date if d < overlay_cut), default=None)
 
     eligible = sorted(d for d in by_date if start_date <= d <= end_date)
     if not eligible:
@@ -354,11 +542,12 @@ def _load_persistence_daily_series(start_date_str, end_date_str, anchor_date_str
     eligible = eligible[-60:]
     tx_vals = np.stack([by_date[d][0] for d in eligible])
     tn_vals = np.stack([by_date[d][1] for d in eligible])
-    ifs_used = archive_max is not None and any(d > archive_max for d in eligible)
+    ifs_used = any(d >= overlay_cut for d in eligible)
     has_gap = False
     if archive_max and ifs_used:
-        ifs_start = min(d for d in eligible if d > archive_max)
-        has_gap = (ifs_start - archive_max).days > 1
+        ifs_days = [d for d in eligible if d >= overlay_cut]
+        if ifs_days:
+            has_gap = (min(ifs_days) - archive_max).days > 1
 
     meta = {
         "archive_max": archive_max,
@@ -367,6 +556,227 @@ def _load_persistence_daily_series(start_date_str, end_date_str, anchor_date_str
         "has_gap": has_gap,
     }
     return (np.array(eligible), tx_vals, tn_vals), meta
+
+QDM_TRANSFER_FILE = Path("ERA5_ClimateTool/Reference_Climatology/qdm_transfer_functions.nc")
+
+@st.cache_resource(show_spinner=False)
+def _load_qdm_bias_ds():
+    """
+    Optional IFS-vs-ERA5 QDM bias cube (see calculate_qdm_bias.py). Returns
+    None — a documented zero-bias passthrough — until that build script has
+    been run (it requires archived IFS_Hindcasts/*.nc, which are not part of
+    this deployment yet).
+    """
+    if not QDM_TRANSFER_FILE.exists():
+        return None
+    try:
+        return xr.open_dataset(QDM_TRANSFER_FILE, engine='netcdf4')
+    except Exception:
+        return None
+
+def _qdm_mean_bias(lat, lon, doys_1_365, bias_var):
+    """
+    Per-day-of-year QDM bias for one point, averaged across the stored
+    quantile axis. The transfer cube persists only the BIAS at each
+    empirical quantile (q_era5 - q_ifs), not the raw IFS quantile VALUES
+    needed to rank a brand-new forecast value into a quantile bin — so a
+    full per-value quantile-mapping isn't reconstructible from this artifact
+    alone. Averaging over quantiles yields the mean systematic bias for that
+    calendar day, a documented simplification of true QDM. Returns zeros
+    (no-op) when the cube isn't available.
+    """
+    ds_qdm = _load_qdm_bias_ds()
+    if ds_qdm is None or bias_var not in ds_qdm.data_vars:
+        return np.zeros(len(doys_1_365), dtype=np.float64)
+    pt = ds_qdm[bias_var].sel(latitude=lat, longitude=lon, method='nearest')
+    by_doy = pt.mean(dim='quantile').values  # shape (365,)
+    idx = np.clip(np.asarray(doys_1_365) - 1, 0, len(by_doy) - 1)
+    return np.nan_to_num(by_doy[idx], nan=0.0)
+
+def _squeeze_celsius(values):
+    arr = np.squeeze(np.asarray(values, dtype=np.float64))
+    finite = arr[np.isfinite(arr)]
+    if finite.size and float(np.mean(finite)) > 100:
+        arr = arr - 273.15
+    return arr
+
+
+def _point_frame_from_master_ds(ds, lat, lon, start, end):
+    """1D TX/TN/TG at (lat, lon) for [start, end], then drop the rest of the cube."""
+    ds = _harmonize_master_archive(ds)
+    if "mx2t" in ds.data_vars and "tx" not in ds.data_vars:
+        ds = ds.rename({"mx2t": "tx"})
+    if "mn2t" in ds.data_vars and "tn" not in ds.data_vars:
+        ds = ds.rename({"mn2t": "tn"})
+    keep = [v for v in ("tx", "tn", "tg") if v in ds.data_vars]
+    if not keep:
+        return pd.DataFrame()
+    lat_name = "latitude" if "latitude" in ds.coords else "lat"
+    lon_name = "longitude" if "longitude" in ds.coords else "lon"
+    t_name = "valid_time" if "valid_time" in ds.dims else "time"
+    pt = ds[keep].sel({lat_name: lat, lon_name: lon}, method="nearest")
+    pt = pt.sel({t_name: slice(start, end)})
+    times = pd.to_datetime(pt[t_name].values)
+    if getattr(times, "tz", None) is not None:
+        times = times.tz_convert("UTC").tz_localize(None)
+    days = pd.DatetimeIndex(times).normalize()
+    tx = _squeeze_celsius(pt["tx"].values) if "tx" in pt else np.full(len(days), np.nan)
+    tn = _squeeze_celsius(pt["tn"].values) if "tn" in pt else np.full(len(days), np.nan)
+    tg = _squeeze_celsius(pt["tg"].values) if "tg" in pt else (tx + tn) / 2.0
+    return pd.DataFrame({"Date": days, "TX": tx, "TN": tn, "TG": tg})
+
+
+_POINT_EXTRACT_SCRIPT = r"""
+import json, sys
+import numpy as np, pandas as pd, xarray as xr
+path, lat, lon, t0, t1 = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), sys.argv[4], sys.argv[5]
+start, end = pd.Timestamp(t0), pd.Timestamp(t1)
+ds = xr.open_dataset(path, engine="netcdf4", decode_timedelta=False)
+try:
+    if "time" in ds.dims and "valid_time" not in ds.dims:
+        ds = ds.rename({"time": "valid_time"})
+    if "mx2t" in ds.data_vars and "tx" not in ds.data_vars:
+        ds = ds.rename({"mx2t": "tx"})
+    if "mn2t" in ds.data_vars and "tn" not in ds.data_vars:
+        ds = ds.rename({"mn2t": "tn"})
+    keep = [v for v in ("tx", "tn", "tg") if v in ds.data_vars]
+    if not keep:
+        raise SystemExit(2)
+    lat_name = "latitude" if "latitude" in ds.coords else "lat"
+    lon_name = "longitude" if "longitude" in ds.coords else "lon"
+    t_name = "valid_time" if "valid_time" in ds.dims else "time"
+    pt = ds[keep].sel({lat_name: lat, lon_name: lon}, method="nearest").sel({t_name: slice(start, end)})
+    times = pd.to_datetime(pt[t_name].values)
+    days = pd.DatetimeIndex(times).tz_localize(None).normalize() if getattr(times, "tz", None) else pd.DatetimeIndex(times).normalize()
+    def _c(v):
+        if v not in pt:
+            return [None] * len(days)
+        a = np.squeeze(np.asarray(pt[v].values, dtype=float))
+        a = np.atleast_1d(a)
+        finite = a[np.isfinite(a)]
+        if finite.size and float(np.mean(finite)) > 100:
+            a = a - 273.15
+        return [None if not np.isfinite(x) else float(x) for x in a]
+    json.dump({"Date": [d.strftime("%Y-%m-%d") for d in days], "TX": _c("tx"), "TN": _c("tn"), "TG": _c("tg")}, sys.stdout)
+finally:
+    ds.close()
+"""
+
+
+def _point_frame_from_master_file(path, lat, lon, start, end, isolate=False):
+    """Read one yearly master file at a single grid point.
+
+    Current-year files are often mid-write (ERA5T updater). HDF5 can abort the
+    whole process on a bad global-heap checksum — that cannot be caught in
+    Python — so the current year is read in a child process.
+    """
+    path = Path(path)
+    if not path.exists():
+        return pd.DataFrame()
+    if isolate:
+        env = os.environ.copy()
+        env["HDF5_USE_FILE_LOCKING"] = "FALSE"
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", _POINT_EXTRACT_SCRIPT, str(path), str(lat), str(lon),
+                 pd.Timestamp(start).isoformat(), pd.Timestamp(end).isoformat()],
+                capture_output=True, text=True, timeout=90, env=env, creationflags=flags,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return pd.DataFrame()
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return pd.DataFrame()
+        payload = json.loads(proc.stdout)
+        df = pd.DataFrame(payload)
+        df["Date"] = pd.to_datetime(df["Date"])
+        return df
+    ds = None
+    try:
+        ds = xr.open_dataset(path, engine="netcdf4", decode_timedelta=False)
+        return _point_frame_from_master_ds(ds, lat, lon, start, end)
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        if ds is not None:
+            try:
+                ds.close()
+            except Exception:
+                pass
+
+
+@st.cache_data(show_spinner=False)
+def get_live_point_series(lat, lon, forecast_model=FORECAST_MODEL_IFS, _series_version=7):
+    """
+    Point daily TX/TN/TG for the Point Meteogram. Does NOT open the maps
+    spatial cube (load_global_datasets): that concatenates 2025+2026 and then
+    .compute()s every field at the point, which aborted Streamlit on a
+    corrupted HDF5 heap in era5_master_daily_2026.nc.
+
+    Each covering year is opened alone, only tx/tn/tg are read, and the
+    current calendar year is isolated in a subprocess.
+    """
+    end = pd.Timestamp.utcnow().tz_localize(None).floor("D") + pd.Timedelta(days=10)
+    start = end - pd.Timedelta(days=375)
+    this_year = int(end.year)
+    frames = []
+    for year in range(int(start.year), int(end.year) + 1):
+        path = Path("ERA5_ClimateTool/Master_Batches") / f"era5_master_daily_{year}.nc"
+        frames.append(_point_frame_from_master_file(
+            path, lat, lon, start, end, isolate=(year == this_year),
+        ))
+
+    lf = get_live_txtn_ds(forecast_model=forecast_model)
+    if lf is not None:
+        try:
+            with st.session_state.nc_lock:
+                pt_lf = lf.sel(latitude=lat, longitude=lon, method="nearest")
+                pt_lf = pt_lf.sel(valid_time=slice(start, end)) if "valid_time" in pt_lf.dims else pt_lf
+            f_times = pd.to_datetime(pt_lf.valid_time.values)
+            if getattr(f_times, "tz", None) is not None:
+                f_times = f_times.tz_convert("UTC").tz_localize(None)
+            f_days = pd.DatetimeIndex(f_times).normalize()
+            cut = pd.Timestamp.utcnow().tz_localize(None).normalize() - pd.Timedelta(days=LIVE_OVERLAY_PAST_DAYS)
+            keep_fcst = np.asarray(f_days >= cut)
+            if not keep_fcst.any():
+                raise RuntimeError("live forecast has no days in the overlay window")
+            if "valid_time" in pt_lf.dims:
+                pt_lf = pt_lf.isel(valid_time=np.flatnonzero(keep_fcst))
+            f_times = f_times[keep_fcst]
+            f_days = f_days[keep_fcst]
+            f_doys = etccdi_doy_365(f_days)
+            tx_name = "tx" if "tx" in pt_lf.data_vars else "mx2t"
+            tn_name = "tn" if "tn" in pt_lf.data_vars else "mn2t"
+            if tx_name in pt_lf.data_vars and tn_name in pt_lf.data_vars:
+                tx_raw = _squeeze_celsius(pt_lf[tx_name].values)
+                tn_raw = _squeeze_celsius(pt_lf[tn_name].values)
+                tx_corr = tx_raw + _qdm_mean_bias(lat, lon, f_doys, "tx_bias")
+                dtr_corr = (tx_raw - tn_raw) + _qdm_mean_bias(lat, lon, f_doys, "dtr_bias")
+                tg_corr = (tx_raw + tn_raw) / 2.0 + _qdm_mean_bias(lat, lon, f_doys, "tg_bias")
+                frames.append(pd.DataFrame({
+                    "Date": f_days, "TX": tx_corr, "TN": tx_corr - dtr_corr, "TG": tg_corr,
+                }))
+            elif "tg" in pt_lf.data_vars:
+                tg_corr = _squeeze_celsius(pt_lf["tg"].values) + _qdm_mean_bias(lat, lon, f_doys, "tg_bias")
+                frames.append(pd.DataFrame({
+                    "Date": f_days, "TX": np.nan, "TN": np.nan, "TG": tg_corr,
+                }))
+        except Exception:
+            pass
+
+    frames = [f for f in frames if f is not None and not f.empty]
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, ignore_index=True)
+    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None).dt.normalize()
+    df = df.sort_values("Date").drop_duplicates(subset="Date", keep="last")
+    # 29 Feb stays VISIBLE on the live chart (real ERA5/IFS value plotted on
+    # its real calendar date) — only the 365-day BASELINE array excises it.
+    # Reindex on the full Gregorian calendar so true ERA5 holes stay NaN.
+    # Never interpolate — AtmoPulse does not invent temperature peaks.
+    full_index = pd.date_range(df["Date"].min(), df["Date"].max(), freq="D")
+    return df.set_index("Date").reindex(full_index).rename_axis("Date").reset_index()
 
 @st.cache_resource(show_spinner=False)
 def get_europe_borders_trace():
@@ -411,6 +821,23 @@ def _synoptic_array(field):
     return np.asarray(getattr(field, "values", field))
 
 
+def _synoptic_temp_pair(map_phys_data):
+    """TX/TN arrays for the map renderer; fall back to TG when extremes are absent (AIFS)."""
+    tx = map_phys_data.get("tx")
+    tn = map_phys_data.get("tn")
+    if tx is not None and tn is not None:
+        return _synoptic_array(tx), _synoptic_array(tn)
+    tg = map_phys_data.get("tg")
+    if tg is not None:
+        arr = _synoptic_array(tg)
+        return arr, arr
+    sample = next((map_phys_data[k] for k in ("mslp", "z500") if k in map_phys_data), None)
+    if sample is None:
+        return None, None
+    nan = np.full(np.asarray(getattr(sample, "values", sample)).shape, np.nan)
+    return nan, nan
+
+
 def _synoptic_lonlat(map_phys_data):
     if map_phys_data is None:
         return None, None
@@ -428,11 +855,11 @@ def _array_has_finite(val) -> bool:
 
 
 @st.cache_resource(show_spinner=False, max_entries=10)
-def fetch_cached_synoptic_data(date_str, anchor_date_str=None, _loader_version=6):
+def fetch_cached_synoptic_data(date_str, anchor_date_str=None, forecast_model=FORECAST_MODEL_IFS, _loader_version=9):
     with st.session_state.nc_lock:
         if anchor_date_str is not None:
-            set_synoptic_anchor(anchor_date_str, SLIDER_PAD_PAST, SLIDER_PAD_FUTURE)
-        data = get_synoptic_map_data(date_str)
+            set_synoptic_anchor(anchor_date_str, SLIDER_PAD_PAST, SLIDER_PAD_FUTURE, forecast_model=forecast_model)
+        data = get_synoptic_map_data(date_str, forecast_model=forecast_model)
         meta = data.pop("_meta", {})
         packed = {}
         sample = next((data[k] for k in ("mslp", "tg", "tx") if k in data), None)
@@ -447,12 +874,17 @@ def fetch_cached_synoptic_data(date_str, anchor_date_str=None, _loader_version=6
         return packed, meta
 
 @st.cache_data(show_spinner=False)
-def get_persistence_arrays(target_date_str, baseline_type, map_var="TG", anchor_date_str=None):
+def get_persistence_arrays(target_date_str, baseline_type, map_var="TG", anchor_date_str=None, forecast_model=FORECAST_MODEL_IFS):
     if ref_clim is None: 
+        return None
+    if "AIFS" in str(forecast_model) and map_var in ("TX", "TN"):
         return None
     end_date = pd.to_datetime(target_date_str)
     start_date = end_date - pd.Timedelta(days=65)
-    loaded = _load_persistence_daily_series(start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), anchor_date_str)
+    loaded = _load_persistence_daily_series(
+        start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'),
+        anchor_date_str, forecast_model=forecast_model,
+    )
     if loaded is None or loaded[0] is None: 
         return None
     (daily_dates, tx_vals, tn_vals), _meta = loaded
@@ -462,19 +894,14 @@ def get_persistence_arrays(target_date_str, baseline_type, map_var="TG", anchor_
         tx_hist -= 273.15
         tn_hist -= 273.15
     dates_dt = pd.to_datetime(daily_dates)
-    raw_doys = np.asarray(dates_dt.dayofyear)
-    is_leap = np.asarray(dates_dt.is_leap_year)
-    months = np.asarray(dates_dt.month)
-    
-    # ETCCDI 365-day mapping: shift Feb 29 (DOY 60) and all subsequent days in leap years by -1
-    doys = np.where(is_leap & (months >= 3), raw_doys - 1, raw_doys)
+    doys = etccdi_doy_365(dates_dt)
     suffix = "A" if baseline_type == "A" else "B"
     n_days, n_lats, n_lons = tx_hist.shape
     
     def safe_get(var_key, fallback=np.nan):
         if var_key in ref_clim.variables: 
             return ref_clim[var_key].values
-        return np.full((366, n_lats, n_lons), fallback)
+        return np.full((365, n_lats, n_lons), fallback)
 
     if map_var == "TX":
         v_h, v_p95, v_p90, v_p75 = tx_hist, safe_get(f'tx_p95_doy_{suffix}'), safe_get(f'tx_p90_doy_{suffix}'), safe_get(f'tx_p75_doy_{suffix}')
@@ -574,9 +1001,9 @@ def _record_window_doys(target_doy: int) -> list[int]:
     for offset in range(-2, 3):
         d = target_doy + offset
         if d < 1:
-            d += 366
-        elif d > 366:
-            d -= 366
+            d += 365
+        elif d > 365:
+            d -= 365
         window.append(d)
     return window
 
@@ -595,7 +1022,7 @@ def _slider_window_doys(anchor_date, pad_past=SLIDER_PAD_PAST, pad_future=SLIDER
     """All calendar day-of-year values reachable via the Forecast Offset slider
     for a given anchor ('today') date."""
     dates = [anchor_date + pd.Timedelta(days=o) for o in range(-pad_past, pad_future + 1)]
-    return tuple(sorted({d.dayofyear for d in dates}))
+    return tuple(sorted({int(etccdi_doy_365(d)) for d in dates}))
 
 @st.cache_resource(show_spinner=False)
 def get_map_historical_records_bundle(target_doys: tuple, cutoff_year: int):
@@ -615,8 +1042,11 @@ def get_map_historical_records_bundle(target_doys: tuple, cutoff_year: int):
     window_by_doy = {d: _record_window_doys(d) for d in target_doys}
     union_doys = sorted({w for ws in window_by_doy.values() for w in ws})
     with st.session_state.nc_lock:
-        vt = pd.to_datetime(ds.valid_time.values)
-        mask = np.isin(vt.dayofyear, union_doys) & (vt.year < cutoff_year)
+        vt = pd.DatetimeIndex(pd.to_datetime(ds.valid_time.values))
+        # 29 Feb is a real candidate record day too (mapped into 1 March's
+        # ETCCDI window) — it must not be excluded from actual-data scans.
+        etccdi = etccdi_doy_365(vt)
+        mask = np.isin(etccdi, union_doys) & (vt.year < cutoff_year)
         if not mask.any():
             return None
         sub = ds.isel(valid_time=mask).load()
@@ -624,7 +1054,7 @@ def get_map_historical_records_bundle(target_doys: tuple, cutoff_year: int):
     tx_all = sub["tx"].values.astype(np.float64) - 273.15
     tn_all = sub["tn"].values.astype(np.float64) - 273.15
     tg_all = sub["tg"].values.astype(np.float64) - 273.15 if "tg" in sub.data_vars else (tx_all + tn_all) / 2.0
-    doy_all = pd.to_datetime(sub.valid_time.values).dayofyear
+    doy_all = etccdi_doy_365(pd.to_datetime(sub.valid_time.values))
     yr_all = pd.to_datetime(sub.valid_time.values).year
 
     bundle = {}
@@ -644,6 +1074,30 @@ def _yyyymmdd_year_grid(grid) -> np.ndarray:
     """YYYYMMDD int grids from the climatology → calendar year as float."""
     arr = np.asarray(grid, dtype=np.float64)
     return np.where(np.isfinite(arr) & (arr > 10_000_000), np.floor(arr / 10_000.0), np.nan)
+
+
+def _yyyymmdd_dot_date(val) -> str:
+    """Format a climatology YYYYMMDD int as 'DD.MM.YYYY'; empty string if missing."""
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return ""
+    if n < 10_000_000:
+        return ""
+    y, m, d = n // 10000, (n // 100) % 100, n % 100
+    if not (1 <= m <= 12 and 1 <= d <= 31):
+        return ""
+    return f"{d:02d}.{m:02d}.{y:04d}"
+
+
+def _yyyymmdd_dot_date_arr(grid) -> np.ndarray:
+    """Vector of ' (DD.MM.YYYY)' suffixes (or '') for Plotly hover customdata."""
+    arr = np.asarray(grid).reshape(-1)
+    out = np.empty(arr.size, dtype=object)
+    for i, v in enumerate(arr):
+        ds = _yyyymmdd_dot_date(v)
+        out[i] = f" ({ds})" if ds else ""
+    return out
 
 
 def _map_historical_records(doy: int, target_date, map_var: str, shape, anchor_date=None):
@@ -668,6 +1122,65 @@ def _map_historical_records(doy: int, target_date, map_var: str, shape, anchor_d
     yr_w = _yyyymmdd_year_grid(daily_ref[wd].values) if wd in daily_ref else np.full(shape, np.nan)
     yr_c = _yyyymmdd_year_grid(daily_ref[cd].values) if cd in daily_ref else np.full(shape, np.nan)
     return rec_w, rec_c, yr_w, yr_c
+
+@st.cache_data(show_spinner=False)
+def compute_map_footprint(_ref_data, _map_phys_data, target_date_str, t_warm, t_cold, baseline_type="A", map_var="TG", anchor_date_str=None):
+    """
+    Area-weighted, CUMULATIVE Moderate/Strong/Extreme/Record spatial footprint
+    for the Map Tracker narrative (backend_narrative.spatial_extreme_footprint).
+    Mirrors build_baseline_map()'s value/threshold retrieval and mask
+    construction exactly, so the narrated percentages always match the map.
+
+    PERFORMANCE: leading-underscore `_ref_data`/`_map_phys_data` are excluded
+    from Streamlit's cache-key hash (Streamlit's convention for cache_data /
+    cache_resource) — they are a large xarray Dataset and a dict of full-grid
+    DataArrays, and re-hashing them on every rerun was the actual source of
+    the reported frontend latency. The real cache key is the remaining,
+    cheap arguments (`target_date_str`, `t_warm`, `t_cold`, `baseline_type`,
+    `map_var`, `anchor_date_str`), so reruns triggered by unrelated widgets
+    (e.g. the Map Layout radio) hit the cache instantly instead of
+    recomputing the mask from scratch.
+    """
+    if _ref_data is None or _map_phys_data is None:
+        return None
+    target_date = pd.Timestamp(target_date_str)
+    anchor_date = pd.Timestamp(anchor_date_str) if anchor_date_str else None
+    suffix, doy = ("A" if baseline_type == "A" else "B"), etccdi_doy_365(target_date)
+    tx_curr, tn_curr = _synoptic_temp_pair(_map_phys_data)
+    if tx_curr is None or tn_curr is None:
+        return None
+    lons, lats = _synoptic_lonlat(_map_phys_data)
+    daily_ref = _ref_data.sel(dayofyear=doy).reindex(latitude=lats, longitude=lons, method="nearest")
+
+    def safe_get(var_key, fallback=np.nan):
+        if var_key in daily_ref.variables:
+            return daily_ref[var_key].values
+        return np.full(tx_curr.shape, fallback)
+
+    if map_var == "TX":
+        v_curr = tx_curr
+        v_p95, v_p90, v_p75 = safe_get(f'tx_p95_doy_{suffix}'), safe_get(f'tx_p90_doy_{suffix}'), safe_get(f'tx_p75_doy_{suffix}')
+        v_p25, v_p10, v_p5 = safe_get(f'tx_p25_doy_{suffix}'), safe_get(f'tx_p10_doy_{suffix}'), safe_get(f'tx_p5_doy_{suffix}')
+    elif map_var == "TN":
+        v_curr = tn_curr
+        v_p95, v_p90, v_p75 = safe_get(f'tn_p95_doy_{suffix}'), safe_get(f'tn_p90_doy_{suffix}'), safe_get(f'tn_p75_doy_{suffix}')
+        v_p25, v_p10, v_p5 = safe_get(f'tn_p25_doy_{suffix}'), safe_get(f'tn_p10_doy_{suffix}'), safe_get(f'tn_p5_doy_{suffix}')
+    else:
+        tg_curr = _map_phys_data.get("tg")
+        v_curr = _synoptic_array(tg_curr) if tg_curr is not None else (tx_curr + tn_curr) / 2.0
+        v_p95 = (safe_get(f'tx_p95_doy_{suffix}') + safe_get(f'tn_p95_doy_{suffix}')) / 2
+        v_p90 = (safe_get(f'tx_p90_doy_{suffix}') + safe_get(f'tn_p90_doy_{suffix}')) / 2
+        v_p75 = (safe_get(f'tx_p75_doy_{suffix}') + safe_get(f'tn_p75_doy_{suffix}')) / 2
+        v_p25 = (safe_get(f'tx_p25_doy_{suffix}') + safe_get(f'tn_p25_doy_{suffix}')) / 2
+        v_p10 = (safe_get(f'tx_p10_doy_{suffix}') + safe_get(f'tn_p10_doy_{suffix}')) / 2
+        v_p5 = (safe_get(f'tx_p5_doy_{suffix}') + safe_get(f'tn_p5_doy_{suffix}')) / 2
+
+    v_rec_w, v_rec_c, _, _ = _map_historical_records(doy, target_date, map_var, tx_curr.shape, anchor_date)
+    mask = _build_display_mask(v_curr, v_p95, v_p90, v_p75, v_p25, v_p10, v_p5, v_rec_w, v_rec_c, t_warm, t_cold)
+    valid_domain = np.isfinite(v_curr)
+    lon2d, lat2d = np.meshgrid(lons, lats)
+    return spatial_extreme_footprint(mask, valid_domain, lat2d, target_date=target_date_str, baseline_name=baseline_type)
+
 
 def _fmt_hover_num(v) -> str:
     return f"{float(v):.1f}" if np.isfinite(v) else "N/A"
@@ -709,7 +1222,7 @@ def _map_yaxis_kwargs(**extra):
 def _add_map_source_label(fig, *, row=None, col=None):
     """Anchor source tag to the map axes domain (not full figure paper)."""
     ann = dict(
-        text="Data: ERA5/IFS",
+        text=f"Data: ERA5/{'AIFS' if is_aifs_model() else 'IFS'}",
         xref="x domain", yref="y domain",
         x=0.99, y=0.03,
         xanchor="right", yanchor="bottom",
@@ -725,12 +1238,15 @@ def _add_map_source_label(fig, *, row=None, col=None):
     else:
         fig.add_annotation(**ann, row=row, col=col)
 
-def _render_synoptic_map(fig, title: str, key: str) -> None:
+def _render_synoptic_map(fig, title: str, key: str, *, bottom_margin: int = 0) -> None:
     """Render one synoptic map: Streamlit title above a CSS 70:42 frame.
 
     Titles stay outside Plotly so the plot area can match EUROPE_BBOX
     exactly. The keyed container is sized by CSS aspect-ratio; Plotly
     fills that box instead of using a fixed pixel height.
+
+    `bottom_margin` reserves room below the map (e.g. for a Plotly
+    layout slider) without affecting the default zero-margin callers.
     """
     st.markdown(f"<p class='atmopulse-map-title'>{title}</p>", unsafe_allow_html=True)
     fig.update_layout(
@@ -739,7 +1255,7 @@ def _render_synoptic_map(fig, title: str, key: str) -> None:
         autosize=True,
         height=None,
         title=None,
-        margin=dict(t=0, l=0, r=0, b=0),
+        margin=dict(t=0, l=0, r=0, b=bottom_margin),
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
     )
@@ -763,8 +1279,10 @@ def build_baseline_map(ref_data, map_phys_data, target_date, t_warm, t_cold, tog
     if ref_data is None or map_phys_data is None: 
         return go.Figure()
         
-    suffix, doy = ("A" if baseline_type == "A" else "B"), target_date.dayofyear
-    tx_curr, tn_curr = _synoptic_array(map_phys_data["tx"]), _synoptic_array(map_phys_data["tn"])
+    suffix, doy = ("A" if baseline_type == "A" else "B"), etccdi_doy_365(target_date)
+    tx_curr, tn_curr = _synoptic_temp_pair(map_phys_data)
+    if tx_curr is None or tn_curr is None:
+        return go.Figure()
     lons, lats = _synoptic_lonlat(map_phys_data)
     
     # Align the climatology grid to the live/archive field's actual lat/lon
@@ -788,7 +1306,8 @@ def build_baseline_map(ref_data, map_phys_data, target_date, t_warm, t_cold, tog
         v_curr, v_p95, v_p90, v_p75 = tn_curr, safe_get(f'tn_p95_doy_{suffix}'), safe_get(f'tn_p90_doy_{suffix}'), safe_get(f'tn_p75_doy_{suffix}')
         v_p25, v_p10, v_p5 = safe_get(f'tn_p25_doy_{suffix}'), safe_get(f'tn_p10_doy_{suffix}'), safe_get(f'tn_p5_doy_{suffix}')
     else:
-        v_curr = (tx_curr + tn_curr) / 2.0
+        tg_curr = map_phys_data.get("tg")
+        v_curr = _synoptic_array(tg_curr) if tg_curr is not None else (tx_curr + tn_curr) / 2.0
         v_p95 = (safe_get(f'tx_p95_doy_{suffix}') + safe_get(f'tn_p95_doy_{suffix}')) / 2
         v_p90 = (safe_get(f'tx_p90_doy_{suffix}') + safe_get(f'tn_p90_doy_{suffix}')) / 2
         v_p75 = (safe_get(f'tx_p75_doy_{suffix}') + safe_get(f'tn_p75_doy_{suffix}')) / 2
@@ -830,10 +1349,13 @@ def build_baseline_map(ref_data, map_phys_data, target_date, t_warm, t_cold, tog
             hovertemplate="%{hovertext}<extra></extra>",
         ))
         
-        if toggles.get("hatching", False):
+        if toggles.get("hatching", False) and not is_aifs_model():
             anchor_date_str = anchor_date.strftime('%Y-%m-%d') if anchor_date is not None else None
             try:
-                streaks = get_persistence_arrays(target_date.strftime('%Y-%m-%d'), baseline_type, map_var, anchor_date_str)
+                streaks = get_persistence_arrays(
+                    target_date.strftime('%Y-%m-%d'), baseline_type, map_var, anchor_date_str,
+                    forecast_model=selected_forecast_model(),
+                )
             except Exception:
                 streaks = None
             if streaks is not None:
@@ -854,7 +1376,10 @@ def build_baseline_map(ref_data, map_phys_data, target_date, t_warm, t_cold, tog
                     
     else:
         anchor_date_str = anchor_date.strftime('%Y-%m-%d') if anchor_date is not None else None
-        streaks = get_persistence_arrays(target_date.strftime('%Y-%m-%d'), baseline_type, map_var, anchor_date_str)
+        streaks = get_persistence_arrays(
+            target_date.strftime('%Y-%m-%d'), baseline_type, map_var, anchor_date_str,
+            forecast_model=selected_forecast_model(),
+        )
         if streaks is not None:
             mapping = {
                 "Moderate": (0, 4, 60),
@@ -916,15 +1441,85 @@ def build_baseline_map(ref_data, map_phys_data, target_date, t_warm, t_cold, tog
     )
     return fig
 
+def build_opacity_slider_map(fig_a, fig_b, label_a="Historical Baseline (1961–1990)", label_b="Recent Baseline (1996–2025)", n_steps=21):
+    """Cross-fade two baseline map figures (e.g. 1961-1990 vs 1996-2025) into
+    a single Plotly figure driven by a layout slider.
+
+    The slider uses method="restyle": Plotly.js applies the opacity change
+    entirely client-side in the browser, so scrubbing it does NOT trigger a
+    Streamlit rerun. Zoom, pan, and hover/tooltip state are untouched, and
+    every trace (including colorbars) keeps its own opacity/visibility so
+    nothing from either source figure is lost.
+    """
+    if not fig_a.data and not fig_b.data:
+        return go.Figure()
+
+    fig = go.Figure(layout=(fig_a.layout if fig_a.data else fig_b.layout))
+
+    traces_a = list(fig_a.data)
+    traces_b = list(fig_b.data)
+    base_op_a = [1.0 if t.opacity is None else t.opacity for t in traces_a]
+    base_op_b = [1.0 if t.opacity is None else t.opacity for t in traces_b]
+
+    # Avoid stacking two identical colorbars for the same value range on top
+    # of one another; the "A" layer's colorbar stays fully visible/functional
+    # and continues to describe both layers since they share one colorscale.
+    for t in traces_b:
+        if getattr(t, "showscale", None):
+            t.showscale = False
+
+    for t in traces_a:
+        fig.add_trace(t)
+    for t in traces_b:
+        fig.add_trace(t)
+
+    n_a = len(traces_a)
+    idx_a, idx_b = list(range(0, n_a)), list(range(n_a, n_a + len(traces_b)))
+
+    steps = []
+    for i in range(n_steps):
+        frac = i / (n_steps - 1)
+        opac_a = [round(o * (1.0 - frac), 4) for o in base_op_a]
+        opac_b = [round(o * frac, 4) for o in base_op_b]
+        steps.append(dict(
+            method="restyle",
+            args=[{"opacity": opac_a + opac_b}, idx_a + idx_b],
+            label=f"{int(round(frac * 100))}%",
+        ))
+
+    fig.update_layout(
+        sliders=[dict(
+            active=0,
+            x=0.08, y=0.02, len=0.84,
+            pad=dict(t=6, b=6),
+            currentvalue=dict(
+                prefix=f"{label_a} \u2192 {label_b}: ",
+                suffix="%",
+                visible=True,
+                xanchor="center",
+                font=dict(size=12),
+            ),
+            steps=steps,
+        )],
+    )
+    # Initial render must match slider step 0 (100% historical, 0% recent).
+    for t, op in zip(fig.data[:n_a], base_op_a):
+        t.opacity = op
+    for t, op in zip(fig.data[n_a:], base_op_b):
+        t.opacity = 0.0
+    return fig
+
 # --- TOP 10 COUNTRY IMPACT (Heat & Cold Extremes) ---
 @st.cache_data(show_spinner=False)
 def calculate_top10(_ref_data, _map_phys_data, target_date, t_warm, t_cold, view_mode, persist_metric, top10_threshold, baseline_type="A", map_var="TG", anchor_date=None, _mask_version=TOP10_MASK_VERSION):
     if _ref_data is None or _map_phys_data is None: 
         return pd.DataFrame(), pd.DataFrame()
         
-    suffix, doy = ("A" if baseline_type == "A" else "B"), target_date.dayofyear
+    suffix, doy = ("A" if baseline_type == "A" else "B"), etccdi_doy_365(target_date)
     lons, lats = _synoptic_lonlat(_map_phys_data)
-    tx, tn = _synoptic_array(_map_phys_data["tx"]), _synoptic_array(_map_phys_data["tn"])
+    tx, tn = _synoptic_temp_pair(_map_phys_data)
+    if tx is None or tn is None:
+        return pd.DataFrame(), pd.DataFrame()
     heat_mask, cold_mask = np.zeros(tx.shape, dtype=bool), np.zeros(tx.shape, dtype=bool)
 
     if is_daily_map_view(view_mode):
@@ -945,7 +1540,8 @@ def calculate_top10(_ref_data, _map_phys_data, target_date, t_warm, t_cold, view
             v_p95, v_p90, v_p75 = safe_get(f'tn_p95_doy_{suffix}'), safe_get(f'tn_p90_doy_{suffix}'), safe_get(f'tn_p75_doy_{suffix}')
             v_p25, v_p10, v_p5 = safe_get(f'tn_p25_doy_{suffix}'), safe_get(f'tn_p10_doy_{suffix}'), safe_get(f'tn_p5_doy_{suffix}')
         else:
-            v_curr = (tx + tn) / 2.0
+            tg = _map_phys_data.get("tg")
+            v_curr = _synoptic_array(tg) if tg is not None else (tx + tn) / 2.0
             v_p95 = (safe_get(f'tx_p95_doy_{suffix}') + safe_get(f'tn_p95_doy_{suffix}')) / 2
             v_p90 = (safe_get(f'tx_p90_doy_{suffix}') + safe_get(f'tn_p90_doy_{suffix}')) / 2
             v_p75 = (safe_get(f'tx_p75_doy_{suffix}') + safe_get(f'tn_p75_doy_{suffix}')) / 2
@@ -961,7 +1557,10 @@ def calculate_top10(_ref_data, _map_phys_data, target_date, t_warm, t_cold, view
         cold_mask = np.isin(display_mask, list(_TOP10_COLD_BINS[level]))
     else:
         anchor_date_str = anchor_date.strftime('%Y-%m-%d') if anchor_date is not None else None
-        streaks = get_persistence_arrays(target_date.strftime('%Y-%m-%d'), baseline_type, map_var, anchor_date_str)
+        streaks = get_persistence_arrays(
+            target_date.strftime('%Y-%m-%d'), baseline_type, map_var, anchor_date_str,
+            forecast_model=selected_forecast_model(),
+        )
         if streaks is not None:
             mapping = {"Moderate": (0, 4), "Strong": (1, 5), "Extreme": (2, 6), "All-Time Record": (3, 7)}
             h_idx, c_idx = mapping.get(persist_metric, (1, 5))
@@ -986,18 +1585,59 @@ def calculate_top10(_ref_data, _map_phys_data, target_date, t_warm, t_cold, view
     return _rank(res_h, "Warm Impact (%)"), _rank(res_c, "Cold Impact (%)")
 
 # --- METEOGRAM CORE TRACES (For Subplots) ---
-def get_meteogram_traces(df_live, ref_clim, lat, lon, target_date, epoch, show_air, show_app, meteo_env, meteo_var="TG"):
+def compute_point_thresholds(ref_clim, lat, lon, target_date, meteo_var, epoch):
+    """
+    ETCCDI percentile + all-time-record thresholds for one coordinate/day,
+    shaped as (p_warm, p_cold) for backend_narrative.classify_point_severity().
+    Uses the same 365-day ETCCDI calendar mapping as get_meteogram_traces()
+    so the Point Meteogram narrative always matches the chart's climate
+    boundaries envelope.
+    """
+    pt_clim = ref_clim.sel(latitude=lat, longitude=lon, method='nearest')
+    ts = pd.Timestamp(target_date)
+    doy = etccdi_doy_365(ts) - 1
+
+    def g(key):
+        return float(pt_clim[key].values[doy]) if key in pt_clim.variables else np.nan
+
+    if meteo_var == "Max Temp (TX)":
+        p_warm = {"p75": g(f'tx_p75_doy_{epoch}'), "p90": g(f'tx_p90_doy_{epoch}'), "p95": g(f'tx_p95_doy_{epoch}'), "rec": g('tx_max_val')}
+        p_cold = {"p25": g(f'tx_p25_doy_{epoch}'), "p10": g(f'tx_p10_doy_{epoch}'), "p5": g(f'tx_p5_doy_{epoch}'), "rec": g('tx_min_val')}
+    elif meteo_var == "Min Temp (TN)":
+        p_warm = {"p75": g(f'tn_p75_doy_{epoch}'), "p90": g(f'tn_p90_doy_{epoch}'), "p95": g(f'tn_p95_doy_{epoch}'), "rec": g('tn_max_val')}
+        p_cold = {"p25": g(f'tn_p25_doy_{epoch}'), "p10": g(f'tn_p10_doy_{epoch}'), "p5": g(f'tn_p5_doy_{epoch}'), "rec": g('tn_min_val')}
+    else:
+        p_warm = {
+            "p75": (g(f'tx_p75_doy_{epoch}') + g(f'tn_p75_doy_{epoch}')) / 2,
+            "p90": (g(f'tx_p90_doy_{epoch}') + g(f'tn_p90_doy_{epoch}')) / 2,
+            "p95": (g(f'tx_p95_doy_{epoch}') + g(f'tn_p95_doy_{epoch}')) / 2,
+            "rec": (g('tx_max_val') + g('tn_max_val')) / 2,
+        }
+        p_cold = {
+            "p25": (g(f'tx_p25_doy_{epoch}') + g(f'tn_p25_doy_{epoch}')) / 2,
+            "p10": (g(f'tx_p10_doy_{epoch}') + g(f'tn_p10_doy_{epoch}')) / 2,
+            "p5": (g(f'tx_p5_doy_{epoch}') + g(f'tn_p5_doy_{epoch}')) / 2,
+            "rec": (g('tx_min_val') + g('tn_min_val')) / 2,
+        }
+    return p_warm, p_cold
+
+
+def get_meteogram_traces(df_live, ref_clim, lat, lon, target_date, epoch, show_air, show_app, meteo_env, meteo_var="TG", current_condition=None):
+    """
+    `current_condition`: optional ("tier", "direction") from classify_point_severity
+    for THIS epoch's active-day classification; currently unused by the chart
+    (kept for call-site compatibility / future use) now that "Normal" is
+    represented by the "Typical Range" fill (P25-P75) rather than a marker.
+    """
     traces = []
+    sh = True if epoch == "A" else False  # Draw each legend entry only once (epoch A pass)
     pt_clim = ref_clim.sel(latitude=lat, longitude=lon, method='nearest')
     df_live['Date'] = pd.to_datetime(df_live['Date']).dt.tz_localize(None)
     tgt_dt_norm = pd.to_datetime(target_date).tz_localize(None)
     
-    # ETCCDI 365-day mapping for the Point Meteogram
-    raw_doys = df_live['Date'].dt.dayofyear.values
-    is_leap = df_live['Date'].dt.is_leap_year.values
-    months = df_live['Date'].dt.month.values
-    doy_365 = np.where(is_leap & (months >= 3), raw_doys - 1, raw_doys)
-    doys = doy_365 - 1  # 0-based for array indexing
+    # ETCCDI 365-day mapping: 29 Feb (if present in df_live) borrows the
+    # climatology slot of 1 March — it is NOT excised from the plotted line.
+    doys = etccdi_doy_365(df_live['Date']) - 1
     
     dates = df_live['Date']
     
@@ -1016,77 +1656,161 @@ def get_meteogram_traces(df_live, ref_clim, lat, lon, target_date, epoch, show_a
     env_upper = pt_clim[p_up_key].values[doys] if p_up_key in pt_clim.variables else np.full(len(doys), np.nan)
     env_lower = pt_clim[p_dn_key].values[doys] if p_dn_key in pt_clim.variables else np.full(len(doys), np.nan)
     
+    # TASK 4: upper boundary trace stays showlegend=False (it is only the
+    # invisible fill anchor) so "Reference Value Envelope" appears exactly
+    # once in the legend, from the lower/fill trace below.
     traces.append(go.Scatter(x=dates, y=env_upper, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-    traces.append(go.Scatter(x=dates, y=env_lower, mode='lines', fill='tonexty', fillcolor='rgba(220,220,220,0.5)', line=dict(width=0), name='Climate Boundaries Envelope', legendgroup='env', hoverinfo='skip'))
+    traces.append(go.Scatter(x=dates, y=env_lower, mode='lines', fill='tonexty', fillcolor='rgba(220,220,220,0.5)', line=dict(width=0), name='Reference Value Envelope', legendgroup='env', showlegend=False, hoverinfo='skip'))
 
     col_target = 'TG' if meteo_var == "Mean Temp (TG)" else ('TX' if meteo_var == "Max Temp (TX)" else 'TN')
     t_hist = df_live.loc[dates <= tgt_dt_norm, col_target].values if col_target in df_live.columns else ((df_live.loc[dates <= tgt_dt_norm, 'TX'].values + df_live.loc[dates <= tgt_dt_norm, 'TN'].values) / 2.0)
-    
+
     d_hist = dates[dates <= tgt_dt_norm]
-    c_hist = c_base[dates <= tgt_dt_norm]
+
+    # TASK 2: colored anomaly bands (y_w1..y_w4 / y_c1..y_c4) now span the FULL
+    # `dates` axis (history + forecast) instead of stopping at d_hist/t_hist —
+    # otherwise the forecast tail rendered with no shading at all, visually
+    # implying "normal" even for an extreme forecasted temperature.
+    t_full = df_live[col_target].values if col_target in df_live.columns else ((df_live['TX'].values + df_live['TN'].values) / 2.0)
+
+    # Record thresholds resolved here (not just inside `if show_air:`) so the
+    # "Record" fill tier below has a genuine all-time boundary instead of
+    # being an uncapped catch-all merged with "Extreme".
+    if meteo_var == "Max Temp (TX)":
+        _rec_w_key, _rec_c_key = "tx_max_val", "tx_min_val"
+    elif meteo_var == "Min Temp (TN)":
+        _rec_w_key, _rec_c_key = "tn_max_val", "tn_min_val"
+    else:
+        _rec_w_key = "tg_max_val" if "tg_max_val" in pt_clim.variables else "tx_max_val"
+        _rec_c_key = "tg_min_val" if "tg_min_val" in pt_clim.variables else "tn_min_val"
+    rec_w_full = pt_clim[_rec_w_key].values[doys] if _rec_w_key in pt_clim.variables else np.full(len(doys), np.inf)
+    rec_c_full = pt_clim[_rec_c_key].values[doys] if _rec_c_key in pt_clim.variables else np.full(len(doys), -np.inf)
 
     # Warm Anomalies
-    p75 = pt_clim[f'tx_p75_doy_{epoch}'].values[doys][dates <= tgt_dt_norm] if f'tx_p75_doy_{epoch}' in pt_clim else c_hist
-    p90 = pt_clim[f'tx_p90_doy_{epoch}'].values[doys][dates <= tgt_dt_norm] if f'tx_p90_doy_{epoch}' in pt_clim else c_hist
-    p95 = pt_clim[f'tx_p95_doy_{epoch}'].values[doys][dates <= tgt_dt_norm] if f'tx_p95_doy_{epoch}' in pt_clim else c_hist
-    y_w1 = np.where(t_hist > c_hist, np.minimum(t_hist, p75), c_hist)
-    y_w2 = np.where(t_hist > p75, np.minimum(t_hist, p90), y_w1)
-    y_w3 = np.where(t_hist > p90, np.minimum(t_hist, p95), y_w2)
-    y_w4 = np.where(t_hist > p95, t_hist, y_w3)
-    
+    p75_full = pt_clim[f'tx_p75_doy_{epoch}'].values[doys] if f'tx_p75_doy_{epoch}' in pt_clim else c_base
+    p90_full = pt_clim[f'tx_p90_doy_{epoch}'].values[doys] if f'tx_p90_doy_{epoch}' in pt_clim else c_base
+    p95_full = pt_clim[f'tx_p95_doy_{epoch}'].values[doys] if f'tx_p95_doy_{epoch}' in pt_clim else c_base
+    # TASK 3: the median-to-P75 zone is climatologically "Normal" (see
+    # classify_point_severity), not "Moderate" — Moderate now starts exactly
+    # at P75, matching the text classification tier-for-tier.
+    y_normal_warm = np.where(t_full > c_base, np.minimum(t_full, p75_full), c_base)
+    y_w1 = np.where(t_full > p75_full, np.minimum(t_full, p90_full), p75_full)
+    y_w2 = np.where(t_full > p90_full, np.minimum(t_full, p95_full), y_w1)
+    y_w3 = np.where(t_full > p95_full, np.minimum(t_full, rec_w_full), y_w2)
+    y_w4 = np.where(t_full > rec_w_full, t_full, y_w3)
+
     # Cold Anomalies
-    p25 = pt_clim[f'tn_p25_doy_{epoch}'].values[doys][dates <= tgt_dt_norm] if f'tn_p25_doy_{epoch}' in pt_clim else c_hist
-    p10 = pt_clim[f'tn_p10_doy_{epoch}'].values[doys][dates <= tgt_dt_norm] if f'tn_p10_doy_{epoch}' in pt_clim else c_hist
-    p5  = pt_clim[f'tn_p5_doy_{epoch}'].values[doys][dates <= tgt_dt_norm] if f'tn_p5_doy_{epoch}' in pt_clim else c_hist
-    y_c1 = np.where(t_hist < c_hist, np.maximum(t_hist, p25), c_hist)
-    y_c2 = np.where(t_hist < p25, np.maximum(t_hist, p10), y_c1)
-    y_c3 = np.where(t_hist < p10, np.maximum(t_hist, p5), y_c2)
-    y_c4 = np.where(t_hist < p5, t_hist, y_c3)
+    p25_full = pt_clim[f'tn_p25_doy_{epoch}'].values[doys] if f'tn_p25_doy_{epoch}' in pt_clim else c_base
+    p10_full = pt_clim[f'tn_p10_doy_{epoch}'].values[doys] if f'tn_p10_doy_{epoch}' in pt_clim else c_base
+    p5_full  = pt_clim[f'tn_p5_doy_{epoch}'].values[doys] if f'tn_p5_doy_{epoch}' in pt_clim else c_base
+    y_normal_cold = np.where(t_full < c_base, np.maximum(t_full, p25_full), c_base)
+    y_c1 = np.where(t_full < p25_full, np.maximum(t_full, p10_full), p25_full)
+    y_c2 = np.where(t_full < p10_full, np.maximum(t_full, p5_full), y_c1)
+    y_c3 = np.where(t_full < p5_full, np.maximum(t_full, rec_c_full), y_c2)
+    y_c4 = np.where(t_full < rec_c_full, t_full, y_c3)
 
-    sh = True if epoch == "A" else False  # Draw legend only once
+    # TASK 2: the 8 warm/cold severity tiers are represented by the compact
+    # HTML badge legend (rendered above the chart, Map-Tracker style) instead
+    # of cluttering Plotly's own legend — so all 8 stay showlegend=False here.
+    # Warm side: median -> Typical Range (grey) -> P75 -> Moderate/Strong/Extreme/Record
+    traces.append(go.Scatter(x=dates, y=c_base, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=dates, y=y_normal_warm, mode='lines', fill='tonexty', fillcolor='rgba(180,180,180,0.4)', line=dict(width=0), name='Typical Range', legendgroup='normal', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=dates, y=p75_full, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=dates, y=y_w1, mode='lines', fill='tonexty', fillcolor=warm_rgba('moderate'), line=dict(width=0), name='Warm Moderate', legendgroup='wm', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=dates, y=y_w2, mode='lines', fill='tonexty', fillcolor=warm_rgba('strong'), line=dict(width=0), name='Warm Strong', legendgroup='ws', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=dates, y=y_w3, mode='lines', fill='tonexty', fillcolor=warm_rgba('extreme'), line=dict(width=0), name='Warm Extreme', legendgroup='we', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=dates, y=y_w4, mode='lines', fill='tonexty', fillcolor=warm_rgba('record'), line=dict(width=0), name='Warm Record', legendgroup='wr', showlegend=False, hoverinfo='skip'))
 
-    traces.append(go.Scatter(x=d_hist, y=c_hist, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-    traces.append(go.Scatter(x=d_hist, y=y_w1, mode='lines', fill='tonexty', fillcolor=warm_rgba('moderate'), line=dict(width=0), name='Warm Moderate', legendgroup='wm', showlegend=sh, hoverinfo='skip'))
-    traces.append(go.Scatter(x=d_hist, y=y_w2, mode='lines', fill='tonexty', fillcolor=warm_rgba('strong'), line=dict(width=0), name='Warm Strong', legendgroup='ws', showlegend=sh, hoverinfo='skip'))
-    traces.append(go.Scatter(x=d_hist, y=y_w3, mode='lines', fill='tonexty', fillcolor=warm_rgba('extreme'), line=dict(width=0), name='Warm Extreme', legendgroup='we', showlegend=sh, hoverinfo='skip'))
-    traces.append(go.Scatter(x=d_hist, y=y_w4, mode='lines', fill='tonexty', fillcolor=warm_rgba('record'), line=dict(width=0), name='Warm Record', legendgroup='wr', showlegend=sh, hoverinfo='skip'))
+    # Cold side: median -> Typical Range (grey, legend already shown on warm side) -> P25 -> Moderate/Strong/Extreme/Record
+    traces.append(go.Scatter(x=dates, y=c_base, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=dates, y=y_normal_cold, mode='lines', fill='tonexty', fillcolor='rgba(180,180,180,0.4)', line=dict(width=0), name='Typical Range', legendgroup='normal', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=dates, y=p25_full, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=dates, y=y_c1, mode='lines', fill='tonexty', fillcolor=cold_rgba('moderate'), line=dict(width=0), name='Cold Moderate', legendgroup='cm', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=dates, y=y_c2, mode='lines', fill='tonexty', fillcolor=cold_rgba('strong'), line=dict(width=0), name='Cold Strong', legendgroup='cs', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=dates, y=y_c3, mode='lines', fill='tonexty', fillcolor=cold_rgba('extreme'), line=dict(width=0), name='Cold Extreme', legendgroup='ce', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=dates, y=y_c4, mode='lines', fill='tonexty', fillcolor=cold_rgba('record'), line=dict(width=0), name='Cold Record', legendgroup='cr', showlegend=False, hoverinfo='skip'))
 
-    traces.append(go.Scatter(x=d_hist, y=c_hist, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-    traces.append(go.Scatter(x=d_hist, y=y_c1, mode='lines', fill='tonexty', fillcolor=cold_rgba('moderate'), line=dict(width=0), name='Cold Moderate', legendgroup='cm', showlegend=sh, hoverinfo='skip'))
-    traces.append(go.Scatter(x=d_hist, y=y_c2, mode='lines', fill='tonexty', fillcolor=cold_rgba('strong'), line=dict(width=0), name='Cold Strong', legendgroup='cs', showlegend=sh, hoverinfo='skip'))
-    traces.append(go.Scatter(x=d_hist, y=y_c3, mode='lines', fill='tonexty', fillcolor=cold_rgba('extreme'), line=dict(width=0), name='Cold Extreme', legendgroup='ce', showlegend=sh, hoverinfo='skip'))
-    traces.append(go.Scatter(x=d_hist, y=y_c4, mode='lines', fill='tonexty', fillcolor=cold_rgba('record'), line=dict(width=0), name='Cold Record', legendgroup='cr', showlegend=sh, hoverinfo='skip'))
+    traces.append(go.Scatter(x=dates, y=c_base, mode='lines', line=dict(color='black', width=2), name='Reference Value', legendgroup='base', showlegend=False, hoverinfo='skip'))
 
-    traces.append(go.Scatter(x=dates, y=c_base, mode='lines', line=dict(color='black', width=2), name='Climatology Base', legendgroup='base', showlegend=sh))
+    # Visual split only: solid through the selected day, dotted after it (join day
+    # included on the dotted line so the stroke is continuous). Hover is a SINGLE
+    # full-series trace — splitting hover across hist/forecast lets Plotly's
+    # unified hover (hoverdistance ~20px ≈ a week on a 365-day axis) pull in the
+    # neighbouring day as a second "Current Value" block.
+    hist_mask = dates <= tgt_dt_norm
+    fcst_line_mask = dates >= tgt_dt_norm
+    y_all = df_live[col_target].values if col_target in df_live.columns else ((df_live['TX'].values + df_live['TN'].values) / 2.0)
 
-    fcst_mask = dates >= tgt_dt_norm
     if show_app:
         col_app = 'AT_Max' if meteo_var == "Max Temp (TX)" else ('AT_Min' if meteo_var == "Min Temp (TN)" else 'AT_Mean')
         if col_app in df_live.columns:
-            traces.append(go.Scatter(x=d_hist, y=df_live.loc[dates <= tgt_dt_norm, col_app], mode='lines', name='Apparent Temperature', legendgroup='app', showlegend=sh, line=dict(color=ATMOPULSE_OVERLAY['apparent_temp'], width=1.5), hovertemplate="Apparent Temperature: %{y:.1f}°C<extra></extra>"))
-            traces.append(go.Scatter(x=dates[fcst_mask], y=df_live.loc[fcst_mask, col_app], mode='lines', line=dict(color=ATMOPULSE_OVERLAY['apparent_temp'], width=1.5, dash='dot'), legendgroup='app', showlegend=False, hovertemplate="Apparent Temperature (Fcst): %{y:.1f}°C<extra></extra>"))
-    
+            traces.append(go.Scatter(x=d_hist, y=df_live.loc[hist_mask, col_app], mode='lines', name='Apparent Temperature', legendgroup='app', showlegend=sh, line=dict(color=ATMOPULSE_OVERLAY['apparent_temp'], width=1.5), hoverinfo='skip'))
+            traces.append(go.Scatter(x=dates[fcst_line_mask], y=df_live.loc[fcst_line_mask, col_app], mode='lines', line=dict(color=ATMOPULSE_OVERLAY['apparent_temp'], width=1.5, dash='dot'), legendgroup='app', showlegend=False, hoverinfo='skip'))
+            traces.append(go.Scatter(
+                x=dates, y=df_live[col_app], mode='lines',
+                line=dict(width=0, color='rgba(0,0,0,0)'), legendgroup='app', showlegend=False,
+                hovertemplate="Apparent Temperature: %{y:.1f}°C<extra></extra>",
+            ))
+
     if show_air:
-        c_ref_w = pt_clim['tx_max_val'].values[doys][dates <= tgt_dt_norm] if 'tx_max_val' in pt_clim else np.full(len(d_hist), np.nan)
-        c_ref_c = pt_clim['tn_min_val'].values[doys][dates <= tgt_dt_norm] if 'tn_min_val' in pt_clim else np.full(len(d_hist), np.nan)
-        c_ref_yw = pt_clim['tx_max_year'].values[doys][dates <= tgt_dt_norm] if 'tx_max_year' in pt_clim else np.full(len(d_hist), np.nan)
-        c_ref_yc = pt_clim['tn_min_year'].values[doys][dates <= tgt_dt_norm] if 'tn_min_year' in pt_clim else np.full(len(d_hist), np.nan)
+        if meteo_var == "Max Temp (TX)":
+            rec_wd_key, rec_cd_key = "tx_max_date", "tx_min_date"
+        elif meteo_var == "Min Temp (TN)":
+            rec_wd_key, rec_cd_key = "tn_max_date", "tn_min_date"
+        else:
+            rec_wd_key = "tg_max_date" if "tg_max_date" in pt_clim.variables else "tx_max_date"
+            rec_cd_key = "tg_min_date" if "tg_min_date" in pt_clim.variables else "tn_min_date"
 
-        c_data = np.empty((len(d_hist), 5), dtype=object)
-        c_data[:, 0] = np.round(c_hist, 1)
-        c_data[:, 1] = np.round(c_ref_w, 1)
-        c_data[:, 2] = np.round(c_ref_c, 1)
-        c_data[:, 3] = c_ref_yw
-        c_data[:, 4] = c_ref_yc
+        # Reuse the record thresholds already resolved above for the "Record"
+        # fill tier, rather than re-reading them from pt_clim a second time.
+        rec_wd = pt_clim[rec_wd_key].values[doys] if rec_wd_key in pt_clim.variables else np.full(len(doys), np.nan)
+        rec_cd = pt_clim[rec_cd_key].values[doys] if rec_cd_key in pt_clim.variables else np.full(len(doys), np.nan)
 
-        traces.append(go.Scatter(x=d_hist, y=t_hist, mode='lines', customdata=c_data, name='Air Temperature', legendgroup='air', showlegend=sh, line=dict(color='rgba(0,0,0,0.7)', width=1.5), 
-            hovertemplate="Air Temperature: %{y:.1f}°C<br>Reference Value: %{customdata[0]:.1f}°C<br>Hist. Max: %{customdata[1]:.1f}°C (%{customdata[3]:.0f})<br>Hist. Min: %{customdata[2]:.1f}°C (%{customdata[4]:.0f})<extra></extra>"))
-        if col_target in df_live.columns:
-            traces.append(go.Scatter(x=dates[fcst_mask], y=df_live.loc[fcst_mask, col_target], mode='lines', name='Air Temp Forecast', legendgroup='air', showlegend=False, line=dict(color='gray', width=2.5, dash='dot'), hovertemplate="Air Temperature (Fcst): %{y:.1f}°C<extra></extra>"))
-        
+        c_data_all = np.empty((len(dates), 5), dtype=object)
+        c_data_all[:, 0] = np.round(c_base, 1)
+        c_data_all[:, 1] = np.round(rec_w_full, 1)
+        c_data_all[:, 2] = np.round(rec_c_full, 1)
+        c_data_all[:, 3] = _yyyymmdd_dot_date_arr(rec_wd)
+        c_data_all[:, 4] = _yyyymmdd_dot_date_arr(rec_cd)
+
+        hover_current = (
+            "Current Value: %{y:.1f}°C<br>"
+            "Reference Value: %{customdata[0]:.1f}°C<br>"
+            "Maximum: %{customdata[1]:.1f}°C%{customdata[3]}<br>"
+            "Minimum: %{customdata[2]:.1f}°C%{customdata[4]}"
+            "<extra></extra>"
+        )
+
+        # TASK 4: this is the trace that actually shows in the Plotly legend
+        # for the temperature line (the hover-carrying trace below stays
+        # showlegend=False) — renamed "Air Temperature" -> "Current Value".
+        traces.append(go.Scatter(
+            x=d_hist, y=t_hist, mode='lines',
+            name='Current Value', legendgroup='air', showlegend=False,
+            line=dict(color='rgba(0,0,0,0.7)', width=1.5), hoverinfo='skip',
+        ))
+        traces.append(go.Scatter(
+            x=dates[fcst_line_mask], y=y_all[fcst_line_mask.values],
+            mode='lines', name='Current Value (Forecast)', legendgroup='air', showlegend=False,
+            line=dict(color='gray', width=2.5, dash='dot'), hoverinfo='skip',
+        ))
+        traces.append(go.Scatter(
+            x=dates, y=y_all, mode='lines',
+            line=dict(width=0, color='rgba(0,0,0,0)'),
+            customdata=c_data_all, name='Current Value',
+            legendgroup='air', showlegend=False, hovertemplate=hover_current,
+        ))
+
     return traces
 
+@st.cache_data(show_spinner=False)
 def build_top10_table(df_live, meteo_var):
+    """Trailing 12-month (365-day) hottest/coldest-day table below the main meteogram.
+
+    Pure data-processing (returns a DataFrame, not a Plotly figure) -> cached
+    with @st.cache_data so re-sorting/re-slicing df_live doesn't re-run on
+    every unrelated widget rerun (e.g. the Layout radio).
+    """
     col_target = 'TG' if meteo_var == "Mean Temp (TG)" else ('TX' if meteo_var == "Max Temp (TX)" else 'TN')
     if col_target not in df_live.columns: 
         return pd.DataFrame()
@@ -1098,51 +1822,79 @@ def build_top10_table(df_live, meteo_var):
     return df_sorted.head(10)
 
 # --- DATETIME64 CRASH BUGFIX ---
+# PERFORMANCE: the master archive point extraction (ds.sel(...).compute()) is
+# the expensive step (multi-minute NetCDF/dask read for a fresh point) and is
+# completely EPOCH-INDEPENDENT — only the climatology percentile lookup below
+# depends on epoch "A" vs "B". Previously this ran TWICE per point (once per
+# epoch, since epoch was baked into build_yearly_extremes_chart's own cache
+# key), doubling the wait. Splitting it into its own @st.cache_data step means
+# the raw series is read from disk once per (lat, lon, is_warm) and reused for
+# both epoch A and epoch B charts.
 @st.cache_data(show_spinner=False)
-def build_yearly_extremes_chart(lat, lon, epoch, is_warm):
+def _load_point_archive_series(lat, lon, is_warm, _archive_version=4):
     ds = get_master_archive_ds()
-    if ds is None or ref_clim is None: 
-        return go.Figure()
+    if ds is None:
+        return None
+
+    # Resolve the variable name from the (lazy, uncomputed) Dataset schema
+    # FIRST — this costs nothing, no I/O — so we can subset to that ONE
+    # variable before touching .sel()/.compute(). Selecting the point on the
+    # full multi-variable Dataset first would force every other archived
+    # field (at that point) to be read/materialized for nothing.
+    var_name = None
+    candidates = ("tx", "mx2t") if is_warm else ("tn", "mn2t")
+    for candidate in candidates:
+        if candidate in ds.data_vars:
+            var_name = candidate
+            break
+    if var_name is None:
+        return None
+
+    # Pushdown: (variable, then point) selection on the still-lazy DataArray
+    # — only the single (lat, lon) time series for `var_name` is ever pulled
+    # off disk/decompressed, never the full spatial grid or unrelated fields.
     with st.session_state.nc_lock:
         try:
-            pt_data = ds.sel(latitude=lat, longitude=lon, method='nearest').compute()
-        except: 
-            return go.Figure()
-        
-    pt_clim = ref_clim.sel(latitude=lat, longitude=lon, method='nearest')
-    var_name = None
-    if is_warm:
-        for candidate in ("tx", "mx2t"):
-            if candidate in pt_data:
-                var_name = candidate
-                break
-    else:
-        for candidate in ("tn", "mn2t"):
-            if candidate in pt_data:
-                var_name = candidate
-                break
-    if var_name is None:
-        return go.Figure().add_annotation(text="Data Missing.", showarrow=False)
+            pt_series = ds[var_name].sel(latitude=lat, longitude=lon, method='nearest').compute()
+        except Exception:
+            return None
 
-    raw = np.asarray(pt_data[var_name].values, dtype=np.float64)
+    raw = np.asarray(pt_series.values, dtype=np.float64)
     finite = raw[np.isfinite(raw)]
     if finite.size > 0 and np.nanmean(finite) > 100:
         raw = raw - 273.15
-    val = raw
-    
-    df = pd.DataFrame({'time': pt_data.valid_time.values, 'val': val}).drop_duplicates(subset=['time'])
+
+    df = pd.DataFrame({'time': pt_series.valid_time.values, 'val': raw}).drop_duplicates(subset=['time'])
     dates = pd.to_datetime(df['time'])
     df['year'] = dates.dt.year
-    
-    # ETCCDI 365-day mapping for historical extremes
-    raw_doys = dates.dt.dayofyear.values
-    is_leap = dates.dt.is_leap_year.values
-    months = dates.dt.month.values
-    doy_365 = np.where(is_leap & (months >= 3), raw_doys - 1, raw_doys)
-    doys = doy_365 - 1  # 0-based for array indexing
-    
+
+    # ETCCDI 365-day mapping for historical extremes — fully vectorized.
+    # 29 Feb keeps its own row/value (it can still set an actual "Record" or
+    # count into the yearly bars); it is only ever excised from the 365-day
+    # BASELINE percentile array, never from this real-data table.
+    df['doy'] = etccdi_doy_365(dates) - 1  # 0-based for array indexing
+    return df
+
+
+# Threshold-occurrence diagram ("Days exceeding thresholds") below the main
+# meteogram: returns a complex Plotly Figure that is never mutated by its
+# callers after return, so @st.cache_resource avoids the deep-copy cost
+# @st.cache_data would otherwise pay on every rerun, while still keying on
+# (lat, lon, epoch, is_warm). The heavy I/O now lives in
+# `_load_point_archive_series` above, so this function only re-runs the cheap
+# epoch-specific percentile classification + figure build on a cache miss.
+@st.cache_resource(show_spinner=False)
+def build_yearly_extremes_chart(lat, lon, epoch, is_warm):
+    if ref_clim is None:
+        return go.Figure()
+    df = _load_point_archive_series(lat, lon, is_warm)
+    if df is None:
+        return go.Figure()
+
+    pt_clim = ref_clim.sel(latitude=lat, longitude=lon, method='nearest')
+    doys = df['doy'].values
     v = df['val'].values
-    
+
     if is_warm and f'tx_p95_doy_{epoch}' in pt_clim.variables:
         c_75, c_90, c_95, c_rec = pt_clim[f'tx_p75_doy_{epoch}'].values[doys], pt_clim[f'tx_p90_doy_{epoch}'].values[doys], pt_clim[f'tx_p95_doy_{epoch}'].values[doys], pt_clim['tx_max_val'].values[doys]
         df['p75'], df['p90'], df['p95'], df['rec'] = (v >= c_75) & (v < c_90), (v >= c_90) & (v < c_95), (v >= c_95) & (v < c_rec), v >= c_rec
@@ -1172,7 +1924,7 @@ def build_yearly_extremes_chart(lat, lon, epoch, is_warm):
 
 # --- WAVE CACHE WRAPPER ---
 @st.cache_data(show_spinner=False)
-def fetch_wave_figs(lat_target, lon_target, param_code, selected_epoch, wave_thresh, wave_stat_metric, _axis_version=2):
+def fetch_wave_figs(lat_target, lon_target, param_code, selected_epoch, wave_thresh, wave_stat_metric, _axis_version=4):
     return get_kiesely_waves_figs(lat_target, lon_target, parameter=param_code, selected_epoch=selected_epoch, threshold_level=wave_thresh, stat_metric=wave_stat_metric)
 
 # --- UI LAYOUT: TOP NAVIGATION BAR ---
@@ -1214,9 +1966,19 @@ with st.sidebar:
     )
     if nav_selection in NAV_ANALYTICS:
         st.header("Control Panel")
+        if show_expert("forecast_model"):
+            st.radio(
+                "Forecast Model",
+                FORECAST_MODEL_OPTIONS,
+                key="forecast_model",
+                help=HELP["forecast_model"],
+            )
+        else:
+            st.session_state.forecast_model = FORECAST_MODEL_IFS
+        _fc_tag = "AIFS" if is_aifs_model() else "IFS"
         st.markdown(
             f"<p style='font-size: 12px; color: #555; margin-top: -10px;'>📡 Data: ERA5 Archive (~ 5 days ago) | "
-            f"IFS Forecast ({default_date.strftime('%d.%m.%Y')} 12 UTC).</p>",
+            f"{_fc_tag} Forecast ({default_date.strftime('%d.%m.%Y')} 12 UTC).</p>",
             unsafe_allow_html=True,
             help=HELP["data_vintage"],
         )
@@ -1408,10 +2170,9 @@ if nav_selection == NAV_WELCOME:
             st.caption("Cold example image not found in Documents/.")
 
 elif nav_selection == NAV_MAP:
-    if show_expert("flicker_layout"):
-        map_layout = st.radio("Map Layout:", (LAYOUT_SIDE_BY_SIDE, LAYOUT_FLICKER), horizontal=True)
-    else:
-        map_layout = STANDARD_DEFAULTS["map_layout"]
+    # Map Layout is a core viewing control (not an expert-only toggle) -> render
+    # it globally for Standard and Expert users alike.
+    map_layout = st.radio("Map Layout:", (LAYOUT_SIDE_BY_SIDE, LAYOUT_FLICKER, LAYOUT_OPACITY), horizontal=True)
     if map_layout == LAYOUT_FLICKER:
         flicker_epoch = st.radio("Select Reference Period:", ("Reference Period A (1961–1990)", "Reference Period B (1996–2025)"), horizontal=True, index=1)
 
@@ -1469,6 +2230,7 @@ elif nav_selection == NAV_MAP:
             (target_date - pd.Timedelta(days=65)).strftime('%Y-%m-%d'),
             target_date.strftime('%Y-%m-%d'),
             default_date.strftime('%Y-%m-%d'),
+            forecast_model=selected_forecast_model(),
         ) or (None, {})
         eff_end = pers_meta.get("effective_end")
         if pers_meta.get("uses_ifs") and eff_end is not None:
@@ -1554,76 +2316,192 @@ elif nav_selection == NAV_MAP:
             else:
                 st.caption("No countries affected.")
 
-    try:
-        with st.spinner("Loading synoptic fields..."):
-            map_phys_data, map_time_meta = fetch_cached_synoptic_data(
-                target_date.strftime('%Y-%m-%d'), default_date.strftime('%Y-%m-%d')
-            )
-        if not map_time_meta.get("available"):
-            st.warning(
-                f"No synoptic data for **{target_date.strftime('%d.%m.%Y')}**. "
-                "The IFS HRES forecast may not yet cover this date — try a lower Forecast Offset."
-            )
-        else:
-            if not map_time_meta.get("temps_available", True):
+    aifs_txtn_blocked = is_aifs_model() and map_var_code in ("TX", "TN")
+    aifs_hatch_blocked = is_aifs_model() and bool(toggles.get("hatching"))
+    if aifs_txtn_blocked or aifs_hatch_blocked:
+        st.warning(AIFS_TXTN_WARNING)
+    if not aifs_txtn_blocked:
+        if aifs_hatch_blocked:
+            toggles = {**toggles, "hatching": False}
+        try:
+            with st.spinner("Loading synoptic fields..."):
+                map_phys_data, map_time_meta = fetch_cached_synoptic_data(
+                    target_date.strftime('%Y-%m-%d'), default_date.strftime('%Y-%m-%d'),
+                    forecast_model=selected_forecast_model(),
+                )
+            if not map_time_meta.get("available"):
                 st.warning(
-                    f"Temperature extremes (TX/TN/TG) are missing for **{target_date.strftime('%d.%m.%Y')}** "
-                    "in the ERA5 archive, so the colour overlay cannot be drawn. "
-                    "Synoptic contours are shown where available."
+                    f"No synoptic data for **{target_date.strftime('%d.%m.%Y')}**. "
+                    "The IFS HRES forecast may not yet cover this date — try a lower Forecast Offset."
                 )
-            if map_layout == LAYOUT_SIDE_BY_SIDE:
-                fig_a = build_baseline_map(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, toggles, view_mode, persist_metric, top10_threshold, "A", map_var_code, anchor_date=default_date)
-                fig_b = build_baseline_map(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, toggles, view_mode, persist_metric, top10_threshold, "B", map_var_code, anchor_date=default_date)
-                with st.container(key="atmopulse_map_columns"):
-                    mc1, mc2 = st.columns(2, gap="small")
-                    with mc1:
-                        _render_synoptic_map(fig_a, "Historical Baseline (1961-1990)", "map_a")
-                    with mc2:
-                        _render_synoptic_map(fig_b, "Recent Baseline (1996-2025)", "map_b")
-                map_col1, map_col2 = st.columns(2)
-                with map_col1:
-                    df_h_a, df_c_a = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "A", map_var_code, anchor_date=default_date)
-                    render_top10_period(df_h_a, df_c_a)
-                with map_col2:
-                    df_h_b, df_c_b = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "B", map_var_code, anchor_date=default_date)
-                    render_top10_period(df_h_b, df_c_b)
             else:
-                ep_sel = "A" if "A" in flicker_epoch else "B"
-                flicker_title = "Historical Baseline (1961-1990)" if ep_sel == "A" else "Recent Baseline (1996-2025)"
-                _render_synoptic_map(
-                    build_baseline_map(
-                        ref_clim, map_phys_data, target_date,
-                        st.session_state.toggles_warm, st.session_state.toggles_cold,
-                        toggles, view_mode, persist_metric, top10_threshold,
-                        ep_sel, map_var_code, anchor_date=default_date,
-                        full_width=True,
-                    ),
-                    flicker_title,
-                    "map_flicker",
-                )
-                _, table_col, _ = st.columns([1, 2, 1])
-                with table_col:
-                    df_h, df_c = calculate_top10(
-                        ref_clim, map_phys_data, target_date,
-                        st.session_state.toggles_warm, st.session_state.toggles_cold,
-                        view_mode, persist_metric, top10_threshold,
-                        ep_sel, map_var_code, anchor_date=default_date,
+                if not map_time_meta.get("temps_available", True):
+                    st.warning(
+                        f"Temperature extremes (TX/TN/TG) are missing for **{target_date.strftime('%d.%m.%Y')}** "
+                        "in the ERA5 archive, so the colour overlay cannot be drawn. "
+                        "Synoptic contours are shown where available."
                     )
-                    render_top10_tables(df_h, df_c)
-    except Exception as e: 
-        st.error(f"Error loading maps: {e}")
+                if is_daily_map_view(view_mode):
+                    # Cumulative severity ladder: Moderate INCLUDES Strong/Extreme/Record,
+                    # Strong INCLUDES Extreme/Record, Extreme INCLUDES Record, Record is exclusive.
+                    footprint_tier_order = ("moderate", "strong", "extreme", "record")
+                    footprint_tier_titles = {"moderate": "Moderate", "strong": "Strong", "extreme": "Extreme", "record": "Record"}
+                    footprint_tier_label = {
+                        "moderate": "moderate (P75/25)", "strong": "strong (P90/10)",
+                        "extreme": "extreme (P95/5)", "record": "all-time record",
+                    }
+                    # Active analysis level (Moderate/Strong/Extreme/All-Time Record radio)
+                    # drives which single tier the TEXT sentence narrates.
+                    active_tier = {
+                        "Moderate": "moderate", "Strong": "strong",
+                        "Extreme": "extreme", "All-Time Record": "record",
+                    }.get(top10_threshold, "strong")
+                    layout_choice = map_layout  # the exact Map Layout radio state — "Side-by-Side Compare" | "Single Map Flicker" | "Opacity Slider Compare"
+                    target_date_str = target_date.strftime('%Y-%m-%d')
+                    anchor_date_str = default_date.strftime('%Y-%m-%d')
+
+                    if layout_choice == LAYOUT_FLICKER:
+                        # --- SINGLE BASELINE STATE: one map on screen -> one set of cumulative percentages ---
+                        active_epoch = "A" if "A" in flicker_epoch else "B"
+                        active_baseline = EPOCH_LABELS[active_epoch]
+                        footprint_single = compute_map_footprint(
+                            ref_clim, map_phys_data, target_date_str,
+                            st.session_state.toggles_warm, st.session_state.toggles_cold,
+                            active_epoch, map_var_code, anchor_date_str=anchor_date_str,
+                        )
+                        if footprint_single:
+                            # TEXT SENTENCE — always rendered, Standard and Expert alike.
+                            single_val = footprint_single[active_tier]["total_pct"]
+                            st.markdown(
+                                f"**Based on the {active_baseline} baseline**, **{single_val:.1f}%** of Europe is experiencing "
+                                f"{footprint_tier_label[active_tier]} anomalies."
+                            )
+                            # DETAILED BREAKDOWN — Expert Mode only, placed directly below the text.
+                            if is_expert_mode():
+                                metric_cols = st.columns(4)
+                                for m_col, tier in zip(metric_cols, footprint_tier_order):
+                                    with m_col:
+                                        st.metric(footprint_tier_titles[tier], f"{footprint_single[tier]['total_pct']:.1f}%")
+                    else:
+                        # --- COMPARE STATE (Side-by-Side or Opacity Compare): both maps on screen -> both baselines' cumulative percentages ---
+                        footprint_a = compute_map_footprint(
+                            ref_clim, map_phys_data, target_date_str,
+                            st.session_state.toggles_warm, st.session_state.toggles_cold,
+                            "A", map_var_code, anchor_date_str=anchor_date_str,
+                        )
+                        footprint_b = compute_map_footprint(
+                            ref_clim, map_phys_data, target_date_str,
+                            st.session_state.toggles_warm, st.session_state.toggles_cold,
+                            "B", map_var_code, anchor_date_str=anchor_date_str,
+                        )
+                        if footprint_a and footprint_b:
+                            # TEXT SENTENCE — always rendered, Standard and Expert alike.
+                            hist_val = footprint_a[active_tier]["total_pct"]
+                            rec_val = footprint_b[active_tier]["total_pct"]
+                            trend_word = "amplified" if rec_val > hist_val else "reduced" if rec_val < hist_val else "unchanged"
+                            st.markdown(
+                                f"Relative to the historical **{EPOCH_LABELS['A']}** baseline, **{hist_val:.1f}%** of Europe is experiencing "
+                                f"{footprint_tier_label[active_tier]} anomalies. Under the recent **{EPOCH_LABELS['B']}** climate state, "
+                                f"this footprint is {trend_word} to **{rec_val:.1f}%**."
+                            )
+                            # DETAILED TABLE (1961-1990 vs 1996-2025 vs Delta) — Expert Mode only,
+                            # placed directly below the text.
+                            if is_expert_mode():
+                                table_rows = "\n".join(
+                                    f"| {footprint_tier_titles[t]} | {footprint_a[t]['total_pct']:.1f}% | "
+                                    f"{footprint_b[t]['total_pct']:.1f}% | {footprint_b[t]['total_pct'] - footprint_a[t]['total_pct']:+.1f} pp |"
+                                    for t in footprint_tier_order
+                                )
+                                st.markdown(
+                                    f"| Severity (cumulative) | {EPOCH_LABELS['A']} | {EPOCH_LABELS['B']} | Δ |\n"
+                                    f"|---|---|---|---|\n{table_rows}"
+                                )
+
+                if map_layout == LAYOUT_SIDE_BY_SIDE:
+                    fig_a = build_baseline_map(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, toggles, view_mode, persist_metric, top10_threshold, "A", map_var_code, anchor_date=default_date)
+                    fig_b = build_baseline_map(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, toggles, view_mode, persist_metric, top10_threshold, "B", map_var_code, anchor_date=default_date)
+                    with st.container(key="atmopulse_map_columns"):
+                        mc1, mc2 = st.columns(2, gap="small")
+                        with mc1:
+                            _render_synoptic_map(fig_a, "Historical Baseline (1961-1990)", "map_a")
+                        with mc2:
+                            _render_synoptic_map(fig_b, "Recent Baseline (1996-2025)", "map_b")
+                    map_col1, map_col2 = st.columns(2)
+                    with map_col1:
+                        df_h_a, df_c_a = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "A", map_var_code, anchor_date=default_date)
+                        render_top10_period(df_h_a, df_c_a)
+                    with map_col2:
+                        df_h_b, df_c_b = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "B", map_var_code, anchor_date=default_date)
+                        render_top10_period(df_h_b, df_c_b)
+                elif map_layout == LAYOUT_OPACITY:
+                    fig_a = build_baseline_map(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, toggles, view_mode, persist_metric, top10_threshold, "A", map_var_code, anchor_date=default_date, full_width=True)
+                    fig_b = build_baseline_map(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, toggles, view_mode, persist_metric, top10_threshold, "B", map_var_code, anchor_date=default_date, full_width=True)
+                    _render_synoptic_map(
+                        build_opacity_slider_map(fig_a, fig_b),
+                        "Opacity Slider Compare: Historical Baseline (1961-1990) ↔ Recent Baseline (1996-2025)",
+                        "map_opacity",
+                        bottom_margin=60,
+                    )
+                    st.caption("Drag the slider under the map to cross-fade between the two reference periods. Zoom and tooltips stay interactive.")
+                    map_col1, map_col2 = st.columns(2)
+                    with map_col1:
+                        df_h_a, df_c_a = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "A", map_var_code, anchor_date=default_date)
+                        render_top10_period(df_h_a, df_c_a, "Historical Baseline (1961–1990)")
+                    with map_col2:
+                        df_h_b, df_c_b = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "B", map_var_code, anchor_date=default_date)
+                        render_top10_period(df_h_b, df_c_b, "Recent Baseline (1996–2025)")
+                else:
+                    ep_sel = "A" if "A" in flicker_epoch else "B"
+                    flicker_title = "Historical Baseline (1961-1990)" if ep_sel == "A" else "Recent Baseline (1996-2025)"
+                    _render_synoptic_map(
+                        build_baseline_map(
+                            ref_clim, map_phys_data, target_date,
+                            st.session_state.toggles_warm, st.session_state.toggles_cold,
+                            toggles, view_mode, persist_metric, top10_threshold,
+                            ep_sel, map_var_code, anchor_date=default_date,
+                            full_width=True,
+                        ),
+                        flicker_title,
+                        "map_flicker",
+                    )
+                    _, table_col, _ = st.columns([1, 2, 1])
+                    with table_col:
+                        df_h, df_c = calculate_top10(
+                            ref_clim, map_phys_data, target_date,
+                            st.session_state.toggles_warm, st.session_state.toggles_cold,
+                            view_mode, persist_metric, top10_threshold,
+                            ep_sel, map_var_code, anchor_date=default_date,
+                        )
+                        render_top10_tables(df_h, df_c)
+        except Exception as e: 
+            st.error(f"Error loading maps: {e}")
 
 elif nav_selection in (NAV_METEO, NAV_WAVE):
     st.subheader("🏙️ Target Location")
     search_col1, search_col2 = st.columns([1, 2])
     with search_col1: 
-        loc_history_sel = st.selectbox("Select recent location:", ["Select..."] + st.session_state.search_history)
+        loc_history_sel = st.selectbox(
+            "Select recent location:",
+            ["Select..."] + st.session_state.search_history,
+            key="loc_history_sel",
+            on_change=_on_loc_history_change,
+        )
     with search_col2: 
-        new_loc_input = st.text_input("Or select new location (Press Enter to see options):")
+        new_loc_input = st.text_input(
+            "Or select new location (Press Enter to see options):",
+            key="new_loc_input",
+            on_change=_on_new_loc_input_change,
+        )
     st.markdown("<div style='margin-bottom: 25px;'></div>", unsafe_allow_html=True)
 
     location = None
-    if new_loc_input:
+    use_history = (
+        loc_history_sel != "Select..."
+        and st.session_state.get("loc_source") == "history"
+    )
+    if use_history:
+        location = geolocator.geocode(loc_history_sel, timeout=10)
+    elif new_loc_input:
         if new_loc_input != st.session_state.get("last_query"):
             st.session_state.last_query = new_loc_input
             with st.spinner("Searching..."):
@@ -1654,60 +2532,213 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
             st.success(f"📍 **Location Matrix Active:** {location.address} | **{lat_target}°N, {lon_target}°E**")
 
     if location:
+        render_grid_cell_profile(location.address, lat_target, lon_target)
         if nav_selection == NAV_METEO:
             if show_expert("flicker_layout"):
                 map_layout = st.radio("Layout:", (LAYOUT_SIDE_BY_SIDE, LAYOUT_FLICKER), horizontal=True, key="met_layout")
             else:
                 map_layout = STANDARD_DEFAULTS["map_layout"]
-            with st.spinner("Fetching Meteogram data..."): 
-                df_live = get_live_timeseries(lat_target, lon_target)
-            if not df_live.empty:
-                col_target = 'TG' if meteo_var == "Mean Temp (TG)" else ('TX' if meteo_var == "Max Temp (TX)" else 'TN')
-                t_arr = df_live[col_target].values if col_target in df_live.columns else ((df_live['TX'].values + df_live['TN'].values) / 2.0)
-                global_min, global_max = np.nanmin(t_arr) - 3, np.nanmax(t_arr) + 3
-                tgt_dt_norm = pd.to_datetime(target_date).tz_localize(None)
+            # Determine the active Flicker-mode reference period BEFORE the
+            # narrative text is built below, so the sentence never "leaks" a
+            # hardcoded baseline that doesn't match what the widget actually
+            # shows under the chart. Re-rendered later at its original chart
+            # position using the SAME key (Streamlit persists the selection
+            # across the rerun, so reading it here is safe).
+            if map_layout == LAYOUT_FLICKER:
+                met_active_epoch = "A" if "A" in st.session_state.get("met_ep", "B (1996–2025)") else "B"
+            if is_aifs_model() and meteo_var in ("Max Temp (TX)", "Min Temp (TN)"):
+                st.warning(AIFS_TXTN_WARNING)
+            else:
+                with st.spinner("Fetching Meteogram data..."): 
+                    df_live = get_live_point_series(lat_target, lon_target, selected_forecast_model())
+                if not df_live.empty:
+                    col_target = 'TG' if meteo_var == "Mean Temp (TG)" else ('TX' if meteo_var == "Max Temp (TX)" else 'TN')
 
-                traces_a = get_meteogram_traces(df_live, ref_clim, lat_target, lon_target, target_date, "A", show_air_temp, show_app_temp, meteo_env, meteo_var)
-                traces_b = get_meteogram_traces(df_live, ref_clim, lat_target, lon_target, target_date, "B", show_air_temp, show_app_temp, meteo_env, meteo_var)
-                
-                if map_layout == LAYOUT_SIDE_BY_SIDE:
-                    fig = make_subplots(rows=1, cols=2, subplot_titles=("Reference Period A (1961–1990)", "Reference Period B (1996–2025)"), shared_yaxes=True)
-                    for trace in traces_a: 
-                        fig.add_trace(trace, row=1, col=1)
-                    for trace in traces_b: 
-                        fig.add_trace(trace, row=1, col=2)
-                        
-                    fig.add_vline(x=tgt_dt_norm.timestamp() * 1000, line_dash="dash", line_color="gray", opacity=0.8, row=1, col=1)
-                    fig.add_vline(x=tgt_dt_norm.timestamp() * 1000, line_dash="dash", line_color="gray", opacity=0.8, row=1, col=2)
-                    fig.update_xaxes(dtick="M2", tickformat="%b\n%Y", showgrid=True, gridcolor=ATMOPULSE_OVERLAY['grid'])
-                    fig.update_yaxes(range=[global_min, global_max])
-                    fig.update_layout(**plotly_typography(), hovermode="x unified", height=500, template="plotly_white", margin=dict(t=40, b=10), legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5))
-                    st.plotly_chart(fig, use_container_width=True)
+                    # --- STRICT DATETIME INDEXING for "current conditions" ---
+                    # Never .max()/.mean() over the series, and never a bare
+                    # .iloc[0]/.iloc[-1] unless target_date genuinely falls
+                    # outside the live window — the scalar MUST come from the
+                    # exact calendar row matching the active target_date.
+                    #
+                    # `df_live` (get_live_point_series) is built entirely from calendar-day
+                    # UTC aggregates — the ERA5 archive's daily valid_time and the IFS/AIFS
+                    # forecast's own 00Z-00Z daily aggregation (ifs_ingestion.py) — so it is
+                    # already on the same UTC calendar-day footing as `active_date` below.
+                    df_indexed = df_live.copy()
+                    df_indexed['Date'] = pd.to_datetime(df_indexed['Date']).dt.tz_localize(None).dt.normalize()
+                    df_indexed = df_indexed.drop_duplicates(subset=['Date']).set_index('Date').sort_index()
+                    active_date = (
+                        pd.Timestamp.utcnow().tz_localize(None).floor('D')
+                        + pd.Timedelta(days=st.session_state.offset_slider)
+                    )
+
+                    try:
+                        current_row = df_indexed.loc[active_date]
+                        current_row_date = active_date
+                    except KeyError:
+                        # Defensive-only safety net (e.g. offset_slider pushed past what
+                        # the live series actually returned, or an upstream API gap) —
+                        # NOT the primary alignment mechanism anymore. Nearest available
+                        # calendar day, never the series' arbitrary last/forecast row.
+                        nearest_pos = df_indexed.index.get_indexer([active_date], method='nearest')[0]
+                        current_row = df_indexed.iloc[nearest_pos]
+                        current_row_date = df_indexed.index[nearest_pos]
+
+                    if col_target in df_indexed.columns:
+                        value_now = float(current_row[col_target])
+                    elif 'TX' in df_indexed.columns and 'TN' in df_indexed.columns:
+                        value_now = float((current_row['TX'] + current_row['TN']) / 2.0)
+                    else:
+                        value_now = np.nan
+
+                    # Thresholds must be evaluated for THAT specific day (current_row_date),
+                    # not the slider's nominal target_date, so a forecast-fallback row never
+                    # gets scored against the wrong calendar day's P75/90/95 climatology.
+                    #
+                    # Baseline isolation: each epoch gets its OWN, freshly-built p_warm/p_cold
+                    # dict from compute_point_thresholds — "A" and "B" thresholds are never
+                    # assigned into the same variable, so there is no possibility of one
+                    # baseline's percentiles silently overwriting the other's.
+                    # Both baselines' thresholds are computed unconditionally (cheap — just
+                    # ref_clim.sel()+array-index lookups, no I/O) so the debug readout below
+                    # can always show both, regardless of which layout is active.
+                    percentiles_a = compute_point_thresholds(ref_clim, lat_target, lon_target, current_row_date, meteo_var, "A")
+                    percentiles_b = compute_point_thresholds(ref_clim, lat_target, lon_target, current_row_date, meteo_var, "B")
+                    cat_a, dir_a = classify_point_severity(value_now, *percentiles_a)
+                    cat_b, dir_b = classify_point_severity(value_now, *percentiles_b)
+                    condition_a = f"{cat_a} {dir_a}" if dir_a else "normal"
+                    condition_b = f"{cat_b} {dir_b}" if dir_b else "normal"  # e.g. "extreme warm", "moderate cold", "normal"
+
+                    if map_layout == LAYOUT_FLICKER:
+                        # Single-baseline state: narrate strictly the ACTIVE epoch (the one the
+                        # Flicker radio below is actually showing) — never a hardcoded baseline.
+                        cat_x, dir_x = (cat_a, dir_a) if met_active_epoch == "A" else (cat_b, dir_b)
+                        condition_x = condition_a if met_active_epoch == "A" else condition_b
+                        x_txt = "within its normal range" if condition_x == "normal" else f"{condition_x} conditions"
+                        condition_string = (
+                            f"The area of {location.address} is currently experiencing {x_txt} relative to "
+                            f"the {EPOCH_LABELS[met_active_epoch]} baseline."
+                        )
+                        condition_b = condition_x  # drives the styling block below
+                    else:
+                        # TASK 2: chronological order — historical (A, 1961-1990) baseline
+                        # narrated FIRST, recent (B, 1996-2025) baseline SECOND, matching the
+                        # left-to-right reading order of the UI.
+                        a_txt = "within its normal range" if condition_a == "normal" else f"{condition_a} conditions"
+                        b_txt = "within its normal range" if condition_b == "normal" else f"{condition_b} conditions"
+                        condition_string = (
+                            f"The area of {location.address} is currently experiencing {a_txt} relative to the "
+                            f"historical {EPOCH_LABELS['A']} baseline. Compared to the recent {EPOCH_LABELS['B']} "
+                            f"climate state, this equates to {b_txt}."
+                        )
+
+                    # --- Conditional styling: driven by the ACTIVE (baseline-B) severity tier,
+                    # not a naive substring search of the sentence, so e.g. a compare-mode
+                    # sentence mentioning both "warm" and "cold" can't pick the wrong branch.
+                    if condition_b in ("record warm", "extreme warm", "strong warm"):
+                        st.error(condition_string, icon="🔥")
+                    elif condition_b == "moderate warm":
+                        st.warning(condition_string)
+                    elif condition_b in ("record cold", "extreme cold", "strong cold"):
+                        st.info(condition_string, icon="❄️")
+                    elif condition_b == "moderate cold":
+                        st.markdown(
+                            f"""<div style="background-color:{ATMOPULSE_COLD['p25']}; color:#003554;
+                            padding:0.75rem 1rem; border-radius:0.5rem;">🧊 {condition_string}</div>""",
+                            unsafe_allow_html=True,
+                        )
+                    else:  # "normal" — no significant anomaly
+                        st.success(condition_string, icon="✅")
+
+                    t_arr = df_live[col_target].values if col_target in df_live.columns else ((df_live['TX'].values + df_live['TN'].values) / 2.0)
+                    global_min, global_max = np.nanmin(t_arr) - 3, np.nanmax(t_arr) + 3
+                    tgt_dt_norm = pd.to_datetime(target_date).tz_localize(None)
+
+                    traces_a = get_meteogram_traces(df_live, ref_clim, lat_target, lon_target, target_date, "A", show_air_temp, show_app_temp, meteo_env, meteo_var, current_condition=(cat_a, dir_a))
+                    traces_b = get_meteogram_traces(df_live, ref_clim, lat_target, lon_target, target_date, "B", show_air_temp, show_app_temp, meteo_env, meteo_var, current_condition=(cat_b, dir_b))
+
+                    # TASK 2: compact HTML badge legend (Map Tracker style) for the 8
+                    # warm/cold severity tiers, replacing Plotly's own cluttered legend
+                    # for these fills. "Typical Range" (P25-P75) called out separately.
+                    _s_normal = "background-color:rgba(180,180,180,0.4); color:#333; padding:1px 6px; border-radius:3px; font-family:" + ATMOPULSE_FONTS['outfit_css'] + "; font-size:12px; font-weight:" + str(ATMOPULSE_FONTS['ui_weight']) + ";"
+                    st.markdown(
+                        f"<div class='atmopulse-map-legend atmopulse-subsection-label' "
+                        f"style='margin-bottom: 6px; white-space: nowrap;'>"
+                        f"<b>Legend.</b> "
+                        f"<span style='{_s_normal}'>Typical Range</span>"
+                        f"<span style='padding-left: 12px;'>Warm:</span> "
+                        f"<span style='{legend_badge_style('warm', 'moderate')}'>Moderate</span> "
+                        f"<span style='{legend_badge_style('warm', 'strong')}'>Strong</span> "
+                        f"<span style='{legend_badge_style('warm', 'extreme')}'>Extreme</span> "
+                        f"<span style='{legend_badge_style('warm', 'record')}'>Record</span>"
+                        f"<span style='padding-left: 12px;'>Cold:</span> "
+                        f"<span style='{legend_badge_style('cold', 'moderate')}'>Moderate</span> "
+                        f"<span style='{legend_badge_style('cold', 'strong')}'>Strong</span> "
+                        f"<span style='{legend_badge_style('cold', 'extreme')}'>Extreme</span> "
+                        f"<span style='{legend_badge_style('cold', 'record')}'>Record</span>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
                     
-                    c1, c2 = st.columns(2)
-                    with c1: 
-                        st.plotly_chart(build_yearly_extremes_chart(lat_target, lon_target, "A", meteo_var != "Min Temp (TN)"), use_container_width=True)
-                    with c2: 
-                        st.plotly_chart(build_yearly_extremes_chart(lat_target, lon_target, "B", meteo_var != "Min Temp (TN)"), use_container_width=True)
-                else:
-                    flicker_epoch = st.radio("Select Reference Period:", ("A (1961–1990)", "B (1996–2025)"), horizontal=True, key="met_ep", index=1)
-                    fig = go.Figure(data=traces_a if "A" in flicker_epoch else traces_b)
-                    fig.add_vline(x=tgt_dt_norm.timestamp() * 1000, line_dash="dash", line_color="gray", opacity=0.8)
-                    fig.update_xaxes(dtick="M2", tickformat="%b\n%Y", showgrid=True, gridcolor=ATMOPULSE_OVERLAY['grid'])
-                    fig.update_yaxes(range=[global_min, global_max])
-                    fig.update_layout(**plotly_typography(), title=f"Reference Period {'1961–1990' if 'A' in flicker_epoch else '1996–2025'}", hovermode="x unified", height=500, template="plotly_white", margin=dict(t=40, b=10), legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5))
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.plotly_chart(build_yearly_extremes_chart(lat_target, lon_target, "A" if "A" in flicker_epoch else "B", meteo_var != "Min Temp (TN)"), use_container_width=True)
+                    if map_layout == LAYOUT_SIDE_BY_SIDE:
+                        fig = make_subplots(rows=1, cols=2, subplot_titles=("Reference Period A (1961–1990)", "Reference Period B (1996–2025)"), shared_yaxes=True)
+                        for trace in traces_a: 
+                            fig.add_trace(trace, row=1, col=1)
+                        for trace in traces_b: 
+                            fig.add_trace(trace, row=1, col=2)
+                            
+                        fig.add_vline(x=tgt_dt_norm.timestamp() * 1000, line_dash="dash", line_color="gray", opacity=0.8, row=1, col=1)
+                        fig.add_vline(x=tgt_dt_norm.timestamp() * 1000, line_dash="dash", line_color="gray", opacity=0.8, row=1, col=2)
+                        fig.update_xaxes(dtick="M2", tickformat="%b\n%Y", hoverformat="%d.%m.%Y", showgrid=True, gridcolor=ATMOPULSE_OVERLAY['grid'])
+                        fig.update_yaxes(range=[global_min, global_max])
+                        fig.update_layout(**plotly_typography(), hovermode="x unified", height=500, template="plotly_white", margin=dict(t=40, b=10), showlegend=False)
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        c1, c2 = st.columns(2)
+                        with c1: 
+                            st.plotly_chart(build_yearly_extremes_chart(lat_target, lon_target, "A", meteo_var != "Min Temp (TN)"), use_container_width=True)
+                        with c2: 
+                            st.plotly_chart(build_yearly_extremes_chart(lat_target, lon_target, "B", meteo_var != "Min Temp (TN)"), use_container_width=True)
+                    else:
+                        # Same widget key ("met_ep") whose value we already read into
+                        # `met_active_epoch` above (before the narrative text was built) —
+                        # re-rendering it here just places it at its usual spot below the chart.
+                        flicker_epoch = st.radio("Select Reference Period:", ("A (1961–1990)", "B (1996–2025)"), horizontal=True, key="met_ep", index=1)
+                        met_active_epoch = "A" if "A" in flicker_epoch else "B"
+                        fig = go.Figure(data=traces_a if met_active_epoch == "A" else traces_b)
+                        fig.add_vline(x=tgt_dt_norm.timestamp() * 1000, line_dash="dash", line_color="gray", opacity=0.8)
+                        fig.update_xaxes(dtick="M2", tickformat="%b\n%Y", hoverformat="%d.%m.%Y", showgrid=True, gridcolor=ATMOPULSE_OVERLAY['grid'])
+                        fig.update_yaxes(range=[global_min, global_max])
+                        fig.update_layout(**plotly_typography(), title=f"Reference Period {EPOCH_LABELS[met_active_epoch]}", hovermode="x unified", height=500, template="plotly_white", margin=dict(t=40, b=10), showlegend=False)
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(build_yearly_extremes_chart(lat_target, lon_target, met_active_epoch, meteo_var != "Min Temp (TN)"), use_container_width=True)
 
         elif nav_selection == NAV_WAVE:
             if show_expert("flicker_layout"):
                 map_layout = st.radio("Layout:", (LAYOUT_SIDE_BY_SIDE, LAYOUT_FLICKER), horizontal=True, key="wave_layout")
             else:
                 map_layout = STANDARD_DEFAULTS["map_layout"]
-            with st.spinner("Generating Historical Waves..."):
-                param_code = "TX" if "Heatwaves" in wave_focus else "TN"
-                fig_m_a, fig_s_a = fetch_wave_figs(lat_target, lon_target, param_code, "A", wave_thresh, wave_stat_metric)
-                fig_m_b, fig_s_b = fetch_wave_figs(lat_target, lon_target, param_code, "B", wave_thresh, wave_stat_metric)
+            if is_aifs_model():
+                st.warning(AIFS_TXTN_WARNING)
+            else:
+                with st.spinner("Generating Historical Waves..."):
+                    param_code = "TX" if "Heatwaves" in wave_focus else "TN"
+                    fig_m_a, fig_s_a = fetch_wave_figs(lat_target, lon_target, param_code, "A", wave_thresh, wave_stat_metric)
+                    fig_m_b, fig_s_b = fetch_wave_figs(lat_target, lon_target, param_code, "B", wave_thresh, wave_stat_metric)
+
+                # STATIC vs. UI overlay state: always ranks against the full 1940-present
+                # ERA5 record, independent of the Side-by-Side / Flicker layout selected above.
+                wave_rank_info = get_wave_historical_rank(
+                    lat_target, lon_target, parameter=param_code,
+                    selected_epoch="B", threshold_level=wave_thresh,
+                )
+                if wave_rank_info is not None:
+                    wave_rank_text = (
+                        f"The area of {location.address} is currently experiencing its "
+                        f"{wave_rank_info['rank_ordinal']} longest {wave_rank_info['severity']} "
+                        f"{wave_rank_info['wave_type']} since the start of the ERA5 record in 1940."
+                    )
+                    st.markdown(f"**{wave_rank_text}**")
 
                 def get_safe_max(fig, fallback=100.0):
                     """Type-safe max across all trace y-values.

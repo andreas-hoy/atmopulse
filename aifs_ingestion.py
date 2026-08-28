@@ -50,7 +50,7 @@ def download_aifs_gribs():
     """Retrieve the newest available AIFS run from the Azure open-data mirror."""
     sources = ["azure"]
     # 6-hourly steps up to 96 hours (4 days).
-    steps = list(range(0, 102, 6))
+    steps = list(range(0, 120, 6))
 
     target_sfc = str(TMP_DIR / "aifs_sfc.grib")
     target_pl = str(TMP_DIR / "aifs_pl.grib")
@@ -189,11 +189,13 @@ def apply_conservative_weights(ds_source, weights_file, ds_target_grid):
             with np.errstate(divide="ignore", invalid="ignore"):
                 y_corrected = np.where(y_den > 0, y_num / y_den, np.nan)
 
-            data_arrays.append(y_corrected.reshape(shape_out))
+            # Hard copy: severs aliasing to the SciPy .dot() output buffer,
+            # which can otherwise be reused/overwritten on later t_idx passes.
+            data_arrays.append(np.array(y_corrected.reshape(shape_out), copy=True))
 
         ds_out[var] = (
             ("time", "latitude", "longitude"),
-            np.array(data_arrays, dtype=np.float32),
+            np.stack(data_arrays).astype(np.float32),
         )
 
     return ds_out

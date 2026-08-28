@@ -8,6 +8,8 @@ plotly>=5.18
 scipy>=1.11
 requests>=2.31
 geopy>=2.4
+folium>=0.15
+streamlit-folium>=0.20
 
 # Data pipeline & downloads
 cdsapi>=0.7
