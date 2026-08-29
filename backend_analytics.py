@@ -15,13 +15,25 @@ circular import at module load time.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 from backend_maps import etccdi_doy_365
 from backend_narrative import spatial_extreme_footprint
-from config import TOP10_MASK_VERSION, TOP10_MIN_PCT, is_daily_map_view, selected_forecast_model
+from config import DATA_ROOT, TOP10_MASK_VERSION, TOP10_MIN_PCT, is_daily_map_view, selected_forecast_model
+
+# --- Pre-computed Analytics (batch_precompute_analytics.py) ---
+PRECOMPUTED_ANALYTICS_DIR: Path = DATA_ROOT / "Precomputed_Analytics"
+
+# Footprint results are threshold-independent (compute_map_footprint returns
+# all four tiers at once) — batch_precompute_analytics.py nonetheless writes
+# one identical copy per threshold to satisfy the shared naming convention
+# with the Top-10 files. Any of the four is equally valid on read; this is
+# just the fixed one the lazy-loading wrapper below looks for.
+_FOOTPRINT_CACHE_THRESHOLD = "Strong"
 
 
 def _synoptic_array(field):
@@ -157,8 +169,45 @@ def _top10_analysis_key(top10_threshold: str) -> str:
     return "Moderate"
 
 
+def _footprint_parquet_path(target_date_str, map_var, baseline_type) -> Path:
+    return PRECOMPUTED_ANALYTICS_DIR / f"footprint_{target_date_str}_{map_var}_{baseline_type}_{_FOOTPRINT_CACHE_THRESHOLD}.parquet"
+
+
+def _top10_parquet_paths(target_date_str, map_var, baseline_type, top10_threshold) -> tuple[Path, Path]:
+    base = f"top10_{target_date_str}_{map_var}_{baseline_type}_{top10_threshold}"
+    return (
+        PRECOMPUTED_ANALYTICS_DIR / f"{base}_warm.parquet",
+        PRECOMPUTED_ANALYTICS_DIR / f"{base}_cold.parquet",
+    )
+
+
+def _toggles_all_true(t_warm: dict, t_cold: dict) -> bool:
+    """True only when every warm/cold percentile toggle is active — the exact
+    assumption batch_precompute_analytics.py bakes into its Parquet output."""
+    return all(t_warm.values()) and all(t_cold.values())
+
+
+def flatten_footprint(footprint: dict) -> pd.DataFrame:
+    """{"moderate": {"warm_pct": .., "cold_pct": .., "total_pct": ..}, ...} ->
+    a single-row flat DataFrame (columns like "moderate_warm_pct"), i.e. the
+    exact on-disk shape written/read by the Parquet pre-computation pipeline."""
+    row = {f"{tier}_{metric}": value for tier, metrics in footprint.items() for metric, value in metrics.items()}
+    return pd.DataFrame([row])
+
+
+def unflatten_footprint(df: pd.DataFrame) -> dict:
+    """Inverse of `flatten_footprint`: rebuilds the exact nested dict shape
+    `compute_map_footprint()` callers expect (`footprint[tier]["total_pct"]`, etc.)."""
+    row = df.iloc[0]
+    out: dict = {}
+    for col, value in row.items():
+        tier, metric = col.split("_", 1)
+        out.setdefault(tier, {})[metric] = float(value)
+    return out
+
+
 @st.cache_data(show_spinner=False)
-def compute_map_footprint(_ref_data, _map_phys_data, target_date_str, t_warm, t_cold, baseline_type="A", map_var="TG", anchor_date_str=None):
+def _calc_compute_map_footprint_raw(_ref_data, _map_phys_data, target_date_str, t_warm, t_cold, baseline_type="A", map_var="TG", anchor_date_str=None):
     """
     Area-weighted, CUMULATIVE Moderate/Strong/Extreme/Record spatial footprint
     for the Map Tracker narrative (backend_narrative.spatial_extreme_footprint).
@@ -216,9 +265,36 @@ def compute_map_footprint(_ref_data, _map_phys_data, target_date_str, t_warm, t_
     return spatial_extreme_footprint(mask, valid_domain, lat2d, target_date=target_date_str, baseline_name=baseline_type)
 
 
+@st.cache_data(show_spinner=False)
+def compute_map_footprint(_ref_data, _map_phys_data, target_date_str, t_warm, t_cold, baseline_type="A", map_var="TG", anchor_date_str=None):
+    """
+    Lazy-loading front door for the spatial extreme footprint.
+
+    Serves the Parquet output of `batch_precompute_analytics.py` when it
+    exists for this exact (date, variable, epoch) — an instant disk read,
+    with zero xarray/mask work — and transparently falls back to the
+    on-the-fly `_calc_compute_map_footprint_raw()` computation otherwise
+    (toggles other than "all active", dates outside the precomputed -7..+3
+    window, or before the batch script has ever been run). Same signature
+    and return shape as the original function, so every call site keeps
+    working unmodified and the app never breaks on a cache miss.
+    """
+    if _toggles_all_true(t_warm, t_cold):
+        parquet_path = _footprint_parquet_path(target_date_str, map_var, baseline_type)
+        if parquet_path.exists():
+            try:
+                return unflatten_footprint(pd.read_parquet(parquet_path))
+            except Exception:
+                pass  # corrupted/partial Parquet file -> fall through to raw computation
+    return _calc_compute_map_footprint_raw(
+        _ref_data, _map_phys_data, target_date_str, t_warm, t_cold,
+        baseline_type=baseline_type, map_var=map_var, anchor_date_str=anchor_date_str,
+    )
+
+
 # --- TOP 10 COUNTRY IMPACT (Heat & Cold Extremes) ---
 @st.cache_data(show_spinner=False)
-def calculate_top10(
+def _calc_calculate_top10_raw(
     _ref_data, _map_phys_data, target_date, t_warm, t_cold, view_mode, persist_metric, top10_threshold,
     baseline_type="A", map_var="TG", anchor_date=None, _mask_version=TOP10_MASK_VERSION,
     _get_persistence_arrays=None, _get_country_weight_grid=None,
@@ -306,3 +382,37 @@ def calculate_top10(
         return df[["Country", col]].reset_index(drop=True)
 
     return _rank(res_h, "Warm Impact (%)"), _rank(res_c, "Cold Impact (%)")
+
+
+@st.cache_data(show_spinner=False)
+def calculate_top10(
+    _ref_data, _map_phys_data, target_date, t_warm, t_cold, view_mode, persist_metric, top10_threshold,
+    baseline_type="A", map_var="TG", anchor_date=None, _mask_version=TOP10_MASK_VERSION,
+    _get_persistence_arrays=None, _get_country_weight_grid=None,
+):
+    """
+    Lazy-loading front door for the Top-10 country impact tables.
+
+    Serves the two Parquet tables written by `batch_precompute_analytics.py`
+    when the request matches exactly what the batch script produces (daily
+    snapshot view, every warm/cold toggle active, date inside the -7..+3
+    precomputed window) — an instant disk read, skipping the country-mask
+    weighting loop entirely — and transparently falls back to
+    `_calc_calculate_top10_raw()` for everything else (Persistence view,
+    partial toggle states, or a missing/corrupted cache file). Same
+    signature and return shape as the original function, so every call
+    site keeps working unmodified and the app never breaks on a cache miss.
+    """
+    if is_daily_map_view(view_mode) and _toggles_all_true(t_warm, t_cold):
+        target_date_str = pd.Timestamp(target_date).strftime('%Y-%m-%d')
+        warm_path, cold_path = _top10_parquet_paths(target_date_str, map_var, baseline_type, top10_threshold)
+        if warm_path.exists() and cold_path.exists():
+            try:
+                return pd.read_parquet(warm_path), pd.read_parquet(cold_path)
+            except Exception:
+                pass  # corrupted/partial Parquet file -> fall through to raw computation
+    return _calc_calculate_top10_raw(
+        _ref_data, _map_phys_data, target_date, t_warm, t_cold, view_mode, persist_metric, top10_threshold,
+        baseline_type=baseline_type, map_var=map_var, anchor_date=anchor_date, _mask_version=_mask_version,
+        _get_persistence_arrays=_get_persistence_arrays, _get_country_weight_grid=_get_country_weight_grid,
+    )

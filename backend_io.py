@@ -51,6 +51,14 @@ from config import DATA_ROOT, FORECAST_MODEL_IFS, SLIDER_PAD_FUTURE, SLIDER_PAD_
 LIVE_TXTN = DATA_ROOT / "Live_Forecasts/live_forecast_txtn.nc"
 QDM_TRANSFER_FILE = DATA_ROOT / "Reference_Climatology/qdm_transfer_functions.nc"
 
+# Point-extraction-optimal Zarr mirror of the master archive (see
+# batch_convert_netcdf_to_zarr.py). Temporally-contiguous, small lat/lon
+# tile chunking turns the 10-25s NetCDF point read below into a
+# millisecond-scale read. Built offline/on a schedule, not at request time —
+# `_load_point_archive_series` falls back to the legacy NetCDF path
+# untouched whenever this store hasn't been built yet.
+ZARR_MASTER_TIME_SERIES = DATA_ROOT / "Zarr_Archive" / "era5_master_time_series.zarr"
+
 
 # --- REFERENCE CLIMATOLOGY & INVARIANTS ---
 @st.cache_resource(show_spinner=False)
@@ -688,6 +696,60 @@ def compute_point_thresholds(ref_clim, lat, lon, target_date, meteo_var, epoch):
     return p_warm, p_cold
 
 
+def _series_frame_from_point(pt_series):
+    """Shared tail-end: DataArray point series -> the 'time'/'val'/'year'/'doy'
+    DataFrame contract both the Zarr and legacy NetCDF paths must return."""
+    raw = np.asarray(pt_series.values, dtype=np.float64)
+    finite = raw[np.isfinite(raw)]
+    if finite.size > 0 and np.nanmean(finite) > 100:
+        raw = raw - 273.15
+
+    df = pd.DataFrame({'time': pt_series.valid_time.values, 'val': raw}).drop_duplicates(subset=['time'])
+    dates = pd.to_datetime(df['time'])
+    df['year'] = dates.dt.year
+
+    # ETCCDI 365-day mapping for historical extremes — fully vectorized.
+    # 29 Feb keeps its own row/value (it can still set an actual "Record" or
+    # count into the yearly bars); it is only ever excised from the 365-day
+    # BASELINE percentile array, never from this real-data table.
+    df['doy'] = etccdi_doy_365(dates) - 1  # 0-based for array indexing
+    return df
+
+
+def _load_point_archive_series_from_zarr(lat, lon, is_warm):
+    """Millisecond-scale point read from the temporally-chunked Zarr mirror
+    (see batch_convert_netcdf_to_zarr.py / ZARR_MASTER_TIME_SERIES). Returns
+    None on ANY problem (missing store, missing variable, corrupt/partial
+    write, consolidated-metadata mismatch, etc.) so the caller falls back to
+    the legacy NetCDF path unconditionally."""
+    if not ZARR_MASTER_TIME_SERIES.exists():
+        return None
+
+    candidates = ("tx", "mx2t") if is_warm else ("tn", "mn2t")
+    try:
+        zds = xr.open_zarr(ZARR_MASTER_TIME_SERIES, consolidated=True)
+    except Exception:
+        try:
+            zds = xr.open_zarr(ZARR_MASTER_TIME_SERIES, consolidated=False)
+        except Exception:
+            return None
+
+    var_name = None
+    for candidate in candidates:
+        if candidate in zds.data_vars:
+            var_name = candidate
+            break
+    if var_name is None:
+        return None
+
+    with st.session_state.nc_lock:
+        try:
+            pt_series = zds[var_name].sel(latitude=lat, longitude=lon, method='nearest').compute()
+        except Exception:
+            return None
+    return _series_frame_from_point(pt_series)
+
+
 # --- DATETIME64 CRASH BUGFIX ---
 # PERFORMANCE: the master archive point extraction (ds.sel(...).compute()) is
 # the expensive step (multi-minute NetCDF/dask read for a fresh point) and is
@@ -697,8 +759,19 @@ def compute_point_thresholds(ref_clim, lat, lon, target_date, meteo_var, epoch):
 # key), doubling the wait. Splitting it into its own @st.cache_data step means
 # the raw series is read from disk once per (lat, lon, is_warm) and reused for
 # both epoch A and epoch B charts.
+#
+# STORAGE ENGINE: this now tries the point-extraction-optimal Zarr mirror
+# first (millisecond reads — see batch_convert_netcdf_to_zarr.py) and only
+# falls back to the legacy spatially-chunked NetCDF archive if that store
+# hasn't been built yet, or the Zarr read fails for any reason. The fallback
+# path below is intentionally IDENTICAL to the previous implementation, and
+# both paths return the exact same 'time'/'val'/'year'/'doy' DataFrame shape.
 @st.cache_data(show_spinner=False)
 def _load_point_archive_series(lat, lon, is_warm, _archive_version=4):
+    zarr_df = _load_point_archive_series_from_zarr(lat, lon, is_warm)
+    if zarr_df is not None:
+        return zarr_df
+
     ds = get_master_archive_ds()
     if ds is None:
         return None
@@ -726,21 +799,7 @@ def _load_point_archive_series(lat, lon, is_warm, _archive_version=4):
         except Exception:
             return None
 
-    raw = np.asarray(pt_series.values, dtype=np.float64)
-    finite = raw[np.isfinite(raw)]
-    if finite.size > 0 and np.nanmean(finite) > 100:
-        raw = raw - 273.15
-
-    df = pd.DataFrame({'time': pt_series.valid_time.values, 'val': raw}).drop_duplicates(subset=['time'])
-    dates = pd.to_datetime(df['time'])
-    df['year'] = dates.dt.year
-
-    # ETCCDI 365-day mapping for historical extremes — fully vectorized.
-    # 29 Feb keeps its own row/value (it can still set an actual "Record" or
-    # count into the yearly bars); it is only ever excised from the 365-day
-    # BASELINE percentile array, never from this real-data table.
-    df['doy'] = etccdi_doy_365(dates) - 1  # 0-based for array indexing
-    return df
+    return _series_frame_from_point(pt_series)
 
 
 # Threshold-occurrence diagram ("Days exceeding thresholds") below the main
