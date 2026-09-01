@@ -29,12 +29,71 @@ Usage:
 
 from __future__ import annotations
 
+import sys
 import threading
+import types
 from functools import lru_cache
 
 import numpy as np
 import pandas as pd
-import streamlit as st
+
+# Headless cron must never import the real Streamlit runtime. MagicMock is
+# also unsafe here: it records every attribute access (a leak) and its fake
+# ``__path__`` can still let ``streamlit.runtime`` load ScriptRunContext.
+class _SessionState(dict):
+    def __getattr__(self, item):
+        return self.get(item)
+
+    def __setattr__(self, key, value):
+        self[key] = value
+
+
+def _identity_cache(*args, **kwargs):
+    """No-op stand-in for ``@st.cache_data`` / ``@st.cache_resource``."""
+
+    def decorator(fn):
+        return fn
+
+    if args and callable(args[0]) and not kwargs:
+        return args[0]
+    return decorator
+
+
+def _install_streamlit_stub() -> types.ModuleType:
+    stub = types.ModuleType("streamlit")
+    stub._atmopulse_headless_stub = True
+    stub.__file__ = "<atmopulse-streamlit-stub>"
+    stub.__path__ = []  # package with no on-disk path: blocks real submodules
+    stub.session_state = _SessionState()
+    stub.cache_data = _identity_cache
+    stub.cache_resource = _identity_cache
+    stub.set_page_config = lambda *a, **k: None
+    stub.stop = lambda *a, **k: None
+    stub.sidebar = stub
+
+    def _noop(*_a, **_k):
+        return None
+
+    def _getattr(name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return _noop
+
+    stub.__getattr__ = _getattr  # type: ignore[method-assign]
+
+    # Pre-register runtime modules so accidental imports cannot load site-packages.
+    runtime = types.ModuleType("streamlit.runtime")
+    runtime.__path__ = []
+    scriptrunner = types.ModuleType("streamlit.runtime.scriptrunner")
+    scriptrunner.get_script_run_ctx = lambda: None
+
+    sys.modules["streamlit"] = stub
+    sys.modules["streamlit.runtime"] = runtime
+    sys.modules["streamlit.runtime.scriptrunner"] = scriptrunner
+    return stub
+
+
+st = _install_streamlit_stub()
 
 from backend_analytics import (
     _calc_calculate_top10_raw,

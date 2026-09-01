@@ -106,6 +106,7 @@ Place the following files under `ERA5_ClimateTool/`:
 * `Reference_Climatology/` — `climatology_reference_complete.nc`, `climatology_synoptics.nc`, optional `qdm_transfer_functions.nc` and `regrid_weights_cdo.nc`.
 * `Master_Batches/` — `era5_master_daily_YYYY.nc`.
 * `Live_Forecasts/` — `ifs_daily_forecast_*.nc`, `aifs_daily_forecast_*.nc`.
+* `Pipeline_Logs/` — timestamped `pipeline_YYYYMMDD_HHMMSS.log` from `run_atmopulse_pipeline.bat`.
 * `Zarr_Archive/` — `era5_master_time_series.zarr`.
 * `Precomputed_Analytics/` — `footprint_*.parquet`, `top10_*.parquet`.
 
