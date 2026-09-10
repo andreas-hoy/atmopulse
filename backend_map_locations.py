@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import requests
 import numpy as np
-from shapely.geometry import box, shape
+from shapely.geometry import Point, box, shape
 from shapely.strtree import STRtree
 from pyproj import Geod
 
@@ -236,6 +236,23 @@ def build_location_label_grid(lons, lats, cell_size: float = 0.25) -> np.ndarray
         for j, lon in enumerate(lons):
             labels[i, j] = label_grid_cell(float(lon), float(lat), cell_size)
     return labels
+
+
+def build_land_sea_grid(lons, lats) -> np.ndarray:
+    """Binary land (1) / sea (0) on the synoptic grid, sampled at cell centres."""
+    idx = _get_location_index()
+    tree = idx["country_tree"]
+    geoms = idx["country_geoms"]
+    z = np.zeros((len(lats), len(lons)), dtype=np.float32)
+    for i, lat in enumerate(lats):
+        for j, lon in enumerate(lons):
+            pt = Point(float(lon), float(lat))
+            for k in np.atleast_1d(tree.query(pt)):
+                geom = geoms[int(k)]
+                if geom.covers(pt):
+                    z[i, j] = 1.0
+                    break
+    return z
 
 
 def build_country_weight_grid(lons, lats, cell_size: float = 0.25) -> tuple[dict, dict]:

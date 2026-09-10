@@ -19,6 +19,7 @@ except ImportError:
     _FOLIUM_AVAILABLE = False
 
 from backend_io import _create_gridcell_map, load_invariant_fields
+from config import meteo_var_code
 from labels import HELP
 
 INVARIANT_VARS = ("lsm", "z", "sdor")
@@ -92,10 +93,10 @@ def build_top10_table(df_live, meteo_var):
     with @st.cache_data so re-sorting/re-slicing df_live doesn't re-run on
     every unrelated widget rerun (e.g. the Layout radio).
     """
-    col_target = 'TG' if meteo_var == "Mean Temp (TG)" else ('TX' if meteo_var == "Max Temp (TX)" else 'TN')
+    col_target = meteo_var_code(meteo_var)
     if col_target not in df_live.columns: 
         return pd.DataFrame()
-    df_sorted = df_live[['Date', col_target]].dropna().sort_values(by=col_target, ascending=(meteo_var == "Min Temp (TN)"))
+    df_sorted = df_live[['Date', col_target]].dropna().sort_values(by=col_target, ascending=(col_target == "TN"))
     df_sorted['Date'] = pd.to_datetime(df_sorted['Date']).dt.strftime('%Y-%m-%d')
     df_sorted.rename(columns={col_target: f"{col_target} (°C)"}, inplace=True)
     df_sorted.reset_index(drop=True, inplace=True)

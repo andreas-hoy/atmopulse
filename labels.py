@@ -49,29 +49,55 @@ HELP: dict[str, str] = {
 
     # --- Map Tracker ---
     "map_variable": (
-        "Mean Temperature: Daily Mean Temperature (TG). The best proxy for the total thermal energy of the day. \n\n"
-        "Maximum Temperature: Daily Maximum Temperature (TX). Represents daytime warming (or lack thereof). \n\n"
-        "Minimum Temperature: Daily Minimum Temperature (TN). Represents nighttime cooling (or lack thereof)."
+        "Mean Temperature (TG): 24-hour mean (0–0 UTC) of air temperature at 2 m.\n\n"
+        "Maximum Temperature (TX): Highest daily air temperature (0–0 UTC).\n\n"
+        "Minimum Temperature (TN): Lowest daily air temperature (0–0 UTC).\n\n"
+        "850 hPa Temperature (T850): Temperature at around 1.5 km height, mapping "
+        "lower-tropospheric air masses."
     ),
     "map_view_mode": (
         "Daily snapshot colours each grid cell by how unusual that day is. "
-        "Persistence duration shows how many consecutive days an extreme has lasted."
+        "Persistence duration shows how many consecutive days an extreme has lasted "
+        "(unbroken run back from the map date, up to 100 days)."
     ),
     "map_analysis_level": (
-        "The following percentile-based levels can be selected: moderate (P75/25), "
-        "strong (P90/10) and extreme (P95/5) levels, as well as all-time records."
+        "How rare a value must be before it counts in the Europe-wide assessment, the country "
+        "tables, and the legend highlight. The same threshold is used for persistence duration "
+        "(consecutive days at this intensity) and for warm/cold-spell hatching. "
+        "Moderate is P75/P25, Strong P90/P10, Extreme P95/P5; All-Time Record is the archive "
+        "extreme for that day of year. Daily map colours still show every percentile; hide "
+        "layers under Map Extremes."
     ),
     "map_extremes": "Deactivates warm/cold anomalies (default: all layers are active)",
     "warm_toggle": "Deactivates warm anomalies (default: all layers are active)",
     "cold_toggle": "Deactivates cold anomalies (default: all layers are active)",
     "wsdi_csdi_overlay": (
-        "Hatched areas highlight regions experiencing at least 6 consecutive days above the "
-        "90th percentile (WSDI) or below the 10th percentile (CSDI)."
+        "Persistence of warm or cold spells at the selected analysis level "
+        "(counted back from the map date). Selectable are three durations: "
+        "6 days (representing WSDI/CSDI-conditions), 15 and 30 days."
     ),
-    "persistence_intensity": "Maps warm persistence in red tones and cold persistence in blue tones on the same scale.",
-    "mslp_contours": "Mean Sea Level Pressure (hPa)",
-    "z500_contours": "500 hPa Geopotential Height (gpm) – indicates upper-level ridges and troughs.",
+    "persistence_intensity": (
+        "Maps how many consecutive days the selected intensity has lasted, counted "
+        "unbroken back from the map date (one day below the threshold resets the "
+        "count). Warm persistence in red, cold in blue. The colour scale is ±30 days "
+        "so typical land spells stay readable; longer runs still show in the hover "
+        "(up to 100 days)."
+    ),
+    "mslp_contours": (
+        "Mean sea-level pressure as 5 hPa isolines. The pattern shows the surface highs and lows "
+        "that set the low-level flow and, with it, warm or cold advection."
+    ),
+    "z500_contours": (
+        "Height of the 500 hPa surface (about 5.5 km). Ridges (high) and troughs (low) at this "
+        "level steer the weather systems seen in the sea-level pressure field."
+    ),
     "top10_table": "Excludes territories under 3000 km² and countries located completely outside of Europe",
+    "europe_share_table": (
+        "Share of Europe at each cumulative severity level. "
+        "Change is in percentage points (1996–2025 minus 1961–1990), not a relative percent. "
+        "Each level includes all stricter levels. The highlighted row is the selected analysis level. "
+        "All-time records are not epoch-relative, so Change is omitted."
+    ),
 
     # --- Point Meteogram ---
     "meteogram_envelope": (
@@ -79,6 +105,11 @@ HELP: dict[str, str] = {
         "Uses the 75th (warm) and 25th (cold) percentile for moderate, 90th (warm) and 10th (cold) for strong "
         "and 95th (warm) and 5th (cold) for extreme conditions within the reference period. "
         "All-time records are given for the full period (starting 1940) prior to the current year."
+    ),
+    "meteo_annual_count": (
+        "Select between: \"all anomaly days\" (counts every day with a warm or cold anomaly) "
+        "and \"spell days\" (counts only days that belong to a period of at least 6 consecutive "
+        "warm or cold days)."
     ),
 
     # --- Point Wavogram ---

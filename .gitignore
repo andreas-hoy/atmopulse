@@ -42,6 +42,7 @@ backup_*/
 .DS_Store
 Thumbs.db
 ~$*
+~WRL*.tmp
 Appending
 Downloading
 Precomputing

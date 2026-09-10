@@ -14,15 +14,18 @@ import numpy as np
 import requests
 import plotly.graph_objects as go
 
-from backend_map_locations import build_location_label_grid, build_country_weight_grid
-from backend_narrative import EPOCH_LABELS
-from atmopulse_theme import ATMOPULSE_BRAND, ATMOPULSE_FONTS, legend_badge_style
+from backend_map_locations import EUROPE_BBOX, build_location_label_grid, build_country_weight_grid
+from backend_narrative import EPOCH_LABELS, epoch_period_label, epoch_from_label
+from atmopulse_theme import ATMOPULSE_BRAND, ATMOPULSE_FONTS, ATMOPULSE_OVERLAY, legend_badge_style
+from labels import HELP
 from config import (
     LAYOUT_SIDE_BY_SIDE,
     LAYOUT_FLICKER,
     LAYOUT_OPACITY,
     LAYOUT_SWIPE,
     AIFS_TXTN_WARNING,
+    PERSISTENCE_LOOKBACK_PAD,
+    PERSISTENCE_MAX_DAYS,
     TOP10_GRID_VERSION,
     is_expert_mode,
     is_aifs_model,
@@ -42,26 +45,72 @@ from backend_maps import synoptic_vars_for_map
 from frontend_widgets import _top10_header_html
 
 
+_NE_GEOJSON = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson"
+_NE_COAST = f"{_NE_GEOJSON}/ne_50m_coastline.geojson"
+_NE_INLAND = f"{_NE_GEOJSON}/ne_50m_admin_0_boundary_lines_land.geojson"
+
+
+def _geojson_line_xy(geom):
+    """Append lon/lat vertices of a GeoJSON line geometry, None-separated."""
+    x, y = [], []
+    if not geom:
+        return x, y
+    gtype = geom.get("type")
+    coords = geom.get("coordinates") or []
+    if gtype == "LineString":
+        parts = [coords]
+    elif gtype == "MultiLineString":
+        parts = coords
+    else:
+        return x, y
+    pad = 3.0
+    lon0, lat0, lon1, lat1 = (
+        EUROPE_BBOX[0] - pad, EUROPE_BBOX[1] - pad,
+        EUROPE_BBOX[2] + pad, EUROPE_BBOX[3] + pad,
+    )
+    for line in parts:
+        if not line:
+            continue
+        if not any(lon0 <= p[0] <= lon1 and lat0 <= p[1] <= lat1 for p in line):
+            continue
+        for p in line:
+            x.append(p[0])
+            y.append(p[1])
+        x.append(None)
+        y.append(None)
+    return x, y
+
+
+def _line_scatter(x, y, color, width):
+    return go.Scatter(
+        x=x, y=y, mode="lines",
+        line=dict(color=color, width=width),
+        hoverinfo="skip", showlegend=False,
+    )
+
+
 @st.cache_resource(show_spinner=False)
-def get_europe_borders_trace():
-    url = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_50m_admin_0_countries.geojson"
+def get_europe_borders_trace(_style_version=3):
+    """Inland country borders plus a stronger coastline (continent/ocean)."""
     try:
-        data = requests.get(url, timeout=10).json()
-        x, y = [], []
-        for feature in data['features']:
-            geom = feature.get('geometry')
-            if not geom: continue
-            if geom['type'] == 'Polygon':
-                for poly in geom['coordinates']:
-                    for p in poly: x.append(p[0]); y.append(p[1])
-                    x.append(None); y.append(None)
-            elif geom['type'] == 'MultiPolygon':
-                for multi in geom['coordinates']:
-                    for poly in multi:
-                        for p in poly: x.append(p[0]); y.append(p[1])
-                        x.append(None); y.append(None)
-        return go.Scatter(x=x, y=y, mode='lines', line=dict(color='black', width=1.0), hoverinfo='skip', showlegend=False)
-    except: 
+        inland = requests.get(_NE_INLAND, timeout=10).json()
+        coast = requests.get(_NE_COAST, timeout=10).json()
+        ix, iy, cx, cy = [], [], [], []
+        for feature in inland.get("features", []):
+            x, y = _geojson_line_xy(feature.get("geometry"))
+            ix.extend(x)
+            iy.extend(y)
+        for feature in coast.get("features", []):
+            x, y = _geojson_line_xy(feature.get("geometry"))
+            cx.extend(x)
+            cy.extend(y)
+        traces = []
+        if ix:
+            traces.append(_line_scatter(ix, iy, ATMOPULSE_OVERLAY["border"], ATMOPULSE_OVERLAY["border_width"]))
+        if cx:
+            traces.append(_line_scatter(cx, cy, ATMOPULSE_OVERLAY["coast"], ATMOPULSE_OVERLAY["coast_width"]))
+        return tuple(traces) if traces else None
+    except Exception:
         return None
 
 
@@ -77,24 +126,40 @@ def get_country_weight_grid(lons_tuple, lats_tuple, _version=TOP10_GRID_VERSION)
 
 _FOOTPRINT_TIER_ORDER = ("moderate", "strong", "extreme", "record")
 _FOOTPRINT_TIER_TITLES = {"moderate": "Moderate", "strong": "Strong", "extreme": "Extreme", "record": "Record"}
-_WARM_TIER_HINT = {"moderate": "P75", "strong": "P90", "extreme": "P95", "record": "all-time"}
-_COLD_TIER_HINT = {"moderate": "P25", "strong": "P10", "extreme": "P5", "record": "all-time"}
 
 
 def _render_html(body: str) -> None:
-    html_fn = getattr(st, "html", None)
-    if callable(html_fn):
-        html_fn(body)
-    else:
-        st.markdown(body, unsafe_allow_html=True)
+    st.markdown(body, unsafe_allow_html=True)
+
+
+_BANNER_FONT_PX = 15
+
+# Copernicus C3S public percentile language (Climate Bulletins): P90/P10 =
+# "much warmer/colder than average"; milder thresholds as "warmer/colder
+# than average"; records as warm/cold records. P95/P5 have no C3S label, so
+# "extremely warm/cold" is the media-facing step above P90.
+_WARM_PLAIN = {
+    "moderate": "warmer than average (P75)",
+    "strong": "much warmer than average (P90)",
+    "extreme": "extremely warm (P95)",
+    "record": "at an all-time warm record",
+}
+_COLD_PLAIN = {
+    "moderate": "colder than average (P25)",
+    "strong": "much colder than average (P10)",
+    "extreme": "extremely cold (P5)",
+    "record": "at an all-time cold record",
+}
 
 
 def _chip_style(direction: str, tier: str) -> str:
-    """Legend colours with inherited sentence font size (not the 12px badge size)."""
+    """Same 15px sentence size as the banner body (legend badges stay 12px)."""
     return (
         legend_badge_style(direction, tier)
-        .replace("font-size:12px;", "font-size:inherit;")
+        .replace("font-size:12px;", f"font-size:{_BANNER_FONT_PX}px;")
         .replace(f" font-weight:{ATMOPULSE_FONTS['ui_weight']};", " font-weight:inherit;")
+        .replace("padding: 1px 6px;", "padding: 0 6px;")
+        + " vertical-align: baseline;"
     )
 
 
@@ -103,21 +168,6 @@ def _phrase_chip(direction: str, tier: str, text: str) -> str:
         f'<span class="atmopulse-narrative-chip atmopulse-sev-{direction}-{tier}" '
         f'style="{_chip_style(direction, tier)}">{html.escape(text)}</span>'
     )
-
-
-def _trend_word(new: float, old: float) -> str:
-    if new > old:
-        return "amplified"
-    if new < old:
-        return "reduced"
-    return "unchanged"
-
-
-def _trend_clause(new: float, old: float) -> str:
-    word = _trend_word(new, old)
-    if word == "unchanged":
-        return f"unchanged at {new:.1f}%"
-    return f"{word} to {new:.1f}%"
 
 
 def _daily_legend_html(top10_threshold: str) -> str:
@@ -135,7 +185,7 @@ def _daily_legend_html(top10_threshold: str) -> str:
 
     return (
         f"<div class='atmopulse-map-legend atmopulse-subsection-label' "
-        f"style='margin-bottom: 12px; white-space: nowrap;'>"
+        f"style='margin-top: 18px; margin-bottom: 12px; white-space: nowrap;'>"
         f"<b>Legend.</b> "
         f"Warm: <span style='{s('warm', 'moderate')}'>Moderate</span> "
         f"<span style='{s('warm', 'strong')}'>Strong</span> "
@@ -150,15 +200,6 @@ def _daily_legend_html(top10_threshold: str) -> str:
     )
 
 
-def _direction_labels(tier: str) -> tuple[str, str]:
-    if tier == "record":
-        return "all-time warm record", "all-time cold record"
-    return (
-        f"{tier} warm ({_WARM_TIER_HINT[tier]})",
-        f"{tier} cold ({_COLD_TIER_HINT[tier]})",
-    )
-
-
 def _banner_wrap(inner: str) -> str:
     bg = ATMOPULSE_BRAND["nav_bg"]
     fg = ATMOPULSE_BRAND["text_on_light"]
@@ -168,34 +209,31 @@ def _banner_wrap(inner: str) -> str:
         f"<div class='atmopulse-narrative-banner' style='"
         f"background-color:{bg}; color:{fg}; padding:0.75rem 1rem; "
         f"border-radius:0.5rem; font-family:{font}; font-weight:{weight}; "
-        f"line-height:1.55; margin:0 0 0.5rem 0;'>"
+        f"font-size:{_BANNER_FONT_PX}px; line-height:1.55; margin:0 0 0.5rem 0;'>"
         f"{inner}</div>"
     )
 
 
-def _warm_clause(tier: str, pct: float) -> str:
-    warm_lbl, _ = _direction_labels(tier)
-    return _phrase_chip(
-        "warm", tier,
-        f"{pct:.1f}% of Europe is experiencing {warm_lbl} anomalies",
-    )
-
-
-def _cold_clause(tier: str, pct: float) -> str:
-    _, cold_lbl = _direction_labels(tier)
-    return _phrase_chip(
-        "cold", tier,
-        f"{pct:.1f}% is experiencing {cold_lbl} anomalies",
+def _europe_clause(tier: str, warm_pct: float, cold_pct: float) -> str:
+    warm_txt = f"{warm_pct:.1f}% of Europe is {_WARM_PLAIN[tier]}"
+    cold_txt = f"{cold_pct:.1f}% is {_COLD_PLAIN[tier]}"
+    return (
+        f"{_phrase_chip('warm', tier, warm_txt)} and "
+        f"{_phrase_chip('cold', tier, cold_txt)}"
     )
 
 
 def _single_footprint_banner(footprint: dict, active_tier: str, baseline_label: str) -> str:
     warm_pct = footprint[active_tier]["warm_pct"]
     cold_pct = footprint[active_tier]["cold_pct"]
+    colder = baseline_label.startswith("1961")
+    lead = (
+        f"Against the colder historical baseline ({html.escape(baseline_label)})"
+        if colder
+        else f"Against the warmer recent baseline ({html.escape(baseline_label)})"
+    )
     return _banner_wrap(
-        f"Based on the {html.escape(baseline_label)} baseline, "
-        f"{_warm_clause(active_tier, warm_pct)} and "
-        f"{_cold_clause(active_tier, cold_pct)}."
+        f"{lead}, {_europe_clause(active_tier, warm_pct, cold_pct)}."
     )
 
 
@@ -207,55 +245,105 @@ def _compare_footprint_banner(footprint_a: dict, footprint_b: dict, active_tier:
     epoch_a = html.escape(EPOCH_LABELS["A"])
     epoch_b = html.escape(EPOCH_LABELS["B"])
     return _banner_wrap(
-        f"Relative to the historical {epoch_a} baseline, "
-        f"{_warm_clause(active_tier, wa)} and {_cold_clause(active_tier, ca)}. "
-        f"Under the recent {epoch_b} climate state, the warm footprint is "
-        f"{_phrase_chip('warm', active_tier, _trend_clause(wb, wa))} "
-        f"and the cold footprint is "
-        f"{_phrase_chip('cold', active_tier, _trend_clause(cb, ca))}."
+        f"Against the colder historical baseline ({epoch_a}), "
+        f"{_europe_clause(active_tier, wa, ca)}. "
+        f"Against the warmer recent baseline ({epoch_b}), "
+        f"{_europe_clause(active_tier, wb, cb)}."
     )
 
 
-def _delta_cell(new: float, old: float) -> str:
-    return f"{new - old:+.1f}%"
+def _fmt_area_pct(pct: float) -> str:
+    return f"{pct:.1f}"
 
 
-def _baseline_expert_df(footprint: dict, footprint_a: dict | None = None, footprint_b: dict | None = None) -> pd.DataFrame:
-    show_delta = footprint_a is not None and footprint_b is not None
+def _fmt_change_cell(new: float, old: float, *, dash: bool = False) -> str:
+    if dash:
+        return "—"
+    return f"{new - old:+.1f}"
+
+
+def _severity_level_rows(values_fn, active_tier: str, *, with_change: bool) -> str:
     rows = []
     for t in _FOOTPRINT_TIER_ORDER:
-        row = {
-            "Severity": _FOOTPRINT_TIER_TITLES[t],
-            "Warm": f"{footprint[t]['warm_pct']:.1f}%",
-        }
-        if show_delta:
-            row["Δ Warm"] = (
-                "—" if t == "record"
-                else _delta_cell(footprint_b[t]["warm_pct"], footprint_a[t]["warm_pct"])
-            )
-        row["Cold"] = f"{footprint[t]['cold_pct']:.1f}%"
-        if show_delta:
-            row["Δ Cold"] = (
-                "—" if t == "record"
-                else _delta_cell(footprint_b[t]["cold_pct"], footprint_a[t]["cold_pct"])
-            )
-        rows.append(row)
-    return pd.DataFrame(rows)
+        old, new = values_fn(t)
+        active = " atmopulse-sev-row-active" if t == active_tier else ""
+        rec = t == "record"
+        cells = (
+            f"<th scope='row'>{_FOOTPRINT_TIER_TITLES[t]}</th>"
+            f"<td>{_fmt_area_pct(old)}</td>"
+        )
+        if with_change:
+            cells += f"<td>{_fmt_area_pct(new)}</td><td>{_fmt_change_cell(new, old, dash=rec)}</td>"
+        rows.append(f"<tr class='atmopulse-sev-level{active}'>{cells}</tr>")
+    return "".join(rows)
 
 
-def _render_expert_footprint(footprint: dict, footprint_a: dict | None = None, footprint_b: dict | None = None) -> None:
-    df = _baseline_expert_df(footprint, footprint_a, footprint_b)
-    column_config = {"Severity": st.column_config.TextColumn("Severity (cumulative)", width="small")}
-    for col in df.columns:
-        if col == "Severity":
-            continue
-        column_config[col] = st.column_config.TextColumn(col, width="small")
-    st.dataframe(
-        df,
-        column_config=column_config,
-        hide_index=True,
-        use_container_width=True,
+def _severity_table_html(headers: tuple[str, ...], body: str) -> str:
+    head = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
+    return (
+        f"<table class='atmopulse-sev-table'><thead><tr>{head}</tr></thead>"
+        f"<tbody>{body}</tbody></table>"
     )
+
+
+def _severity_pair_html(warm_table: str, cold_table: str) -> str:
+    tip = html.escape(HELP["europe_share_table"])
+    return (
+        "<div class='atmopulse-sev-pair'>"
+        "<div class='atmopulse-sev-block'>"
+        "<div class='atmopulse-sev-heading atmopulse-sev-heading-warm'>Warm:</div>"
+        f"{warm_table}</div>"
+        "<div class='atmopulse-sev-block'>"
+        "<div class='atmopulse-sev-heading atmopulse-sev-heading-cold'>Cold:</div>"
+        f"{cold_table}</div>"
+        f"<span class='atmopulse-sev-help' title='{tip}'>?</span>"
+        "</div>"
+    )
+
+
+def _severity_compare_html(footprint_a: dict, footprint_b: dict, active_tier: str) -> str:
+    headers = ("", "1961–1990", "1996–2025", "Change")
+
+    def warm(t):
+        return footprint_a[t]["warm_pct"], footprint_b[t]["warm_pct"]
+
+    def cold(t):
+        return footprint_a[t]["cold_pct"], footprint_b[t]["cold_pct"]
+
+    return _severity_pair_html(
+        _severity_table_html(headers, _severity_level_rows(warm, active_tier, with_change=True)),
+        _severity_table_html(headers, _severity_level_rows(cold, active_tier, with_change=True)),
+    )
+
+
+def _severity_single_html(footprint: dict, active_tier: str) -> str:
+    headers = ("", "Area")
+
+    def warm(t):
+        return footprint[t]["warm_pct"], footprint[t]["warm_pct"]
+
+    def cold(t):
+        return footprint[t]["cold_pct"], footprint[t]["cold_pct"]
+
+    return _severity_pair_html(
+        _severity_table_html(headers, _severity_level_rows(warm, active_tier, with_change=False)),
+        _severity_table_html(headers, _severity_level_rows(cold, active_tier, with_change=False)),
+    )
+
+
+def _render_expert_severity(
+    *,
+    footprint_a: dict | None,
+    footprint_b: dict | None,
+    footprint_single: dict | None,
+    active_tier: str,
+    compare: bool,
+) -> None:
+    # Markdown so page CSS (severity table) applies; st.html is isolated.
+    if compare and footprint_a is not None and footprint_b is not None:
+        st.markdown(_severity_compare_html(footprint_a, footprint_b, active_tier), unsafe_allow_html=True)
+    elif footprint_single is not None:
+        st.markdown(_severity_single_html(footprint_single, active_tier), unsafe_allow_html=True)
 
 
 def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold, toggles, target_date, default_date):
@@ -275,11 +363,16 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
         horizontal=True,
     )
     if map_layout == LAYOUT_FLICKER:
-        flicker_epoch = st.radio("Select Reference Period:", ("Reference Period A (1961–1990)", "Reference Period B (1996–2025)"), horizontal=True, index=1)
+        flicker_epoch = st.radio(
+            "Select Reference Period:",
+            (epoch_period_label("A"), epoch_period_label("B")),
+            horizontal=True,
+            index=1,
+        )
 
     if not is_daily_map_view(view_mode):
         _, pers_meta = _load_persistence_daily_series(
-            (target_date - pd.Timedelta(days=65)).strftime('%Y-%m-%d'),
+            (target_date - pd.Timedelta(days=PERSISTENCE_MAX_DAYS + PERSISTENCE_LOOKBACK_PAD)).strftime('%Y-%m-%d'),
             target_date.strftime('%Y-%m-%d'),
             default_date.strftime('%Y-%m-%d'),
             forecast_model=selected_forecast_model(),
@@ -303,14 +396,14 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
     def _render_impact_table(title: str, df, impact_col: str) -> None:
         st.markdown(_top10_header_html(title), unsafe_allow_html=True)
         if df.empty:
-            st.caption("No countries affected.")
+            st.caption("No European countries affected.")
             return
         st.dataframe(
             df,
             column_config={
                 "Country": st.column_config.TextColumn("Country", width="small"),
                 impact_col: st.column_config.ProgressColumn(
-                    impact_col, format="%.1f%%", min_value=0, max_value=100, width="small"
+                    "Area %", format="%.1f%%", min_value=0, max_value=100, width="small"
                 ),
             },
             hide_index=True,
@@ -320,8 +413,11 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
     def render_top10_period(df_h, df_c, period_label=None):
         if period_label:
             st.markdown(f"**{period_label}**")
-        _render_impact_table("Top 10 Countries – Warm Impact", df_h, "Warm Impact (%)")
-        _render_impact_table("Top 10 Countries – Cold Impact", df_c, "Cold Impact (%)")
+        wcol, ccol = st.columns(2, gap="small")
+        with wcol:
+            _render_impact_table("Warm", df_h, "Warm Impact (%)")
+        with ccol:
+            _render_impact_table("Cold", df_c, "Cold Impact (%)")
 
     def render_top10_tables(df_h, df_c):
         render_top10_period(df_h, df_c)
@@ -364,6 +460,7 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
                         "Synoptic contours are shown where available."
                     )
                 footprint_a = footprint_b = footprint_single = None
+                active_tier = "strong"
                 if is_daily_map_view(view_mode):
                     # Cumulative severity ladder: Moderate INCLUDES Strong/Extreme/Record,
                     # Strong INCLUDES Extreme/Record, Extreme INCLUDES Record, Record is exclusive.
@@ -374,7 +471,7 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
                     }.get(top10_threshold, "strong")
 
                     if map_layout == LAYOUT_FLICKER:
-                        active_epoch = "A" if "A" in flicker_epoch else "B"
+                        active_epoch = epoch_from_label(flicker_epoch)
                         footprint_single = compute_map_footprint(
                             ref_clim, map_phys_data, target_date_str,
                             st.session_state.toggles_warm, st.session_state.toggles_cold,
@@ -403,6 +500,12 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
                                 footprint_a, footprint_b, active_tier,
                             ))
 
+                    if is_expert_mode():
+                        _render_expert_severity(
+                            footprint_a=footprint_a, footprint_b=footprint_b,
+                            footprint_single=footprint_single, active_tier=active_tier,
+                            compare=map_layout != LAYOUT_FLICKER,
+                        )
                     st.markdown(_daily_legend_html(top10_threshold), unsafe_allow_html=True)
 
                 # Schritt C: hashable-only front door for build_baseline_map.
@@ -417,9 +520,13 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
                         persist_metric, top10_threshold,
                         tuple(sorted(st.session_state.toggles_warm.items())),
                         tuple(sorted(st.session_state.toggles_cold.items())),
-                        frozenset(name for name, active in toggles.items() if active),
+                        frozenset(
+                            name for name, active in toggles.items()
+                            if name in ("mslp", "z500", "hatching") and active
+                        ),
                         source_mtime, forecast_model,
                         full_width=full_width, anchor_date_str=anchor_date_str,
+                        spell_days=int(toggles.get("spell_days", 6)),
                         _ref_data=ref_clim, _map_phys_data=map_phys_data,
                     )
 
@@ -429,15 +536,15 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
                     with st.container(key="atmopulse_map_columns"):
                         mc1, mc2 = st.columns(2, gap="small")
                         with mc1:
-                            _render_synoptic_map(fig_a, "Historical Baseline (1961-1990)", "map_a")
-                            if is_expert_mode() and is_daily_map_view(view_mode) and footprint_a:
-                                _render_expert_footprint(footprint_a, footprint_a, footprint_b)
+                            _render_synoptic_map(fig_a, epoch_period_label("A"), "map_a")
+                        with mc2:
+                            _render_synoptic_map(fig_b, epoch_period_label("B"), "map_b")
+                    with st.container(key="atmopulse_map_tables"):
+                        mc1, mc2 = st.columns(2, gap="small")
+                        with mc1:
                             df_h_a, df_c_a = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "A", map_var_code, anchor_date=default_date, _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid, source_mtime=source_mtime)
                             render_top10_period(df_h_a, df_c_a)
                         with mc2:
-                            _render_synoptic_map(fig_b, "Recent Baseline (1996-2025)", "map_b")
-                            if is_expert_mode() and is_daily_map_view(view_mode) and footprint_b:
-                                _render_expert_footprint(footprint_b, footprint_a, footprint_b)
                             df_h_b, df_c_b = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "B", map_var_code, anchor_date=default_date, _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid, source_mtime=source_mtime)
                             render_top10_period(df_h_b, df_c_b)
                 elif map_layout in (LAYOUT_OPACITY, LAYOUT_SWIPE):
@@ -448,33 +555,27 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
                     else:
                         _render_synoptic_map(
                             build_opacity_slider_map(fig_a, fig_b),
-                            "Opacity Slider Compare: Historical Baseline (1961-1990) ↔ Recent Baseline (1996-2025)",
+                            f"Opacity Slider Compare: {epoch_period_label('A')} ↔ {epoch_period_label('B')}",
                             "map_opacity",
                             bottom_margin=60,
                         )
                         st.caption("Drag the slider under the map to cross-fade between the two reference periods.")
-                    with st.container(key="atmopulse_map_columns"):
+                    with st.container(key="atmopulse_map_tables"):
                         map_col1, map_col2 = st.columns(2, gap="small")
                         with map_col1:
-                            if is_expert_mode() and is_daily_map_view(view_mode) and footprint_a:
-                                _render_expert_footprint(footprint_a, footprint_a, footprint_b)
                             df_h_a, df_c_a = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "A", map_var_code, anchor_date=default_date, _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid, source_mtime=source_mtime)
-                            render_top10_period(df_h_a, df_c_a, "Historical Baseline (1961–1990)")
+                            render_top10_period(df_h_a, df_c_a, epoch_period_label("A"))
                         with map_col2:
-                            if is_expert_mode() and is_daily_map_view(view_mode) and footprint_b:
-                                _render_expert_footprint(footprint_b, footprint_a, footprint_b)
                             df_h_b, df_c_b = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "B", map_var_code, anchor_date=default_date, _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid, source_mtime=source_mtime)
-                            render_top10_period(df_h_b, df_c_b, "Recent Baseline (1996–2025)")
+                            render_top10_period(df_h_b, df_c_b, epoch_period_label("B"))
                 else:
-                    ep_sel = "A" if "A" in flicker_epoch else "B"
-                    flicker_title = "Historical Baseline (1961-1990)" if ep_sel == "A" else "Recent Baseline (1996-2025)"
+                    ep_sel = epoch_from_label(flicker_epoch)
+                    flicker_title = epoch_period_label(ep_sel)
                     _render_synoptic_map(
                         _cached_map(ep_sel, full_width=True),
                         flicker_title,
                         "map_flicker",
                     )
-                    if is_expert_mode() and is_daily_map_view(view_mode) and footprint_single:
-                        _render_expert_footprint(footprint_single)
                     df_h, df_c = calculate_top10(
                         ref_clim, map_phys_data, target_date,
                         st.session_state.toggles_warm, st.session_state.toggles_cold,

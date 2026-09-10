@@ -48,9 +48,12 @@ from backend_maps import (
 from config import (
     DATA_ROOT,
     FORECAST_MODEL_IFS,
+    PERSISTENCE_LOOKBACK_PAD,
+    PERSISTENCE_MAX_DAYS,
     SLIDER_PAD_FUTURE,
     SLIDER_PAD_PAST,
     ZARR_MASTER_TIME_SERIES,
+    meteo_var_code,
 )
 
 LIVE_TXTN = DATA_ROOT / "Live_Forecasts/live_forecast_txtn.nc"
@@ -194,7 +197,7 @@ def get_live_txtn_ds(forecast_model=FORECAST_MODEL_IFS, _loader_version=8):
 @st.cache_resource(show_spinner=False)
 def _load_persistence_window_source(
     start_date_str, end_date_str,
-    forecast_model=FORECAST_MODEL_IFS, _loader_version=9,
+    forecast_model=FORECAST_MODEL_IFS, _loader_version=10,
 ):
     """
     SINGLETON CACHE: the requested persistence window from covering
@@ -212,7 +215,7 @@ def _load_persistence_window_source(
 
 @st.cache_data(show_spinner=False)
 def _load_persistence_daily_series(start_date_str, end_date_str, anchor_date_str=None, forecast_model=FORECAST_MODEL_IFS):
-    """Build a daily TX/TN cube from ERA5 masters; IFS/AIFS only in the last 6 days + forecast."""
+    """Build a daily TX/TN/T850 cube from ERA5 masters; IFS/AIFS only in the last 6 days + forecast."""
     start_date = pd.to_datetime(start_date_str).normalize()
     end_date = pd.to_datetime(end_date_str).normalize()
     by_date = {}
@@ -234,17 +237,29 @@ def _load_persistence_daily_series(start_date_str, end_date_str, anchor_date_str
                 # leftover duplicate timestamps.
                 # 29 Feb is kept as a real day here too — persistence streaks
                 # are a live/actual-data view, not the 365-day baseline array.
-                if "tx" in sub.data_vars and "tn" in sub.data_vars:
-                    tx_d = sub['tx'].groupby('valid_time.date').max()
-                    tn_d = sub['tn'].groupby('valid_time.date').min()
-                    for i, d in enumerate(tx_d['date'].values):
+                tx_by, tn_by, t850_by = {}, {}, {}
+                if "tx" in sub.data_vars:
+                    tx_d = sub["tx"].groupby("valid_time.date").max()
+                    for i, d in enumerate(tx_d["date"].values):
+                        tx_by[pd.Timestamp(d).normalize()] = tx_d.values[i]
+                if "tn" in sub.data_vars:
+                    tn_d = sub["tn"].groupby("valid_time.date").min()
+                    for i, d in enumerate(tn_d["date"].values):
+                        tn_by[pd.Timestamp(d).normalize()] = tn_d.values[i]
+                if "t850" in sub.data_vars:
+                    t850_d = sub["t850"].groupby("valid_time.date").mean()
+                    for i, d in enumerate(t850_d["date"].values):
+                        t850_by[pd.Timestamp(d).normalize()] = t850_d.values[i]
+                if "tg" in sub.data_vars:
+                    tg_d = sub["tg"].groupby("valid_time.date").mean()
+                    for i, d in enumerate(tg_d["date"].values):
                         day = pd.Timestamp(d).normalize()
-                        by_date[day] = (tx_d.values[i], tn_d.values[i])
-                elif "tg" in sub.data_vars:
-                    tg_d = sub['tg'].groupby('valid_time.date').mean()
-                    for i, d in enumerate(tg_d['date'].values):
-                        day = pd.Timestamp(d).normalize()
-                        by_date[day] = (tg_d.values[i], tg_d.values[i])
+                        if day not in tx_by:
+                            tx_by[day] = tg_d.values[i]
+                        if day not in tn_by:
+                            tn_by[day] = tg_d.values[i]
+                for day in set(tx_by) | set(tn_by) | set(t850_by):
+                    by_date[day] = (tx_by.get(day), tn_by.get(day), t850_by.get(day))
 
     archive_max = max((d for d in by_date if d < overlay_cut), default=None)
 
@@ -252,9 +267,27 @@ def _load_persistence_daily_series(start_date_str, end_date_str, anchor_date_str
     if not eligible:
         return None, {"archive_max": archive_max, "effective_end": None, "uses_ifs": False, "has_gap": False}
 
-    eligible = eligible[-60:]
-    tx_vals = np.stack([by_date[d][0] for d in eligible])
-    tn_vals = np.stack([by_date[d][1] for d in eligible])
+    eligible = eligible[-PERSISTENCE_MAX_DAYS:]
+
+    def _stack_field(idx):
+        sample = next((by_date[d][idx] for d in eligible if by_date[d][idx] is not None), None)
+        if sample is None:
+            other = next(
+                (by_date[d][j] for d in eligible for j in range(3) if by_date[d][j] is not None),
+                None,
+            )
+            if other is None:
+                return None
+            return np.full((len(eligible),) + np.shape(other), np.nan)
+        nan_grid = np.full_like(sample, np.nan)
+        return np.stack([by_date[d][idx] if by_date[d][idx] is not None else nan_grid for d in eligible])
+
+    tx_vals = _stack_field(0)
+    tn_vals = _stack_field(1)
+    t850_vals = _stack_field(2)
+    if tx_vals is None and tn_vals is None and t850_vals is None:
+        return None, {"archive_max": archive_max, "effective_end": None, "uses_ifs": False, "has_gap": False}
+
     ifs_used = any(d >= overlay_cut for d in eligible)
     has_gap = False
     if archive_max and ifs_used:
@@ -268,7 +301,7 @@ def _load_persistence_daily_series(start_date_str, end_date_str, anchor_date_str
         "uses_ifs": ifs_used,
         "has_gap": has_gap,
     }
-    return (np.array(eligible), tx_vals, tn_vals), meta
+    return (np.array(eligible), tx_vals, tn_vals, t850_vals), meta
 
 
 # --- QDM BIAS CORRECTION ---
@@ -323,7 +356,7 @@ def _point_frame_from_master_ds(ds, lat, lon, start, end):
         ds = ds.rename({"mx2t": "tx"})
     if "mn2t" in ds.data_vars and "tn" not in ds.data_vars:
         ds = ds.rename({"mn2t": "tn"})
-    keep = [v for v in ("tx", "tn", "tg") if v in ds.data_vars]
+    keep = [v for v in ("tx", "tn", "tg", "t850") if v in ds.data_vars]
     if not keep:
         return pd.DataFrame()
     lat_name = "latitude" if "latitude" in ds.coords else "lat"
@@ -338,7 +371,8 @@ def _point_frame_from_master_ds(ds, lat, lon, start, end):
     tx = _squeeze_celsius(pt["tx"].values) if "tx" in pt else np.full(len(days), np.nan)
     tn = _squeeze_celsius(pt["tn"].values) if "tn" in pt else np.full(len(days), np.nan)
     tg = _squeeze_celsius(pt["tg"].values) if "tg" in pt else (tx + tn) / 2.0
-    return pd.DataFrame({"Date": days, "TX": tx, "TN": tn, "TG": tg})
+    t850 = _squeeze_celsius(pt["t850"].values) if "t850" in pt else np.full(len(days), np.nan)
+    return pd.DataFrame({"Date": days, "TX": tx, "TN": tn, "TG": tg, "T850": t850})
 
 
 _POINT_EXTRACT_SCRIPT = r"""
@@ -354,7 +388,7 @@ try:
         ds = ds.rename({"mx2t": "tx"})
     if "mn2t" in ds.data_vars and "tn" not in ds.data_vars:
         ds = ds.rename({"mn2t": "tn"})
-    keep = [v for v in ("tx", "tn", "tg") if v in ds.data_vars]
+    keep = [v for v in ("tx", "tn", "tg", "t850") if v in ds.data_vars]
     if not keep:
         raise SystemExit(2)
     lat_name = "latitude" if "latitude" in ds.coords else "lat"
@@ -372,7 +406,7 @@ try:
         if finite.size and float(np.mean(finite)) > 100:
             a = a - 273.15
         return [None if not np.isfinite(x) else float(x) for x in a]
-    json.dump({"Date": [d.strftime("%Y-%m-%d") for d in days], "TX": _c("tx"), "TN": _c("tn"), "TG": _c("tg")}, sys.stdout)
+    json.dump({"Date": [d.strftime("%Y-%m-%d") for d in days], "TX": _c("tx"), "TN": _c("tn"), "TG": _c("tg"), "T850": _c("t850")}, sys.stdout)
 finally:
     ds.close()
 """
@@ -420,16 +454,25 @@ def _point_frame_from_master_file(path, lat, lon, start, end, isolate=False):
                 pass
 
 
+def _last_finite(series):
+    """Latest non-null in a Date-grouped column (forecast overlay must not wipe archive T850)."""
+    arr = series.to_numpy()
+    ok = pd.notna(arr)
+    if not ok.any():
+        return np.nan
+    return arr[ok][-1]
+
+
 @st.cache_data(show_spinner=False)
-def get_live_point_series(lat, lon, forecast_model=FORECAST_MODEL_IFS, _series_version=7):
+def get_live_point_series(lat, lon, forecast_model=FORECAST_MODEL_IFS, _series_version=8):
     """
-    Point daily TX/TN/TG for the Point Meteogram. Does NOT open the maps
+    Point daily TX/TN/TG/T850 for the Point Meteogram. Does NOT open the maps
     spatial cube (load_global_datasets): that concatenates 2025+2026 and then
     .compute()s every field at the point, which aborted Streamlit on a
     corrupted HDF5 heap in era5_master_daily_2026.nc.
 
-    Each covering year is opened alone, only tx/tn/tg are read, and the
-    current calendar year is isolated in a subprocess.
+    Each covering year is opened alone, only the point temperature fields are
+    read, and the current calendar year is isolated in a subprocess.
     """
     end = pd.Timestamp.utcnow().tz_localize(None).floor("D") + pd.Timedelta(days=10)
     start = end - pd.Timedelta(days=375)
@@ -462,6 +505,10 @@ def get_live_point_series(lat, lon, forecast_model=FORECAST_MODEL_IFS, _series_v
             f_doys = etccdi_doy_365(f_days)
             tx_name = "tx" if "tx" in pt_lf.data_vars else "mx2t"
             tn_name = "tn" if "tn" in pt_lf.data_vars else "mn2t"
+            t850_vals = (
+                _squeeze_celsius(pt_lf["t850"].values) + _qdm_mean_bias(lat, lon, f_doys, "t850_bias")
+                if "t850" in pt_lf.data_vars else np.full(len(f_days), np.nan)
+            )
             if tx_name in pt_lf.data_vars and tn_name in pt_lf.data_vars:
                 tx_raw = _squeeze_celsius(pt_lf[tx_name].values)
                 tn_raw = _squeeze_celsius(pt_lf[tn_name].values)
@@ -469,12 +516,16 @@ def get_live_point_series(lat, lon, forecast_model=FORECAST_MODEL_IFS, _series_v
                 dtr_corr = (tx_raw - tn_raw) + _qdm_mean_bias(lat, lon, f_doys, "dtr_bias")
                 tg_corr = (tx_raw + tn_raw) / 2.0 + _qdm_mean_bias(lat, lon, f_doys, "tg_bias")
                 frames.append(pd.DataFrame({
-                    "Date": f_days, "TX": tx_corr, "TN": tx_corr - dtr_corr, "TG": tg_corr,
+                    "Date": f_days, "TX": tx_corr, "TN": tx_corr - dtr_corr, "TG": tg_corr, "T850": t850_vals,
                 }))
             elif "tg" in pt_lf.data_vars:
                 tg_corr = _squeeze_celsius(pt_lf["tg"].values) + _qdm_mean_bias(lat, lon, f_doys, "tg_bias")
                 frames.append(pd.DataFrame({
-                    "Date": f_days, "TX": np.nan, "TN": np.nan, "TG": tg_corr,
+                    "Date": f_days, "TX": np.nan, "TN": np.nan, "TG": tg_corr, "T850": t850_vals,
+                }))
+            elif "t850" in pt_lf.data_vars:
+                frames.append(pd.DataFrame({
+                    "Date": f_days, "TX": np.nan, "TN": np.nan, "TG": np.nan, "T850": t850_vals,
                 }))
         except Exception:
             pass
@@ -485,7 +536,9 @@ def get_live_point_series(lat, lon, forecast_model=FORECAST_MODEL_IFS, _series_v
 
     df = pd.concat(frames, ignore_index=True)
     df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None).dt.normalize()
-    df = df.sort_values("Date").drop_duplicates(subset="Date", keep="last")
+    df = df.sort_values("Date")
+    value_cols = [c for c in ("TX", "TN", "TG", "T850") if c in df.columns]
+    df = df.groupby("Date", as_index=False)[value_cols].agg(_last_finite)
     # 29 Feb stays VISIBLE on the live chart (real ERA5/IFS value plotted on
     # its real calendar date) — only the 365-day BASELINE array excises it.
     # Reindex on the full Gregorian calendar so true ERA5 holes stay NaN.
@@ -541,7 +594,7 @@ def synoptic_source_mtime(date_str, forecast_model=FORECAST_MODEL_IFS) -> float:
 @st.cache_resource(show_spinner=False, max_entries=10)
 def fetch_cached_synoptic_data(
     date_str, anchor_date_str=None, forecast_model=FORECAST_MODEL_IFS,
-    needed_vars=None, source_mtime=0.0, _loader_version=10,
+    needed_vars=None, source_mtime=0.0, _loader_version=11,
 ):
     """
     `source_mtime` (Schritt C): hashable cache-key component, see
@@ -563,7 +616,7 @@ def fetch_cached_synoptic_data(
         )
         meta = data.pop("_meta", {})
         packed = {}
-        sample = next((data[k] for k in ("mslp", "tg", "tx", "tn", "z500") if k in data), None)
+        sample = next((data[k] for k in ("mslp", "tg", "tx", "tn", "z500", "t850") if k in data), None)
         if sample is None:
             sample = next((v for v in data.values() if hasattr(v, "longitude")), None)
         if sample is not None and hasattr(sample, "longitude"):
@@ -572,7 +625,7 @@ def fetch_cached_synoptic_data(
         for key, val in data.items():
             packed[key] = _synoptic_array(val)
         meta["temps_available"] = any(
-            _array_has_finite(packed.get(name)) for name in ("tx", "tn", "tg")
+            _array_has_finite(packed.get(name)) for name in ("tx", "tn", "tg", "t850")
         )
         return packed, meta
 
@@ -585,23 +638,34 @@ def get_persistence_arrays(target_date_str, baseline_type, map_var="TG", anchor_
     if "AIFS" in str(forecast_model) and map_var in ("TX", "TN"):
         return None
     end_date = pd.to_datetime(target_date_str)
-    start_date = end_date - pd.Timedelta(days=65)
+    start_date = end_date - pd.Timedelta(days=PERSISTENCE_MAX_DAYS + PERSISTENCE_LOOKBACK_PAD)
     loaded = _load_persistence_daily_series(
         start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'),
         anchor_date_str, forecast_model=forecast_model,
     )
     if loaded is None or loaded[0] is None: 
         return None
-    (daily_dates, tx_vals, tn_vals), _meta = loaded
+    payload, _meta = loaded
+    daily_dates, tx_vals, tn_vals = payload[0], payload[1], payload[2]
+    t850_vals = payload[3] if len(payload) > 3 else None
+    if tx_vals is None and tn_vals is None and t850_vals is None:
+        return None
 
-    tx_hist, tn_hist = tx_vals.astype(np.float64), tn_vals.astype(np.float64)
-    if np.nanmean(tx_hist) > 100:
-        tx_hist -= 273.15
-        tn_hist -= 273.15
+    def _to_celsius(arr):
+        if arr is None:
+            return None
+        hist = arr.astype(np.float64)
+        finite_mean = np.nanmean(hist)
+        if np.isfinite(finite_mean) and finite_mean > 100:
+            hist -= 273.15
+        return hist
+
+    tx_hist, tn_hist, t850_hist = _to_celsius(tx_vals), _to_celsius(tn_vals), _to_celsius(t850_vals)
     dates_dt = pd.to_datetime(daily_dates)
     doys = etccdi_doy_365(dates_dt)
     suffix = "A" if baseline_type == "A" else "B"
-    n_days, n_lats, n_lons = tx_hist.shape
+    shape_src = next(a for a in (tx_hist, tn_hist, t850_hist) if a is not None)
+    n_days, n_lats, n_lons = shape_src.shape
     
     def safe_get(var_key, fallback=np.nan):
         if var_key in ref_clim.variables: 
@@ -609,14 +673,27 @@ def get_persistence_arrays(target_date_str, baseline_type, map_var="TG", anchor_
         return np.full((365, n_lats, n_lons), fallback)
 
     if map_var == "TX":
+        if tx_hist is None:
+            return None
         v_h, v_p95, v_p90, v_p75 = tx_hist, safe_get(f'tx_p95_doy_{suffix}'), safe_get(f'tx_p90_doy_{suffix}'), safe_get(f'tx_p75_doy_{suffix}')
         v_p25, v_p10, v_p5 = safe_get(f'tx_p25_doy_{suffix}'), safe_get(f'tx_p10_doy_{suffix}'), safe_get(f'tx_p5_doy_{suffix}')
         v_r_w, v_r_c = safe_get('tx_max_val'), safe_get('tx_min_val')
     elif map_var == "TN":
+        if tn_hist is None:
+            return None
         v_h, v_p95, v_p90, v_p75 = tn_hist, safe_get(f'tn_p95_doy_{suffix}'), safe_get(f'tn_p90_doy_{suffix}'), safe_get(f'tn_p75_doy_{suffix}')
         v_p25, v_p10, v_p5 = safe_get(f'tn_p25_doy_{suffix}'), safe_get(f'tn_p10_doy_{suffix}'), safe_get(f'tn_p5_doy_{suffix}')
         v_r_w, v_r_c = safe_get('tn_max_val'), safe_get('tn_min_val')
-    else: 
+    elif map_var == "T850":
+        if t850_hist is None or not np.isfinite(t850_hist).any():
+            return None
+        v_h = t850_hist
+        v_p95, v_p90, v_p75 = safe_get(f't850_p95_doy_{suffix}'), safe_get(f't850_p90_doy_{suffix}'), safe_get(f't850_p75_doy_{suffix}')
+        v_p25, v_p10, v_p5 = safe_get(f't850_p25_doy_{suffix}'), safe_get(f't850_p10_doy_{suffix}'), safe_get(f't850_p5_doy_{suffix}')
+        v_r_w, v_r_c = safe_get('t850_max_val'), safe_get('t850_min_val')
+    else:
+        if tx_hist is None or tn_hist is None:
+            return None
         v_h = (tx_hist + tn_hist) / 2.0
         v_p95 = (safe_get(f'tx_p95_doy_{suffix}') + safe_get(f'tn_p95_doy_{suffix}')) / 2
         v_p90 = (safe_get(f'tx_p90_doy_{suffix}') + safe_get(f'tn_p90_doy_{suffix}')) / 2
@@ -727,6 +804,7 @@ def point_clim_ladder(pt_clim, doys, meteo_var, epoch):
 
     * TX — TX percentiles / records
     * TN — TN percentiles / records
+    * T850 — 850 hPa temperature percentiles / records
     * TG — mean of the TX and TN ladders (same proxy the Map Tracker uses);
       ``tg_max_val`` / ``tg_min_val`` when present, else mean of TX+TN records
 
@@ -742,16 +820,22 @@ def point_clim_ladder(pt_clim, doys, meteo_var, epoch):
     def avg(k1, k2):
         return (a(k1) + a(k2)) / 2.0
 
-    if meteo_var == "Max Temp (TX)":
+    code = meteo_var_code(meteo_var)
+    if code == "TX":
         p75, p90, p95 = a(f"tx_p75_doy_{ep}"), a(f"tx_p90_doy_{ep}"), a(f"tx_p95_doy_{ep}")
         rec_w = a("tx_max_val")
         p25, p10, p5 = a(f"tx_p25_doy_{ep}"), a(f"tx_p10_doy_{ep}"), a(f"tx_p5_doy_{ep}")
         rec_c = a("tx_min_val")
-    elif meteo_var == "Min Temp (TN)":
+    elif code == "TN":
         p75, p90, p95 = a(f"tn_p75_doy_{ep}"), a(f"tn_p90_doy_{ep}"), a(f"tn_p95_doy_{ep}")
         rec_w = a("tn_max_val")
         p25, p10, p5 = a(f"tn_p25_doy_{ep}"), a(f"tn_p10_doy_{ep}"), a(f"tn_p5_doy_{ep}")
         rec_c = a("tn_min_val")
+    elif code == "T850":
+        p75, p90, p95 = a(f"t850_p75_doy_{ep}"), a(f"t850_p90_doy_{ep}"), a(f"t850_p95_doy_{ep}")
+        rec_w = a("t850_max_val")
+        p25, p10, p5 = a(f"t850_p25_doy_{ep}"), a(f"t850_p10_doy_{ep}"), a(f"t850_p5_doy_{ep}")
+        rec_c = a("t850_min_val")
     else:
         p75 = avg(f"tx_p75_doy_{ep}", f"tn_p75_doy_{ep}")
         p90 = avg(f"tx_p90_doy_{ep}", f"tn_p90_doy_{ep}")
@@ -802,7 +886,18 @@ def _series_frame_from_point(pt_series):
     return df
 
 
-def _load_point_archive_series_from_zarr(lat, lon, is_warm):
+def _archive_var_candidates(var_code: str) -> tuple[str, ...]:
+    code = meteo_var_code(var_code) if var_code not in ("TX", "TN", "TG", "T850") else str(var_code)
+    if code == "T850":
+        return ("t850",)
+    if code == "TN":
+        return ("tn", "mn2t")
+    if code == "TG":
+        return ("tg",)
+    return ("tx", "mx2t")
+
+
+def _load_point_archive_series_from_zarr(lat, lon, var_code):
     """Millisecond-scale point read from the temporally-chunked Zarr mirror
     (see batch_convert_netcdf_to_zarr.py / ZARR_MASTER_TIME_SERIES). Returns
     None on ANY problem (missing store, missing variable, corrupt/partial
@@ -811,7 +906,7 @@ def _load_point_archive_series_from_zarr(lat, lon, is_warm):
     if not ZARR_MASTER_TIME_SERIES.exists():
         return None
 
-    candidates = ("tx", "mx2t") if is_warm else ("tn", "mn2t")
+    candidates = _archive_var_candidates(var_code)
     try:
         zds = xr.open_zarr(ZARR_MASTER_TIME_SERIES, consolidated=True)
     except Exception:
@@ -843,7 +938,7 @@ def _load_point_archive_series_from_zarr(lat, lon, is_warm):
 # depends on epoch "A" vs "B". Previously this ran TWICE per point (once per
 # epoch, since epoch was baked into build_yearly_extremes_chart's own cache
 # key), doubling the wait. Splitting it into its own @st.cache_data step means
-# the raw series is read from disk once per (lat, lon, is_warm) and reused for
+# the raw series is read from disk once per (lat, lon, var_code) and reused for
 # both epoch A and epoch B charts.
 #
 # STORAGE ENGINE: this now tries the point-extraction-optimal Zarr mirror
@@ -853,8 +948,8 @@ def _load_point_archive_series_from_zarr(lat, lon, is_warm):
 # path below is intentionally IDENTICAL to the previous implementation, and
 # both paths return the exact same 'time'/'val'/'year'/'doy' DataFrame shape.
 @st.cache_data(show_spinner=False)
-def _load_point_archive_series(lat, lon, is_warm, _archive_version=4):
-    zarr_df = _load_point_archive_series_from_zarr(lat, lon, is_warm)
+def _load_point_archive_series(lat, lon, var_code, _archive_version=6):
+    zarr_df = _load_point_archive_series_from_zarr(lat, lon, var_code)
     if zarr_df is not None:
         return zarr_df
 
@@ -868,7 +963,7 @@ def _load_point_archive_series(lat, lon, is_warm, _archive_version=4):
     # full multi-variable Dataset first would force every other archived
     # field (at that point) to be read/materialized for nothing.
     var_name = None
-    candidates = ("tx", "mx2t") if is_warm else ("tn", "mn2t")
+    candidates = _archive_var_candidates(var_code)
     for candidate in candidates:
         if candidate in ds.data_vars:
             var_name = candidate

@@ -71,9 +71,12 @@ def plotly_title_font(*, size: int = 20) -> dict:
     return dict(size=size, family=ATMOPULSE_FONTS["sora_css"])
 
 
-def map_contour_label_font(*, size: int = 10) -> dict:
+def map_contour_label_font(*, size: int = 9, color: str | None = None) -> dict:
     """Return small font dictionary for synoptic contour labels (MSLP/Z500 isolines)."""
-    return dict(size=size, family=ATMOPULSE_FONTS["sora_css"])
+    font = dict(size=size, family=ATMOPULSE_FONTS["sora_css"])
+    if color:
+        font["color"] = color
+    return font
 
 
 def atmopulse_streamlit_css(brand: dict) -> str:
@@ -462,56 +465,157 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
 
 /* Map Tracker: side-by-side baselines share one column pair (maps + tables)
    with a vertical divider. min-width:0 lets nested dataframes shrink. */
-.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] {{
+.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"],
+.st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] {{
     gap: 0 !important;
     align-items: stretch !important;
 }}
 .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
-.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"] {{
-    padding: 0 !important;
+.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"],
+.st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+.st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="column"] {{
+    flex: 1 1 0 !important;
+    width: 50% !important;
+    max-width: 50% !important;
+    box-sizing: border-box !important;
+    padding: 0 10px !important;
     margin: 0 !important;
     min-width: 0 !important;
     overflow-x: auto !important;
+    position: relative !important;
 }}
 .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
-.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
-    border-right: 2px solid {_hex_to_rgba(brand['primary'], 0.55)} !important;
-    padding-right: 12px !important;
+.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child,
+.st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
+.st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
+    box-shadow: inset -2px 0 0 0 {_hex_to_rgba(brand['primary'], 0.55)} !important;
 }}
-.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child,
-.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"]:last-child {{
-    padding-left: 12px !important;
-}}
-.st-key-atmopulse_map_columns [data-testid="stDataFrame"] {{
+.st-key-atmopulse_map_columns [data-testid="stDataFrame"],
+.st-key-atmopulse_map_tables [data-testid="stDataFrame"] {{
     width: 100% !important;
     max-width: 100% !important;
 }}
-.st-key-atmopulse_map_columns [data-testid="stDataFrame"] > div {{
+.st-key-atmopulse_map_columns [data-testid="stDataFrame"] > div,
+.st-key-atmopulse_map_tables [data-testid="stDataFrame"] > div {{
     width: 100% !important;
     max-width: 100% !important;
 }}
 @media (max-width: 900px) {{
-    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] {{
+    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"],
+    .st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] {{
         flex-wrap: wrap !important;
     }}
     .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
-    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"] {{
+    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"],
+    .st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+    .st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="column"] {{
         flex: 1 1 100% !important;
         width: 100% !important;
         max-width: 100% !important;
     }}
     .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
-    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
+    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child,
+    .st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
+    .st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
         border-right: none !important;
+        box-shadow: none !important;
         border-bottom: 2px solid {_hex_to_rgba(brand['primary'], 0.55)} !important;
-        padding-right: 0 !important;
+        padding-right: 10px !important;
         padding-bottom: 12px !important;
         margin-bottom: 12px !important;
+        width: 100% !important;
+        max-width: 100% !important;
     }}
     .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child,
-    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"]:last-child {{
-        padding-left: 0 !important;
+    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"]:last-child,
+    .st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child,
+    .st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="column"]:last-child {{
+        padding-left: 10px !important;
+        width: 100% !important;
+        max-width: 100% !important;
     }}
+}}
+
+.atmopulse-sev-pair {{
+    display: flex !important;
+    flex-direction: row !important;
+    flex-wrap: wrap !important;
+    align-items: flex-start !important;
+    justify-content: flex-start !important;
+    gap: 28px !important;
+    width: max-content !important;
+    max-width: 100% !important;
+    margin: 0 0 0.85rem 0 !important;
+}}
+.atmopulse-sev-block {{
+    width: max-content !important;
+}}
+.atmopulse-sev-heading {{
+    font-family: {o} !important;
+    font-size: 13px !important;
+    font-weight: 600 !important;
+    margin: 0 0 6px 0 !important;
+    line-height: 1.2 !important;
+}}
+.atmopulse-sev-heading-warm {{
+    color: {ATMOPULSE_WARM['p95']} !important;
+}}
+.atmopulse-sev-heading-cold {{
+    color: {ATMOPULSE_COLD['p5']} !important;
+}}
+.atmopulse-sev-help {{
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    width: 16px !important;
+    height: 16px !important;
+    margin-top: 1px !important;
+    border-radius: 50% !important;
+    border: 1px solid #6b7280 !important;
+    color: #6b7280 !important;
+    font-family: {o} !important;
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    line-height: 1 !important;
+    cursor: help !important;
+    flex-shrink: 0 !important;
+    user-select: none !important;
+}}
+.atmopulse-sev-table {{
+    width: auto !important;
+    min-width: 0 !important;
+    table-layout: fixed !important;
+    border-collapse: collapse;
+    font-family: {o};
+    font-size: 13px;
+    font-weight: {uw};
+    color: {brand['text_on_light']};
+    line-height: 1.35;
+}}
+.atmopulse-sev-table th,
+.atmopulse-sev-table td {{
+    width: 7.5rem !important;
+    min-width: 7.5rem !important;
+    max-width: 7.5rem !important;
+    box-sizing: border-box !important;
+    padding: 4px 8px !important;
+    text-align: right !important;
+    border-bottom: 1px solid {_hex_to_rgba(brand['primary'], 0.10)};
+    white-space: nowrap;
+}}
+.atmopulse-sev-table thead th {{
+    font-weight: 600;
+    border-bottom: 1px solid {_hex_to_rgba(brand['primary'], 0.35)};
+    padding-bottom: 6px !important;
+}}
+.atmopulse-sev-table tbody th[scope="row"] {{
+    text-align: left !important;
+    font-weight: {uw};
+}}
+.atmopulse-sev-table tbody tr.atmopulse-sev-row-active th,
+.atmopulse-sev-table tbody tr.atmopulse-sev-row-active td {{
+    font-weight: 600;
+    background: {_hex_to_rgba(brand['primary'], 0.07)};
 }}
 
 /* Synoptic maps: the keyed frame is locked to EUROPE_BBOX (70° lon : 42° lat).
@@ -574,6 +678,18 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     max-height: 100% !important;
 }}
 
+/* Compact left-aligned press-export buttons */
+div[class*="st-key-press-row"] [data-testid="stDownloadButton"] button,
+div[class*="st-key-press-row"] button {{
+    min-height: 1.65rem !important;
+    padding: 0.12rem 0.7rem !important;
+    font-size: 12px !important;
+    line-height: 1.2 !important;
+}}
+.atmopulse-meteo-yearly-gap {{
+    height: 1.75rem !important;
+}}
+
 /* Swipe compare now renders both maps inside one self-contained
    components.html iframe (see render_swipe_compare_map in
    frontend_plots.py) — no outer .st-key-* CSS is needed for it. */
@@ -602,13 +718,42 @@ section[data-testid="stSidebar"] div[data-testid="stMarkdownContainer"] {{
 section[data-testid="stSidebar"] .stRadio > div {{ 
     gap: 0rem; 
 }}
-section[data-testid="stSidebar"] div[data-testid="stRadio"] label p {{
+section[data-testid="stSidebar"] div[data-testid="stRadio"] label p,
+section[data-testid="stSidebar"] [data-testid="stCheckbox"] label,
+section[data-testid="stSidebar"] [data-testid="stCheckbox"] label p,
+section[data-testid="stSidebar"] [data-testid="stCheckbox"] label span,
+section[data-testid="stSidebar"] [data-testid="stCheckbox"] [data-testid="stWidgetLabel"],
+section[data-testid="stSidebar"] [data-testid="stCheckbox"] [data-testid="stWidgetLabel"] p,
+section[data-testid="stSidebar"] [data-testid="stCheckbox"] [data-testid="stMarkdownContainer"],
+section[data-testid="stSidebar"] [data-testid="stCheckbox"] [data-testid="stMarkdownContainer"] p,
+section[data-testid="stSidebar"] [data-testid="stCheckbox"] [data-testid="stMarkdownContainer"] li {{
     font-size: 14px !important; 
     font-weight: {uw} !important; 
     color: inherit !important;
+    line-height: 1.35 !important;
 }}
 section[data-testid="stSidebar"] .stCheckbox {{ 
     margin-top: -12px; 
+}}
+/* Overlay checkboxes share one size. Labels that start with digits
+   (500 hPa) can be parsed as markdown lists and otherwise render larger. */
+.st-key-map_synoptic_overlays [data-testid="stCheckbox"] [data-testid="stMarkdownContainer"],
+.st-key-map_synoptic_overlays [data-testid="stCheckbox"] [data-testid="stMarkdownContainer"] *,
+.st-key-map_overlay_mslp [data-testid="stMarkdownContainer"],
+.st-key-map_overlay_mslp [data-testid="stMarkdownContainer"] *,
+.st-key-map_overlay_z500 [data-testid="stMarkdownContainer"],
+.st-key-map_overlay_z500 [data-testid="stMarkdownContainer"] * {{
+    font-family: {o} !important;
+    font-size: 14px !important;
+    font-weight: {uw} !important;
+    line-height: 1.35 !important;
+    font-variant-numeric: lining-nums !important;
+}}
+.st-key-map_synoptic_overlays [data-testid="stCheckbox"] [data-testid="stMarkdownContainer"] ol,
+.st-key-map_overlay_z500 [data-testid="stMarkdownContainer"] ol {{
+    list-style: none !important;
+    padding-left: 0 !important;
+    margin: 0 !important;
 }}
 section[data-testid="stSidebar"] button, 
 section[data-testid="stSidebar"] input,
@@ -652,17 +797,21 @@ section[data-testid="stSidebar"] [data-baseweb="select"] {{
     border-radius: 0.5rem !important;
     font-family: {o} !important;
     font-weight: {uw} !important;
+    font-size: 15px !important;
     margin: 0 0 0.5rem 0 !important;
-    line-height: 1.55 !important;
+    line-height: 1.45 !important;
 }}
 .atmopulse-narrative-chip {{
-    padding: 1px 6px !important;
+    padding: 0 0.22em 0 0.18em !important;
+    margin: 0 !important;
     border-radius: 3px !important;
     font-family: inherit !important;
     font-size: inherit !important;
     font-weight: inherit !important;
-    white-space: normal !important;
+    white-space: nowrap !important;
     display: inline !important;
+    line-height: inherit !important;
+    vertical-align: baseline !important;
     box-decoration-break: clone;
     -webkit-box-decoration-break: clone;
 }}
@@ -764,8 +913,14 @@ ATMOPULSE_COLD = {
 # --- Overlays & auxiliary series ---
 ATMOPULSE_OVERLAY = {
     "mslp_contour": "#2E7D32",
+    "mslp_hl": "#2E7D32",
     "z500_contour": "#0056B3",
-    "border": "#000000",
+    "coast": "#5A5A5A",
+    "coast_width": 1.25,
+    "border": "#8E9499",
+    "border_width": 0.65,
+    "land": "#FAF8F4",
+    "sea": "#F3F6F8",
     "grid": "rgba(200,200,200,0.3)",
     "annotation": "gray",
 }

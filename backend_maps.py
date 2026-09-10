@@ -480,7 +480,7 @@ def synoptic_vars_for_map(
     toggles: dict | None = None,
     view_mode: str | None = None,
 ) -> tuple[str, ...]:
-    """Hashable field list for the current Map Tracker view (no u/v/t850)."""
+    """Hashable field list for the current Map Tracker view."""
     toggles = toggles or {}
     code = str(map_var or "TG").upper()
     wanted: list[str] = []
@@ -488,6 +488,8 @@ def synoptic_vars_for_map(
         wanted.append("tx")
     elif code == "TN":
         wanted.append("tn")
+    elif code == "T850":
+        wanted.append("t850")
     else:
         wanted.extend(("tg", "tx", "tn"))
     if toggles.get("mslp"):
@@ -495,7 +497,10 @@ def synoptic_vars_for_map(
     if toggles.get("z500"):
         wanted.append("z500")
     if toggles.get("hatching") or view_mode == MAP_VIEW_PERSISTENCE:
-        wanted.extend(("tx", "tn"))
+        if code == "T850":
+            wanted.append("t850")
+        else:
+            wanted.extend(("tx", "tn"))
     seen: set[str] = set()
     out: list[str] = []
     for name in wanted:

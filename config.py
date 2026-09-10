@@ -66,6 +66,7 @@ NAV_ANALYTICS = (NAV_MAP, NAV_METEO, NAV_WAVE)
 EXPERT_FEATURES = frozenset({
     "map_tx_tn",
     "persistence_view",
+    "map_analysis_level",
     "percentile_layer_toggles",
     "z500",
     "t850",
@@ -76,23 +77,88 @@ EXPERT_FEATURES = frozenset({
     "wave_stat_metric",
     "flicker_layout",
     "forecast_model",
+    "meteo_wsdi_csdi",
 })
+
+SPELL_OFF = "Off"
+SPELL_LABELS = (SPELL_OFF, "6 days", "15 days", "30 days")
+
+METEO_COUNT_ALL = "All anomaly days"
+METEO_COUNT_SPELL = "Spell days"
+METEO_COUNT_OPTIONS = (METEO_COUNT_ALL, METEO_COUNT_SPELL)
+
+# Consecutive-day lookback for persistence maps and the heat/cold-spell overlay.
+# Count is unbroken from the map date backward; one sub-threshold day resets.
+# 100 days covers long Mediterranean warm spells (2 m temperature, not SST).
+PERSISTENCE_MAX_DAYS = 100
+PERSISTENCE_LOOKBACK_PAD = 5  # extra days loaded so calendar gaps don't shrink the kept window
+# Colour-bar range for the persistence map. Counts still run to PERSISTENCE_MAX_DAYS;
+# values beyond this saturate so typical land spells remain readable.
+PERSISTENCE_COLORBAR_DAYS = 30
 
 STANDARD_DEFAULTS = {
     "map_var": "Mean Temperature (TG)",
     "map_view": MAP_VIEW_DAILY,
     "persist_metric": "Strong",
-    "hatching": True,
+    "analysis_level": "Strong",
+    "hatching": False,
+    "spell_label": SPELL_OFF,
+    "spell_days": 6,
     "mslp": True,
     "z500": False,
     "meteo_var": "Mean Temp (TG)",
     "meteo_env": "Strong",
+    "meteo_count": METEO_COUNT_ALL,
     "wave_thresh": "Strong",
     "wave_stat_metric": "Cumulative Annual Wave Intensity",
     "map_layout": LAYOUT_SIDE_BY_SIDE,
 }
 
-MAP_VAR_LABELS = {"TG": "Mean Temperature", "TX": "Maximum Temperature", "TN": "Minimum Temperature"}
+MAP_VAR_LABELS = {
+    "TG": "Mean Temperature",
+    "TX": "Maximum Temperature",
+    "TN": "Minimum Temperature",
+    "T850": "850 hPa Temperature",
+}
+MAP_VAR_OPTIONS = (
+    "Mean Temperature (TG)",
+    "Maximum Temperature (TX)",
+    "Minimum Temperature (TN)",
+    "850 hPa Temperature (T850)",
+)
+
+
+def meteo_var_code(meteo_var: str) -> str:
+    """Map a sidebar/map label to TX | TN | TG | T850."""
+    raw = str(meteo_var)
+    if "T850" in raw:
+        return "T850"
+    if "TX" in raw:
+        return "TX"
+    if "TN" in raw:
+        return "TN"
+    return "TG"
+
+
+EPOCH_LABELS: dict[str, str] = {"A": "1961–1990", "B": "1996–2025"}
+EPOCH_PERIOD_NAME: dict[str, str] = {
+    "A": "Historical Reference Period",
+    "B": "Recent Reference Period",
+}
+
+
+def epoch_period_label(epoch: str) -> str:
+    """UI title shared by Map Tracker, Meteogram, and Wavogram."""
+    key = "A" if str(epoch).upper().startswith("A") else "B"
+    return f"{EPOCH_PERIOD_NAME[key]} ({EPOCH_LABELS[key]})"
+
+
+def epoch_from_label(text: str) -> str:
+    """Parse a radio/title string to epoch A or B (do not use `'A' in label`)."""
+    raw = str(text)
+    if "1961" in raw or "Historical" in raw:
+        return "A"
+    return "B"
 
 FORECAST_OFFSET_MIN = -7
 FORECAST_OFFSET_MAX = 3

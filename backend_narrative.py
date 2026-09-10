@@ -25,8 +25,37 @@ import numpy as np
 import streamlit as st
 
 from backend_waves import get_wave_historical_rank
+from config import EPOCH_LABELS, epoch_from_label, epoch_period_label
 
-EPOCH_LABELS: dict[str, str] = {"A": "1961–1990", "B": "1996–2025"}
+# Same wording as the Map Tracker banner chips (page_map_tracker._WARM_PLAIN).
+WARM_CONDITION = {
+    "moderate": "warmer than average (P75)",
+    "strong": "much warmer than average (P90)",
+    "extreme": "extremely warm (P95)",
+    "record": "at an all-time warm record",
+}
+COLD_CONDITION = {
+    "moderate": "colder than average (P25)",
+    "strong": "much colder than average (P10)",
+    "extreme": "extremely cold (P5)",
+    "record": "at an all-time cold record",
+}
+
+
+def point_condition_phrase(tier: str, direction: str | None) -> str:
+    """Predicate after 'is currently …' — matches Map Tracker terminology."""
+    if not direction or tier == "normal":
+        return "within the normal range"
+    table = WARM_CONDITION if direction == "warm" else COLD_CONDITION
+    return table.get(tier, f"{tier} {direction}")
+
+
+def baseline_against_lead(epoch: str) -> str:
+    """Opening clause used by Map Tracker flicker/compare banners."""
+    label = EPOCH_LABELS.get(epoch, epoch)
+    if epoch == "A":
+        return f"Against the colder historical baseline ({label})"
+    return f"Against the warmer recent baseline ({label})"
 
 # Mask codes as produced by app.py::_build_display_mask(). Codes are ordinal
 # by severity WITHIN each direction: warm ascends 5->8, cold descends 4->1.
@@ -276,29 +305,21 @@ def render_point_meteogram_narrative(
     cat_b, dir_b = classify_point_severity(value, p_warm_b, p_cold_b)
 
     if ui_state == "single_baseline":
-        if cat_b == "normal":
-            st.markdown(
-                f"The area of **{location_name}** is currently within its normal range relative to "
-                f"the **{EPOCH_LABELS['B']}** baseline."
-            )
-        else:
-            st.markdown(
-                f"The area of **{location_name}** is currently experiencing **{cat_b} {dir_b}** "
-                f"conditions relative to the **{EPOCH_LABELS['B']}** baseline."
-            )
+        phrase = point_condition_phrase(cat_b, dir_b)
+        st.markdown(
+            f"{baseline_against_lead('B')}, the area of **{location_name}** "
+            f"is currently {phrase}."
+        )
         return cat_b, dir_b
 
     if ui_state == "compare_baselines":
         if p_warm_a is None or p_cold_a is None:
             raise ValueError("compare_baselines requires p_warm_a/p_cold_a thresholds")
         cat_a, dir_a = classify_point_severity(value, p_warm_a, p_cold_a)
-
-        b_txt = "within its normal range" if cat_b == "normal" else f"**{cat_b} {dir_b}** conditions"
-        a_txt = "within its normal range" if cat_a == "normal" else f"**{cat_a} {dir_a}** conditions"
         st.markdown(
-            f"The area of **{location_name}** is currently experiencing {b_txt} relative to the "
-            f"**{EPOCH_LABELS['B']}** baseline. However, compared to the historical **{EPOCH_LABELS['A']}** "
-            f"baseline, this equates to {a_txt}."
+            f"{baseline_against_lead('A')}, the area of **{location_name}** "
+            f"is currently {point_condition_phrase(cat_a, dir_a)}. "
+            f"{baseline_against_lead('B')}, it is {point_condition_phrase(cat_b, dir_b)}."
         )
         return (cat_b, dir_b), (cat_a, dir_a)
 

@@ -112,7 +112,7 @@ from config import (
 
 OUTPUT_DIR = DATA_ROOT / "Precomputed_Analytics"
 
-MAP_VAR_CODES = ("TG", "TX", "TN")
+MAP_VAR_CODES = ("TG", "TX", "TN", "T850")
 EPOCHS = ("A", "B")
 THRESHOLDS = ("Moderate", "Strong", "Extreme", "All-Time Record")
 
@@ -155,7 +155,7 @@ def precompute_offset(offset: int, anchor_date: pd.Timestamp, ref_clim) -> None:
     try:
         map_phys_data, map_time_meta = fetch_cached_synoptic_data(
             target_date_str, anchor_date_str, forecast_model=FORECAST_MODEL_IFS,
-            needed_vars=("tx", "tn", "tg"),
+            needed_vars=("tx", "tn", "tg", "t850"),
         )
     except Exception as exc:
         print(f"  SKIPPED {target_date_str} (loader error: {exc})")

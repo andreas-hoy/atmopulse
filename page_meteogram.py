@@ -18,9 +18,14 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from backend_narrative import EPOCH_LABELS, classify_point_severity
+from backend_narrative import (
+    classify_point_severity,
+    point_condition_phrase,
+    baseline_against_lead,
+    epoch_period_label,
+    epoch_from_label,
+)
 from atmopulse_theme import (
-    ATMOPULSE_COLD,
     ATMOPULSE_OVERLAY,
     legend_badge_style,
     plotly_typography,
@@ -33,6 +38,7 @@ from config import (
     is_aifs_model,
     selected_forecast_model,
     show_expert,
+    meteo_var_code,
 )
 from backend_io import (
     load_reference_climatology,
@@ -40,7 +46,12 @@ from backend_io import (
     compute_point_thresholds,
     _load_point_archive_series,
 )
-from frontend_plots import get_meteogram_traces, build_yearly_extremes_chart
+from frontend_plots import (
+    get_meteogram_traces,
+    build_yearly_extremes_chart,
+    align_yearly_extremes_yranges,
+    st_plotly_press,
+)
 
 
 def _severity_phrase_html(cat: str, direction: str | None, phrase: str) -> str:
@@ -62,7 +73,7 @@ def _render_html(body: str) -> None:
         st.markdown(body, unsafe_allow_html=True)
 
 
-def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, target_date):
+def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, target_date, meteo_spell=False):
     ref_clim = load_reference_climatology()
     if ref_clim is None:
         st.error("Reference Climatology missing or corrupted! Please rebuild.")
@@ -79,14 +90,14 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
     # position using the SAME key (Streamlit persists the selection
     # across the rerun, so reading it here is safe).
     if map_layout == LAYOUT_FLICKER:
-        met_active_epoch = "A" if "A" in st.session_state.get("met_ep", "B (1996–2025)") else "B"
-    if is_aifs_model() and meteo_var in ("Max Temp (TX)", "Min Temp (TN)"):
+        met_active_epoch = epoch_from_label(st.session_state.get("met_ep", epoch_period_label("B")))
+    if is_aifs_model() and meteo_var_code(meteo_var) in ("TX", "TN"):
         st.warning(AIFS_TXTN_WARNING)
     else:
         with st.spinner("Fetching Meteogram data..."): 
             df_live = get_live_point_series(lat_target, lon_target, selected_forecast_model())
         if not df_live.empty:
-            col_target = 'TG' if meteo_var == "Mean Temp (TG)" else ('TX' if meteo_var == "Max Temp (TX)" else 'TN')
+            col_target = meteo_var_code(meteo_var)
 
             # --- STRICT DATETIME INDEXING for "current conditions" ---
             # Never .max()/.mean() over the series, and never a bare
@@ -120,7 +131,7 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
 
             if col_target in df_indexed.columns:
                 value_now = float(current_row[col_target])
-            elif 'TX' in df_indexed.columns and 'TN' in df_indexed.columns:
+            elif col_target != "T850" and 'TX' in df_indexed.columns and 'TN' in df_indexed.columns:
                 value_now = float((current_row['TX'] + current_row['TN']) / 2.0)
             else:
                 value_now = np.nan
@@ -140,45 +151,26 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
             percentiles_b = compute_point_thresholds(ref_clim, lat_target, lon_target, current_row_date, meteo_var, "B")
             cat_a, dir_a = classify_point_severity(value_now, *percentiles_a)
             cat_b, dir_b = classify_point_severity(value_now, *percentiles_b)
-            condition_a = f"{cat_a} {dir_a}" if dir_a else "normal"
-            condition_b = f"{cat_b} {dir_b}" if dir_b else "normal"  # e.g. "extreme warm", "moderate cold", "normal"
+            addr = html.escape(location.address)
 
             if map_layout == LAYOUT_FLICKER:
-                # Single-baseline state: narrate strictly the ACTIVE epoch (the one the
-                # Flicker radio below is actually showing) — never a hardcoded baseline.
                 cat_x, dir_x = (cat_a, dir_a) if met_active_epoch == "A" else (cat_b, dir_b)
-                condition_x = condition_a if met_active_epoch == "A" else condition_b
-                x_txt = "within its normal range" if condition_x == "normal" else f"{condition_x} conditions"
-                condition_string = (
-                    f"The area of {location.address} is currently experiencing {x_txt} relative to "
-                    f"the {EPOCH_LABELS[met_active_epoch]} baseline."
-                )
-                if condition_x in ("record warm", "extreme warm", "strong warm"):
-                    st.error(condition_string, icon="🔥")
-                elif condition_x == "moderate warm":
-                    st.warning(condition_string)
-                elif condition_x in ("record cold", "extreme cold", "strong cold"):
-                    st.info(condition_string, icon="❄️")
-                elif condition_x == "moderate cold":
-                    st.markdown(
-                        f"""<div style="background-color:{ATMOPULSE_COLD['p25']}; color:#003554;
-                        padding:0.75rem 1rem; border-radius:0.5rem;">🧊 {html.escape(condition_string)}</div>""",
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.success(condition_string, icon="✅")
-            else:
-                # Two chips, one per baseline — same colours as the meteogram legend.
-                a_txt = "within its normal range" if condition_a == "normal" else f"{condition_a} conditions"
-                b_txt = "within its normal range" if condition_b == "normal" else f"{condition_b} conditions"
-                a_html = _severity_phrase_html(cat_a, dir_a, a_txt)
-                b_html = _severity_phrase_html(cat_b, dir_b, b_txt)
-                addr = html.escape(location.address)
+                chip = _severity_phrase_html(cat_x, dir_x, point_condition_phrase(cat_x, dir_x))
+                lead = html.escape(baseline_against_lead(met_active_epoch))
                 _render_html(
                     f"<div class='atmopulse-narrative-banner'>"
-                    f"The area of {addr} is currently experiencing {a_html} relative to the "
-                    f"historical {EPOCH_LABELS['A']} baseline. Compared to the recent {EPOCH_LABELS['B']} "
-                    f"climate state, this equates to {b_html}."
+                    f"{lead}, the area of {addr} is currently{chip}."
+                    f"</div>"
+                )
+            else:
+                a_html = _severity_phrase_html(cat_a, dir_a, point_condition_phrase(cat_a, dir_a))
+                b_html = _severity_phrase_html(cat_b, dir_b, point_condition_phrase(cat_b, dir_b))
+                lead_a = html.escape(baseline_against_lead("A"))
+                lead_b = html.escape(baseline_against_lead("B"))
+                _render_html(
+                    f"<div class='atmopulse-narrative-banner'>"
+                    f"{lead_a}, the area of {addr} is currently{a_html}. "
+                    f"{lead_b}, it is{b_html}."
                     f"</div>"
                 )
 
@@ -212,7 +204,13 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
             )
             
             if map_layout == LAYOUT_SIDE_BY_SIDE:
-                fig = make_subplots(rows=1, cols=2, subplot_titles=("Reference Period A (1961–1990)", "Reference Period B (1996–2025)"), shared_yaxes=True)
+                fig = make_subplots(
+                    rows=1, cols=2, shared_yaxes=True,
+                    subplot_titles=(
+                        f"{epoch_period_label('A').replace(' (', '<br>(')}",
+                        f"{epoch_period_label('B').replace(' (', '<br>(')}",
+                    ),
+                )
                 for trace in traces_a: 
                     fig.add_trace(trace, row=1, col=1)
                 for trace in traces_b: 
@@ -221,25 +219,36 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
                 fig.add_vline(x=tgt_dt_norm.timestamp() * 1000, line_dash="dash", line_color="gray", opacity=0.8, row=1, col=1)
                 fig.add_vline(x=tgt_dt_norm.timestamp() * 1000, line_dash="dash", line_color="gray", opacity=0.8, row=1, col=2)
                 fig.update_xaxes(dtick="M2", tickformat="%b\n%Y", hoverformat="%d.%m.%Y", showgrid=True, gridcolor=ATMOPULSE_OVERLAY['grid'])
-                fig.update_yaxes(range=[global_min, global_max])
-                fig.update_layout(**plotly_typography(), hovermode="x", height=500, template="plotly_white", margin=dict(t=40, b=10), showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
+                fig.update_yaxes(range=[global_min, global_max], row=1, col=1)
+                fig.update_yaxes(range=[global_min, global_max], row=1, col=2)
+                fig.update_layout(**plotly_typography(), hovermode="x", height=520, template="plotly_white", margin=dict(t=56, b=10), showlegend=False)
+                live_csv = df_live.to_csv(index=False)
+                st_plotly_press(fig, "meteogram_compare", csv_text=live_csv)
+                st.markdown("<div class='atmopulse-meteo-yearly-gap'></div>", unsafe_allow_html=True)
                 
+                fig_yr_a = build_yearly_extremes_chart(lat_target, lon_target, "A", col_target, wsdi=meteo_spell, csdi=meteo_spell, _ref_clim=ref_clim, _load_point_archive_series=_load_point_archive_series)
+                fig_yr_b = build_yearly_extremes_chart(lat_target, lon_target, "B", col_target, wsdi=meteo_spell, csdi=meteo_spell, _ref_clim=ref_clim, _load_point_archive_series=_load_point_archive_series)
+                align_yearly_extremes_yranges(fig_yr_a, fig_yr_b)
                 c1, c2 = st.columns(2)
                 with c1: 
-                    st.plotly_chart(build_yearly_extremes_chart(lat_target, lon_target, "A", meteo_var != "Min Temp (TN)", _ref_clim=ref_clim, _load_point_archive_series=_load_point_archive_series), use_container_width=True)
+                    st_plotly_press(fig_yr_a, "yearly_historical")
                 with c2: 
-                    st.plotly_chart(build_yearly_extremes_chart(lat_target, lon_target, "B", meteo_var != "Min Temp (TN)", _ref_clim=ref_clim, _load_point_archive_series=_load_point_archive_series), use_container_width=True)
+                    st_plotly_press(fig_yr_b, "yearly_recent")
             else:
                 # Same widget key ("met_ep") whose value we already read into
                 # `met_active_epoch` above (before the narrative text was built) —
                 # re-rendering it here just places it at its usual spot below the chart.
-                flicker_epoch = st.radio("Select Reference Period:", ("A (1961–1990)", "B (1996–2025)"), horizontal=True, key="met_ep", index=1)
-                met_active_epoch = "A" if "A" in flicker_epoch else "B"
+                flicker_epoch = st.radio(
+                    "Select Reference Period:",
+                    (epoch_period_label("A"), epoch_period_label("B")),
+                    horizontal=True, key="met_ep", index=1,
+                )
+                met_active_epoch = epoch_from_label(flicker_epoch)
                 fig = go.Figure(data=traces_a if met_active_epoch == "A" else traces_b)
                 fig.add_vline(x=tgt_dt_norm.timestamp() * 1000, line_dash="dash", line_color="gray", opacity=0.8)
                 fig.update_xaxes(dtick="M2", tickformat="%b\n%Y", hoverformat="%d.%m.%Y", showgrid=True, gridcolor=ATMOPULSE_OVERLAY['grid'])
                 fig.update_yaxes(range=[global_min, global_max])
-                fig.update_layout(**plotly_typography(), title=f"Reference Period {EPOCH_LABELS[met_active_epoch]}", hovermode="x", height=500, template="plotly_white", margin=dict(t=40, b=10), showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
-                st.plotly_chart(build_yearly_extremes_chart(lat_target, lon_target, met_active_epoch, meteo_var != "Min Temp (TN)", _ref_clim=ref_clim, _load_point_archive_series=_load_point_archive_series), use_container_width=True)
+                fig.update_layout(**plotly_typography(), title=epoch_period_label(met_active_epoch), hovermode="x", height=500, template="plotly_white", margin=dict(t=40, b=10), showlegend=False)
+                st_plotly_press(fig, f"meteogram_{met_active_epoch}", csv_text=df_live.to_csv(index=False))
+                st.markdown("<div class='atmopulse-meteo-yearly-gap'></div>", unsafe_allow_html=True)
+                st_plotly_press(build_yearly_extremes_chart(lat_target, lon_target, met_active_epoch, col_target, wsdi=meteo_spell, csdi=meteo_spell, _ref_clim=ref_clim, _load_point_archive_series=_load_point_archive_series), f"yearly_{met_active_epoch}")

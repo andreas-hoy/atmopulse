@@ -30,7 +30,6 @@ from geopy.geocoders import Nominatim
 
 from backend_maps import etccdi_doy_365
 from backend_waves import compute_kysely_waves_data, get_wave_historical_rank
-from frontend_plots import build_kysely_wave_figs
 from labels import HELP
 from atmopulse_theme import (
     ATMOPULSE_BRAND,
@@ -58,6 +57,11 @@ from config import (
     NAV_ITEMS,
     NAV_ANALYTICS,
     STANDARD_DEFAULTS,
+    SPELL_OFF,
+    SPELL_LABELS,
+    MAP_VAR_OPTIONS,
+    METEO_COUNT_OPTIONS,
+    METEO_COUNT_SPELL,
     FORECAST_OFFSET_MIN,
     FORECAST_OFFSET_MAX,
     SLIDER_PAD_PAST,
@@ -66,10 +70,13 @@ from config import (
     is_aifs_model,
     show_expert,
     is_daily_map_view,
+    epoch_period_label,
+    epoch_from_label,
 )
 from frontend_widgets import render_grid_cell_profile
 from page_map_tracker import render_map_tracker
 from page_meteogram import render_meteogram
+from frontend_plots import st_plotly_press
 
 
 # --- WAVE CACHE WRAPPER ---
@@ -86,6 +93,7 @@ def _compute_wave_payload(lat_target, lon_target, param_code, selected_epoch, wa
 
 
 def fetch_wave_figs(lat_target, lon_target, param_code, selected_epoch, wave_thresh, wave_stat_metric, _axis_version=4):
+    from frontend_plots import build_kysely_wave_figs
     payload = _compute_wave_payload(lat_target, lon_target, param_code, selected_epoch, wave_thresh, wave_stat_metric, _axis_version=_axis_version)
     return build_kysely_wave_figs(payload)
 
@@ -313,11 +321,11 @@ with st.sidebar:
         toggles = {}
         
         if nav_selection == NAV_MAP:
-            st.markdown("---")
             if show_expert("map_tx_tn"):
+                st.markdown("---")
                 map_var = st.radio(
                     "**Mapped Variable:**",
-                    ("Mean Temperature (TG)", "Maximum Temperature (TX)", "Minimum Temperature (TN)"),
+                    MAP_VAR_OPTIONS,
                     index=0,
                     help=HELP["map_variable"],
                 )
@@ -325,9 +333,9 @@ with st.sidebar:
                 map_var = STANDARD_DEFAULTS["map_var"]
             map_var_code = map_var.split('(')[1].strip(')')
             
-            st.markdown("---")
             persist_metric = STANDARD_DEFAULTS["persist_metric"]
             if show_expert("persistence_view"):
+                st.markdown("---")
                 view_mode = st.radio(
                     "**Map view:**",
                     (MAP_VIEW_DAILY, MAP_VIEW_PERSISTENCE),
@@ -335,8 +343,17 @@ with st.sidebar:
                 )
             else:
                 view_mode = STANDARD_DEFAULTS["map_view"]
-            st.markdown("---")
-            top10_threshold = st.radio("**Analysis Level**", ("Moderate", "Strong", "Extreme", "All-Time Record"), index=1, help=HELP["map_analysis_level"])
+            if show_expert("map_analysis_level"):
+                st.markdown("---")
+                top10_threshold = st.radio(
+                    "**Analysis Level**",
+                    ("Moderate", "Strong", "Extreme", "All-Time Record"),
+                    index=1,
+                    help=HELP["map_analysis_level"],
+                )
+            else:
+                top10_threshold = STANDARD_DEFAULTS["analysis_level"]
+            persist_metric = top10_threshold
             
             if is_daily_map_view(view_mode):
                 st.markdown("---")
@@ -386,30 +403,50 @@ with st.sidebar:
                         for k in st.session_state.toggles_cold:
                             st.session_state.toggles_cold[k] = True
                 st.markdown("---")
-                toggles["hatching"] = st.checkbox(
-                    "Show 6-Day WSDI/CSDI Overlay",
-                    value=STANDARD_DEFAULTS["hatching"],
+                spell_choice = st.selectbox(
+                    "Warm/cold spells",
+                    SPELL_LABELS,
+                    index=SPELL_LABELS.index(STANDARD_DEFAULTS["spell_label"]),
+                    key="map_heat_cold_spells",
                     help=HELP["wsdi_csdi_overlay"],
                 )
-            else:
-                st.markdown("---")
-                st.markdown("**Persistence Visualization**")
-                persist_metric = st.radio("Select intensity level:", ("Moderate", "Strong", "Extreme", "All-Time Record"), index=1, help=HELP["persistence_intensity"])
-                
+                toggles["hatching"] = spell_choice != SPELL_OFF
+                toggles["spell_days"] = (
+                    int(spell_choice.split()[0]) if spell_choice != SPELL_OFF else STANDARD_DEFAULTS["spell_days"]
+                )
+
             st.markdown("---")
-            toggles["mslp"] = st.checkbox("Show MSLP Contours", value=STANDARD_DEFAULTS["mslp"], help=HELP["mslp_contours"])
-            if show_expert("z500"):
-                toggles["z500"] = st.checkbox("Show Z500 Contours", value=STANDARD_DEFAULTS["z500"], help=HELP["z500_contours"])
-            else:
-                toggles["z500"] = STANDARD_DEFAULTS["z500"]
+            with st.container(key="map_synoptic_overlays"):
+                toggles["mslp"] = st.checkbox(
+                    "Sea-level pressure",
+                    value=STANDARD_DEFAULTS["mslp"],
+                    help=HELP["mslp_contours"],
+                    key="map_overlay_mslp",
+                )
+                if show_expert("z500"):
+                    # Leading word-joiner: Streamlit markdown otherwise treats a
+                    # label that starts with digits as a numbered list and renders
+                    # it at a larger size than the MSLP checkbox.
+                    toggles["z500"] = st.checkbox(
+                        "\u200b500 hPa height",
+                        value=STANDARD_DEFAULTS["z500"],
+                        help=HELP["z500_contours"],
+                        key="map_overlay_z500",
+                    )
+                else:
+                    toggles["z500"] = STANDARD_DEFAULTS["z500"]
             
         elif nav_selection in (NAV_METEO, NAV_WAVE):
             st.markdown("---")
             st.markdown("**Location Settings**")
             
             if nav_selection == NAV_METEO:
-                if show_expert("meteo_tx_tn"):
-                    meteo_var = st.radio("Variable:", ["Mean Temp (TG)", "Max Temp (TX)", "Min Temp (TN)"])
+                if show_expert("meteo_tx_tn") or show_expert("t850"):
+                    meteo_var = st.radio(
+                        "Variable:",
+                        MAP_VAR_OPTIONS,
+                        help=HELP["map_variable"],
+                    )
                 else:
                     meteo_var = STANDARD_DEFAULTS["meteo_var"]
                 if show_expert("meteo_envelope"):
@@ -417,6 +454,16 @@ with st.sidebar:
                     meteo_env = st.selectbox("Background Envelope:", ["Moderate", "Strong", "Extreme", "All-Time"], index=1, help=HELP["meteogram_envelope"])
                 else:
                     meteo_env = STANDARD_DEFAULTS["meteo_env"]
+                if show_expert("meteo_wsdi_csdi"):
+                    meteo_count = st.radio(
+                        "Select between:",
+                        METEO_COUNT_OPTIONS,
+                        help=HELP["meteo_annual_count"],
+                        key="meteo_annual_count",
+                    )
+                    meteo_spell = meteo_count == METEO_COUNT_SPELL
+                else:
+                    meteo_spell = False
             
             if nav_selection == NAV_WAVE:
                 wave_focus = st.radio("Wave Event Type:", ("Heatwaves", "Coldwaves"), index=default_wave_idx, help=HELP["wave_event_type"])
@@ -442,7 +489,7 @@ if nav_selection == NAV_WELCOME:
     <br><br>
     #### The Importance of Event Duration
     The impact of extreme temperatures on sectors like human health, agriculture and infrastructure scales drastically with duration. A single hot day is a weather event; a prolonged sequence becomes a systemic hazard. 
-    In the **Map Tracker** tab, you can visualize this through the **Cumulative Persistence** layer, showing how many days an extreme event has lasted. By default, the maps also display an overlay for **WSDI and CSDI** conditions.
+    In the **Map Tracker** tab, you can visualize this through the **Persistence duration** layer, showing how many consecutive days an extreme has lasted (unbroken run back from the map date, up to 100 days). Daily maps can optionally show a **warm/cold spell** overlay for 6, 15 or 30 consecutive days (off by default; enable it in the sidebar). 6 days matches the WSDI/CSDI definition.
     <br><br>
     #### Local Wave Definitions
     In the **Point Wavogram** tab, {atmopulse_wordmark_html()} uses a sophisticated definition (adapted from Kyselý) to track seasonally-bound heatwaves and coldwaves:
@@ -530,7 +577,10 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
     if location:
         render_grid_cell_profile(location.address, lat_target, lon_target)
         if nav_selection == NAV_METEO:
-            render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, target_date)
+            render_meteogram(
+                location, lat_target, lon_target, meteo_var, meteo_env, target_date,
+                meteo_spell=meteo_spell,
+            )
 
         elif nav_selection == NAV_WAVE:
             if show_expert("flicker_layout"):
@@ -619,15 +669,20 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                 if map_layout == LAYOUT_SIDE_BY_SIDE:
                     w_col1, w_col2 = st.columns(2)
                     with w_col1:
-                        st.plotly_chart(fig_m_a, use_container_width=True)
-                        st.plotly_chart(fig_s_a, use_container_width=True)
+                        st_plotly_press(fig_m_a, "wavogram_ridge_historical")
+                        st_plotly_press(fig_s_a, "wavogram_stats_historical")
                     with w_col2:
-                        st.plotly_chart(fig_m_b, use_container_width=True)
-                        st.plotly_chart(fig_s_b, use_container_width=True)
+                        st_plotly_press(fig_m_b, "wavogram_ridge_recent")
+                        st_plotly_press(fig_s_b, "wavogram_stats_recent")
                 else:
-                    flicker_epoch = st.radio("Select Reference Period:", ("A (1961–1990)", "B (1996–2025)"), horizontal=True, key="wave_ep", index=1)
-                    st.plotly_chart(fig_m_a if "A" in flicker_epoch else fig_m_b, use_container_width=True)
-                    st.plotly_chart(fig_s_a if "A" in flicker_epoch else fig_s_b, use_container_width=True)
+                    flicker_epoch = st.radio(
+                        "Select Reference Period:",
+                        (epoch_period_label("A"), epoch_period_label("B")),
+                        horizontal=True, key="wave_ep", index=1,
+                    )
+                    use_a = epoch_from_label(flicker_epoch) == "A"
+                    st_plotly_press(fig_m_a if use_a else fig_m_b, f"wavogram_ridge_{'A' if use_a else 'B'}")
+                    st_plotly_press(fig_s_a if use_a else fig_s_b, f"wavogram_stats_{'A' if use_a else 'B'}")
 
 elif nav_selection == NAV_METHODS:
     methods_md = _load_markdown_page(METHODS_MD)

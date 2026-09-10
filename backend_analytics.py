@@ -46,7 +46,10 @@ def _synoptic_temp_pair(map_phys_data):
     if tg is not None:
         arr = _synoptic_array(tg)
         return arr, arr
-    sample = next((map_phys_data[k] for k in ("mslp", "z500") if k in map_phys_data), None)
+    sample = next(
+        (map_phys_data[k] for k in ("mslp", "z500", "t850", "tg", "tx") if k in map_phys_data),
+        None,
+    )
     if sample is None:
         return None, None
     nan = np.full(np.asarray(getattr(sample, "values", sample)).shape, np.nan)
@@ -58,8 +61,45 @@ def _synoptic_lonlat(map_phys_data):
         return None, None
     if "_lons" in map_phys_data and "_lats" in map_phys_data:
         return np.asarray(map_phys_data["_lons"]), np.asarray(map_phys_data["_lats"])
-    sample = map_phys_data.get("mslp", map_phys_data.get("tg", map_phys_data.get("tx")))
+    sample = map_phys_data.get(
+        "mslp", map_phys_data.get("tg", map_phys_data.get("tx", map_phys_data.get("t850")))
+    )
     return np.asarray(sample.longitude.values), np.asarray(sample.latitude.values)
+
+
+def _map_var_threshold_arrays(map_var, map_phys_data, safe_get, suffix, tx, tn):
+    """Current field plus P95/P90/P75/P25/P10/P5 for the selected mapped variable."""
+    if map_var == "TX":
+        v_curr, prefix = tx, "tx"
+    elif map_var == "TN":
+        v_curr, prefix = tn, "tn"
+    elif map_var == "T850":
+        raw = map_phys_data.get("t850") if map_phys_data else None
+        v_curr = _synoptic_array(raw) if raw is not None else None
+        prefix = "t850"
+    else:
+        tg = map_phys_data.get("tg") if map_phys_data else None
+        v_curr = _synoptic_array(tg) if tg is not None else (tx + tn) / 2.0
+        return (
+            v_curr,
+            (safe_get(f"tx_p95_doy_{suffix}") + safe_get(f"tn_p95_doy_{suffix}")) / 2,
+            (safe_get(f"tx_p90_doy_{suffix}") + safe_get(f"tn_p90_doy_{suffix}")) / 2,
+            (safe_get(f"tx_p75_doy_{suffix}") + safe_get(f"tn_p75_doy_{suffix}")) / 2,
+            (safe_get(f"tx_p25_doy_{suffix}") + safe_get(f"tn_p25_doy_{suffix}")) / 2,
+            (safe_get(f"tx_p10_doy_{suffix}") + safe_get(f"tn_p10_doy_{suffix}")) / 2,
+            (safe_get(f"tx_p5_doy_{suffix}") + safe_get(f"tn_p5_doy_{suffix}")) / 2,
+        )
+    if v_curr is None:
+        return (None,) * 7
+    return (
+        v_curr,
+        safe_get(f"{prefix}_p95_doy_{suffix}"),
+        safe_get(f"{prefix}_p90_doy_{suffix}"),
+        safe_get(f"{prefix}_p75_doy_{suffix}"),
+        safe_get(f"{prefix}_p25_doy_{suffix}"),
+        safe_get(f"{prefix}_p10_doy_{suffix}"),
+        safe_get(f"{prefix}_p5_doy_{suffix}"),
+    )
 
 
 def _build_display_mask(v_curr, v_p95, v_p90, v_p75, v_p25, v_p10, v_p5, v_rec_w, v_rec_c, t_warm, t_cold):
@@ -125,6 +165,8 @@ def _map_historical_records(ref_data, doy: int, target_date, map_var: str, shape
         wkey, ckey, wd, cd = "tx_max_val", "tx_min_val", "tx_max_date", "tx_min_date"
     elif map_var == "TN":
         wkey, ckey, wd, cd = "tn_max_val", "tn_min_val", "tn_max_date", "tn_min_date"
+    elif map_var == "T850":
+        wkey, ckey, wd, cd = "t850_max_val", "t850_min_val", "t850_max_date", "t850_min_date"
     else:
         wkey, ckey, wd, cd = "tg_max_val", "tg_min_val", "tg_max_date", "tg_min_date"
     if wkey not in daily_ref or ckey not in daily_ref:
@@ -231,35 +273,26 @@ def _calc_compute_map_footprint_raw(_ref_data, _map_phys_data, target_date_str, 
     anchor_date = pd.Timestamp(anchor_date_str) if anchor_date_str else None
     suffix, doy = ("A" if baseline_type == "A" else "B"), etccdi_doy_365(target_date)
     tx_curr, tn_curr = _synoptic_temp_pair(_map_phys_data)
-    if tx_curr is None or tn_curr is None:
-        return None
     lons, lats = _synoptic_lonlat(_map_phys_data)
+    if lons is None or lats is None:
+        return None
+    if map_var != "T850" and (tx_curr is None or tn_curr is None):
+        return None
     daily_ref = _ref_data.sel(dayofyear=doy).reindex(latitude=lats, longitude=lons, method="nearest")
+    shape = tx_curr.shape if tx_curr is not None else (len(lats), len(lons))
 
     def safe_get(var_key, fallback=np.nan):
         if var_key in daily_ref.variables:
             return daily_ref[var_key].values
-        return np.full(tx_curr.shape, fallback)
+        return np.full(shape, fallback)
 
-    if map_var == "TX":
-        v_curr = tx_curr
-        v_p95, v_p90, v_p75 = safe_get(f'tx_p95_doy_{suffix}'), safe_get(f'tx_p90_doy_{suffix}'), safe_get(f'tx_p75_doy_{suffix}')
-        v_p25, v_p10, v_p5 = safe_get(f'tx_p25_doy_{suffix}'), safe_get(f'tx_p10_doy_{suffix}'), safe_get(f'tx_p5_doy_{suffix}')
-    elif map_var == "TN":
-        v_curr = tn_curr
-        v_p95, v_p90, v_p75 = safe_get(f'tn_p95_doy_{suffix}'), safe_get(f'tn_p90_doy_{suffix}'), safe_get(f'tn_p75_doy_{suffix}')
-        v_p25, v_p10, v_p5 = safe_get(f'tn_p25_doy_{suffix}'), safe_get(f'tn_p10_doy_{suffix}'), safe_get(f'tn_p5_doy_{suffix}')
-    else:
-        tg_curr = _map_phys_data.get("tg")
-        v_curr = _synoptic_array(tg_curr) if tg_curr is not None else (tx_curr + tn_curr) / 2.0
-        v_p95 = (safe_get(f'tx_p95_doy_{suffix}') + safe_get(f'tn_p95_doy_{suffix}')) / 2
-        v_p90 = (safe_get(f'tx_p90_doy_{suffix}') + safe_get(f'tn_p90_doy_{suffix}')) / 2
-        v_p75 = (safe_get(f'tx_p75_doy_{suffix}') + safe_get(f'tn_p75_doy_{suffix}')) / 2
-        v_p25 = (safe_get(f'tx_p25_doy_{suffix}') + safe_get(f'tn_p25_doy_{suffix}')) / 2
-        v_p10 = (safe_get(f'tx_p10_doy_{suffix}') + safe_get(f'tn_p10_doy_{suffix}')) / 2
-        v_p5 = (safe_get(f'tx_p5_doy_{suffix}') + safe_get(f'tn_p5_doy_{suffix}')) / 2
+    v_curr, v_p95, v_p90, v_p75, v_p25, v_p10, v_p5 = _map_var_threshold_arrays(
+        map_var, _map_phys_data, safe_get, suffix, tx_curr, tn_curr,
+    )
+    if v_curr is None:
+        return None
 
-    v_rec_w, v_rec_c, _, _ = _map_historical_records(_ref_data, doy, target_date, map_var, tx_curr.shape, anchor_date)
+    v_rec_w, v_rec_c, _, _ = _map_historical_records(_ref_data, doy, target_date, map_var, v_curr.shape, anchor_date)
     mask = _build_display_mask(v_curr, v_p95, v_p90, v_p75, v_p25, v_p10, v_p5, v_rec_w, v_rec_c, t_warm, t_cold)
     valid_domain = np.isfinite(v_curr)
     lon2d, lat2d = np.meshgrid(lons, lats)
@@ -328,38 +361,30 @@ def _calc_calculate_top10_raw(
     suffix, doy = ("A" if baseline_type == "A" else "B"), etccdi_doy_365(target_date)
     lons, lats = _synoptic_lonlat(_map_phys_data)
     tx, tn = _synoptic_temp_pair(_map_phys_data)
-    if tx is None or tn is None:
+    if map_var != "T850" and (tx is None or tn is None):
         return pd.DataFrame(), pd.DataFrame()
-    heat_mask, cold_mask = np.zeros(tx.shape, dtype=bool), np.zeros(tx.shape, dtype=bool)
+    if lons is None or lats is None:
+        return pd.DataFrame(), pd.DataFrame()
+    heat_mask = np.zeros((len(lats), len(lons)), dtype=bool)
+    cold_mask = np.zeros((len(lats), len(lons)), dtype=bool)
 
     if is_daily_map_view(view_mode):
         daily_ref = _ref_data.sel(dayofyear=doy).reindex(
             latitude=lats, longitude=lons, method="nearest"
         )
+        shape = tx.shape if tx is not None else (len(lats), len(lons))
+
         def safe_get(var_key, fallback=np.nan):
             if var_key in daily_ref.variables:
                 return daily_ref[var_key].values
-            return np.full(tx.shape, fallback)
+            return np.full(shape, fallback)
 
-        if map_var == "TX":
-            v_curr = tx
-            v_p95, v_p90, v_p75 = safe_get(f'tx_p95_doy_{suffix}'), safe_get(f'tx_p90_doy_{suffix}'), safe_get(f'tx_p75_doy_{suffix}')
-            v_p25, v_p10, v_p5 = safe_get(f'tx_p25_doy_{suffix}'), safe_get(f'tx_p10_doy_{suffix}'), safe_get(f'tx_p5_doy_{suffix}')
-        elif map_var == "TN":
-            v_curr = tn
-            v_p95, v_p90, v_p75 = safe_get(f'tn_p95_doy_{suffix}'), safe_get(f'tn_p90_doy_{suffix}'), safe_get(f'tn_p75_doy_{suffix}')
-            v_p25, v_p10, v_p5 = safe_get(f'tn_p25_doy_{suffix}'), safe_get(f'tn_p10_doy_{suffix}'), safe_get(f'tn_p5_doy_{suffix}')
-        else:
-            tg = _map_phys_data.get("tg")
-            v_curr = _synoptic_array(tg) if tg is not None else (tx + tn) / 2.0
-            v_p95 = (safe_get(f'tx_p95_doy_{suffix}') + safe_get(f'tn_p95_doy_{suffix}')) / 2
-            v_p90 = (safe_get(f'tx_p90_doy_{suffix}') + safe_get(f'tn_p90_doy_{suffix}')) / 2
-            v_p75 = (safe_get(f'tx_p75_doy_{suffix}') + safe_get(f'tn_p75_doy_{suffix}')) / 2
-            v_p25 = (safe_get(f'tx_p25_doy_{suffix}') + safe_get(f'tn_p25_doy_{suffix}')) / 2
-            v_p10 = (safe_get(f'tx_p10_doy_{suffix}') + safe_get(f'tn_p10_doy_{suffix}')) / 2
-            v_p5 = (safe_get(f'tx_p5_doy_{suffix}') + safe_get(f'tn_p5_doy_{suffix}')) / 2
-
-        v_rec_w, v_rec_c, _, _ = _map_historical_records(_ref_data, doy, target_date, map_var, tx.shape, anchor_date)
+        v_curr, v_p95, v_p90, v_p75, v_p25, v_p10, v_p5 = _map_var_threshold_arrays(
+            map_var, _map_phys_data, safe_get, suffix, tx, tn,
+        )
+        if v_curr is None:
+            return pd.DataFrame(), pd.DataFrame()
+        v_rec_w, v_rec_c, _, _ = _map_historical_records(_ref_data, doy, target_date, map_var, v_curr.shape, anchor_date)
 
         display_mask = _build_display_mask(v_curr, v_p95, v_p90, v_p75, v_p25, v_p10, v_p5, v_rec_w, v_rec_c, t_warm, t_cold)
         level = _top10_analysis_key(top10_threshold)

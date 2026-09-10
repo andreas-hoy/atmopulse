@@ -15,23 +15,30 @@ circular import while app.py imports these plot builders from here.
 
 from __future__ import annotations
 
+import hashlib
+import re
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 import streamlit.components.v1 as components
 from scipy.interpolate import make_interp_spline
+from scipy.ndimage import gaussian_filter, maximum_filter, minimum_filter, uniform_filter
 
 from backend_map_locations import EUROPE_BBOX
 from backend_analytics import (
     _build_display_mask,
     _map_historical_records,
+    _map_var_threshold_arrays,
     _synoptic_lonlat,
     _synoptic_temp_pair,
     _yyyymmdd_dot_date_arr,
 )
 from backend_maps import _synoptic_array, etccdi_doy_365
-from backend_io import point_clim_ladder
+from backend_io import load_invariant_fields, point_clim_ladder
+from config import epoch_period_label
 from atmopulse_theme import (
     ATMOPULSE_BRAND,
     ATMOPULSE_COLD,
@@ -46,7 +53,7 @@ from atmopulse_theme import (
     plotly_typography,
     warm_rgba,
 )
-from config import MAP_VAR_LABELS, is_aifs_model, is_daily_map_view, selected_forecast_model
+from config import MAP_VAR_LABELS, PERSISTENCE_COLORBAR_DAYS, is_aifs_model, is_daily_map_view, meteo_var_code, selected_forecast_model
 
 # --- Point Wavogram ridge-plot layout (tune wave shape / break aesthetics
 # here — drawing-only, moved from backend_waves.py so that module stays
@@ -109,7 +116,28 @@ def _wave_break_tail(x_end: float, y_peak: float) -> tuple[np.ndarray, np.ndarra
 
 MAP_VIEW_LON = (EUROPE_BBOX[0], EUROPE_BBOX[2])
 MAP_VIEW_LAT = (EUROPE_BBOX[1], EUROPE_BBOX[3])
-MAP_CONTOUR_LINE_WIDTH = 1.5  # was 2.5 — MSLP / Z500 isolines
+MAP_CONTOUR_LINE_WIDTH = 1.35
+MAP_CONTOUR_LINE_SMOOTHING = 1.15
+_MSLP_CONTOUR_SMOOTH_SIGMA = 2.8
+# Synoptic H/L: only label centres with a closed-system footprint
+# (neighbourhood span of at least one 5 hPa isoline) and keep glyphs apart.
+_MSLP_HL_SMOOTH_SIGMA = 2.5
+_MSLP_HL_NEIGHBORHOOD = 21
+_MSLP_HL_PROM_WINDOW = 45      # background mean; smaller window underestimates broad highs
+_MSLP_HL_RANGE_WINDOW = 41     # ~10°: closed or strongly curved isolines nearby
+_MSLP_HL_MIN_PROMINENCE = 2.0  # hPa vs regional mean
+_MSLP_HL_MIN_RANGE = 4.0       # hPa span; drops flat saddles without isoline structure
+_MSLP_HL_MIN_SEP_SAME = 14.0
+_MSLP_HL_MIN_SEP_CROSS = 7.0
+_MSLP_HL_EDGE_DEG = 0.0
+_MSLP_HL_INSET_DEG = 1.8
+_MSLP_HL_EDGE_BAND = 5.0
+_MSLP_HL_EDGE_PROM = 4.0
+_MSLP_HL_EDGE_RANGE = 8.0
+_MSLP_HL_MAX_LABELS = 2
+_MSLP_HL_STEER_FRAC = 0.60
+_MSLP_HL_VERSION = 7
+MAP_EXTREMES_OPACITY = 0.75
 SYNOPTIC_MAP_CONFIG = {
     "displayModeBar": True,
     "displaylogo": False,
@@ -128,11 +156,15 @@ def _fmt_hover_diff(v) -> str:
 def _fmt_hover_year(v) -> str:
     return str(int(float(v))) if np.isfinite(v) and float(v) > 0 else "N/A"
 
+def _fmt_hover_days(v) -> str:
+    return str(int(round(float(v)))) if np.isfinite(v) else "N/A"
+
 # Vectorized once at module scope (Schritt B): reused by the customdata
 # builders below instead of building a per-cell HTML string grid.
 _vfmt_num = np.vectorize(_fmt_hover_num, otypes=[object])
 _vfmt_diff = np.vectorize(_fmt_hover_diff, otypes=[object])
 _vfmt_year = np.vectorize(_fmt_hover_year, otypes=[object])
+_vfmt_days = np.vectorize(_fmt_hover_days, otypes=[object])
 
 def _build_standard_hovertext(labels, lat2d, lon2d, v_curr, v_rec_w, yr_w, diff_w, v_rec_c, yr_c, diff_c, var_label):
     """DEAD CODE as of Schritt B (kept for reference / potential rollback).
@@ -179,8 +211,8 @@ def _build_map_customdata(v_curr, v_rec_w, yr_w, diff_w, v_rec_c, yr_c, diff_c):
 
 def _build_persistence_customdata(warm, cold):
     """customdata for the Persistence map heatmap, shape (nlat, nlon, 2):
-    [0] warm days, [1] cold days (same 1-decimal "N/A"-safe formatting)."""
-    return np.stack([_vfmt_num(warm), _vfmt_num(cold)], axis=-1)
+    [0] warm days, [1] cold days (integer day counts; spells have no fractions)."""
+    return np.stack([_vfmt_days(warm), _vfmt_days(cold)], axis=-1)
 
 def _map_xaxis_kwargs(**extra):
     # constrain="domain" on X (not Y): if the box is a pixel off the 70:42
@@ -202,19 +234,139 @@ def _add_map_source_label(fig, *, row=None, col=None):
     ann = dict(
         text=f"Data: ERA5/{'AIFS' if is_aifs_model() else 'IFS'}",
         xref="x domain", yref="y domain",
-        x=0.99, y=0.03,
+        x=0.99, y=0.0,
         xanchor="right", yanchor="bottom",
         showarrow=False,
         font=dict(size=10, color=ATMOPULSE_BRAND["text_on_light"], family=ATMOPULSE_FONTS["sora_css"]),
         bgcolor="rgba(255,255,255,0.78)",
         bordercolor="rgba(200,200,200,0.55)",
         borderwidth=1,
-        borderpad=4,
+        borderpad=3,
     )
     if row is None and col is None:
         fig.add_annotation(**ann)
     else:
         fig.add_annotation(**ann, row=row, col=col)
+
+
+def _attach_press_csv(fig: go.Figure, csv_text: str | None) -> None:
+    if not csv_text:
+        return
+    meta = fig.layout.meta
+    payload = dict(meta) if isinstance(meta, dict) else {"press_csv": csv_text}
+    if isinstance(meta, dict):
+        payload["press_csv"] = csv_text
+    fig.update_layout(meta=payload)
+
+
+def _press_stem(stem: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_") or "chart"
+
+
+def _fig_fingerprint(fig: go.Figure) -> str:
+    parts = [
+        str(fig.layout.title.text if fig.layout.title else ""),
+        str(fig.layout.height),
+        str(len(fig.data)),
+    ]
+    for t in fig.data:
+        parts.append(str(getattr(t, "type", "")))
+        for attr in ("z", "y", "x"):
+            val = getattr(t, attr, None)
+            if val is None:
+                continue
+            arr = np.asarray(val)
+            parts.append(attr + str(arr.shape))
+            if arr.size:
+                parts.append(str(arr.flat[0]))
+                parts.append(str(arr.flat[-1]))
+            break
+    return hashlib.md5("|".join(parts).encode("utf-8", errors="ignore")).hexdigest()
+
+
+@st.cache_resource(show_spinner=False)
+def _press_image_store() -> dict:
+    return {}
+
+
+def _kaleido_image(fig: go.Figure, fmt: str) -> bytes:
+    store = _press_image_store()
+    key = (_fig_fingerprint(fig), fmt)
+    cached = store.get(key)
+    if cached is not None:
+        return cached
+    height = int(fig.layout.height) if fig.layout.height else 840
+    width = 1400 if fig.layout.height is None else 1200
+    blob = fig.to_image(format=fmt, width=width, height=height)
+    store[key] = blob
+    return blob
+
+
+def render_press_export(
+    fig: go.Figure, stem: str, csv_text: str | None = None, *, heavy: bool = False,
+) -> None:
+    """Download row under a figure: SVG/PDF (Kaleido) and optional CSV."""
+    if csv_text is None:
+        meta = fig.layout.meta
+        if isinstance(meta, dict):
+            csv_text = meta.get("press_csv")
+    stem = _press_stem(stem)
+    with st.container(key=f"press-row-{stem}"):
+        if heavy and not st.session_state.get(f"press_ready_{stem}"):
+            b1, b2, _ = st.columns([1.1, 1.1, 8], gap="small")
+            with b1:
+                if st.button("Prepare SVG/PDF", key=f"press_go_{stem}"):
+                    st.session_state[f"press_ready_{stem}"] = True
+                    st.rerun()
+            if csv_text:
+                with b2:
+                    st.download_button(
+                        "CSV", data=csv_text.encode("utf-8"),
+                        file_name=f"AtmoPulse_{stem}.csv", mime="text/csv",
+                        key=f"press_{stem}_csv",
+                    )
+            return
+        n = 3 if csv_text else 2
+        cols = st.columns([1.1] * n + [8], gap="small")
+        err = None
+        svg = pdf = None
+        try:
+            with st.spinner("Rendering SVG/PDF…"):
+                svg = _kaleido_image(fig, "svg")
+                pdf = _kaleido_image(fig, "pdf")
+        except Exception as exc:
+            err = str(exc)
+        with cols[0]:
+            if svg:
+                st.download_button(
+                    "SVG", data=svg, file_name=f"AtmoPulse_{stem}.svg",
+                    mime="image/svg+xml", key=f"press_{stem}_svg",
+                )
+            else:
+                st.caption("SVG unavailable")
+        with cols[1]:
+            if pdf:
+                st.download_button(
+                    "PDF", data=pdf, file_name=f"AtmoPulse_{stem}.pdf",
+                    mime="application/pdf", key=f"press_{stem}_pdf",
+                )
+            else:
+                st.caption("PDF unavailable")
+        if csv_text:
+            with cols[2]:
+                st.download_button(
+                    "CSV", data=csv_text.encode("utf-8"),
+                    file_name=f"AtmoPulse_{stem}.csv", mime="text/csv",
+                    key=f"press_{stem}_csv",
+                )
+        if err and svg is None:
+            st.caption(f"Vector export needs the kaleido package ({err})")
+
+
+def st_plotly_press(fig: go.Figure, stem: str, csv_text: str | None = None, **chart_kw) -> None:
+    st.plotly_chart(fig, use_container_width=True, **chart_kw)
+    render_press_export(fig, stem, csv_text=csv_text)
+
 
 def _render_synoptic_map(fig, title: str, key: str, *, bottom_margin: int = 0) -> None:
     """Render one synoptic map: Streamlit title above a CSS 70:42 frame.
@@ -244,13 +396,272 @@ def _render_synoptic_map(fig, title: str, key: str, *, bottom_margin: int = 0) -
             config=SYNOPTIC_MAP_CONFIG,
             key=f"plotly_{key}",
         )
+    render_press_export(fig, f"map_{key}", heavy=True)
+
+def _mslp_sep2(lon1, lat1, lon2, lat2) -> float:
+    """Squared angular distance with a cosine correction for longitude."""
+    dlat = lat1 - lat2
+    dlon = (lon1 - lon2) * np.cos(np.radians(0.5 * (lat1 + lat2)))
+    return dlat * dlat + dlon * dlon
+
+
+def _mslp_inset(lon: float, lat: float) -> tuple[float, float]:
+    """Pull a centre slightly inside EUROPE_BBOX so the glyph is not clipped."""
+    lon = min(max(lon, EUROPE_BBOX[0] + _MSLP_HL_INSET_DEG), EUROPE_BBOX[2] - _MSLP_HL_INSET_DEG)
+    lat = min(max(lat, EUROPE_BBOX[1] + _MSLP_HL_INSET_DEG), EUROPE_BBOX[3] - _MSLP_HL_INSET_DEG)
+    return lon, lat
+
+
+def _mslp_align_grid(lons, lats, z):
+    """Return (field, lon, lat) as 2D (nlat, nlon) + 1D axes, or (None, None, None)."""
+    field = np.squeeze(np.asarray(getattr(z, "values", z), dtype=float))
+    lon = np.squeeze(np.asarray(lons, dtype=float))
+    lat = np.squeeze(np.asarray(lats, dtype=float))
+    while field.ndim > 2:
+        field = field[0]
+    if lon.ndim > 1:
+        lon = lon[0] if lon.shape[0] <= lon.shape[-1] else lon[:, 0]
+        lon = np.squeeze(lon)
+    if lat.ndim > 1:
+        lat = lat[:, 0] if lat.shape[0] >= lat.shape[-1] else lat[0]
+        lat = np.squeeze(lat)
+    if field.ndim != 2 or lon.ndim != 1 or lat.ndim != 1:
+        return None, None, None
+    if field.shape == (lat.size, lon.size):
+        return field, lon, lat
+    if field.shape == (lon.size, lat.size):
+        return field.T, lon, lat
+    return None, None, None
+
+
+def _mslp_collect_centres(lon2, lat2, smooth, local_mean, mask, letter: str) -> list[tuple]:
+    rows, cols = np.where(mask)
+    if rows.size == 0:
+        return []
+    out = []
+    for r, c in zip(rows.tolist(), cols.tolist()):
+        lon, lat = _mslp_inset(float(lon2[r, c]), float(lat2[r, c]))
+        prom = abs(float(smooth[r, c] - local_mean[r, c]))
+        out.append((lon, lat, prom, letter))
+    return out
+
+
+def _mslp_near_edge(lon: float, lat: float) -> bool:
+    return (
+        lon <= EUROPE_BBOX[0] + _MSLP_HL_EDGE_BAND
+        or lon >= EUROPE_BBOX[2] - _MSLP_HL_EDGE_BAND
+        or lat <= EUROPE_BBOX[1] + _MSLP_HL_EDGE_BAND
+        or lat >= EUROPE_BBOX[3] - _MSLP_HL_EDGE_BAND
+    )
+
+
+def _mslp_edge_candidates(lon2, lat2, smooth, local_mean, local_range, finite) -> list[tuple]:
+    """Island-low / Azores-high style systems whose centre sits on the map rim."""
+    if not np.any(finite):
+        return []
+    out = []
+    work = {
+        "L": np.where(finite, smooth, np.inf),
+        "H": np.where(finite, smooth, -np.inf),
+    }
+    for letter, arr in work.items():
+        idx = np.unravel_index(np.argmin(arr) if letter == "L" else np.argmax(arr), smooth.shape)
+        if not finite[idx]:
+            continue
+        lon, lat = float(lon2[idx]), float(lat2[idx])
+        if not _mslp_near_edge(lon, lat):
+            continue
+        prom = abs(float(smooth[idx] - local_mean[idx]))
+        if prom < _MSLP_HL_EDGE_PROM or float(local_range[idx]) < _MSLP_HL_EDGE_RANGE:
+            continue
+        lon, lat = _mslp_inset(lon, lat)
+        out.append((lon, lat, prom, letter))
+    return out
+
+
+def _mslp_nms(candidates: list[tuple]) -> list[tuple]:
+    """Keep only steering-scale centres (strongest H/L, drop weak companions)."""
+    ranked = sorted(candidates, key=lambda rec: rec[2], reverse=True)
+    best = {"H": 0.0, "L": 0.0}
+    for _lon, _lat, prom, letter in ranked:
+        if prom > best[letter]:
+            best[letter] = prom
+    kept: list[tuple] = []
+    n_h = n_l = 0
+    for lon, lat, prom, letter in ranked:
+        if letter == "H" and n_h >= _MSLP_HL_MAX_LABELS:
+            continue
+        if letter == "L" and n_l >= _MSLP_HL_MAX_LABELS:
+            continue
+        floor = max(_MSLP_HL_MIN_PROMINENCE, _MSLP_HL_STEER_FRAC * best[letter])
+        if prom < floor:
+            continue
+        too_close = False
+        for klon, klat, _kp, kletter in kept:
+            sep2 = _mslp_sep2(lon, lat, klon, klat)
+            limit = _MSLP_HL_MIN_SEP_SAME if letter == kletter else _MSLP_HL_MIN_SEP_CROSS
+            if sep2 < limit * limit:
+                too_close = True
+                break
+        if too_close:
+            continue
+        kept.append((lon, lat, prom, letter))
+        if letter == "H":
+            n_h += 1
+        else:
+            n_l += 1
+    return kept
+
+
+def _mslp_pressure_centers(lons, lats, z) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Local MSLP maxima (H) and minima (L) with a closed-isobar footprint."""
+    field, lon, lat = _mslp_align_grid(lons, lats, z)
+    if field is None:
+        return [], []
+
+    finite = np.isfinite(field)
+    if int(finite.sum()) < 50:
+        return [], []
+
+    fill = float(np.nanmean(field))
+    filled = np.where(finite, field, fill)
+    smooth = gaussian_filter(filled, sigma=_MSLP_HL_SMOOTH_SIGMA, mode="nearest")
+    local_mean = uniform_filter(filled, size=_MSLP_HL_PROM_WINDOW, mode="nearest")
+    local_range = (
+        maximum_filter(smooth, size=_MSLP_HL_RANGE_WINDOW, mode="nearest")
+        - minimum_filter(smooth, size=_MSLP_HL_RANGE_WINDOW, mode="nearest")
+    )
+
+    max_in = np.where(finite, smooth, -np.inf)
+    min_in = np.where(finite, smooth, np.inf)
+    is_max = finite & (smooth == maximum_filter(max_in, size=_MSLP_HL_NEIGHBORHOOD, mode="nearest"))
+    is_min = finite & (smooth == minimum_filter(min_in, size=_MSLP_HL_NEIGHBORHOOD, mode="nearest"))
+    is_max &= (smooth - local_mean) >= _MSLP_HL_MIN_PROMINENCE
+    is_min &= (local_mean - smooth) >= _MSLP_HL_MIN_PROMINENCE
+    is_max &= local_range >= _MSLP_HL_MIN_RANGE
+    is_min &= local_range >= _MSLP_HL_MIN_RANGE
+
+    lon2, lat2 = np.meshgrid(lon, lat)
+    in_frame = (
+        (lon2 >= EUROPE_BBOX[0] + _MSLP_HL_EDGE_DEG)
+        & (lon2 <= EUROPE_BBOX[2] - _MSLP_HL_EDGE_DEG)
+        & (lat2 >= EUROPE_BBOX[1] + _MSLP_HL_EDGE_DEG)
+        & (lat2 <= EUROPE_BBOX[3] - _MSLP_HL_EDGE_DEG)
+    )
+    is_max &= in_frame
+    is_min &= in_frame
+
+    candidates = (
+        _mslp_collect_centres(lon2, lat2, smooth, local_mean, is_max, "H")
+        + _mslp_collect_centres(lon2, lat2, smooth, local_mean, is_min, "L")
+        + _mslp_edge_candidates(lon2, lat2, smooth, local_mean, local_range, finite)
+    )
+    kept = _mslp_nms(candidates)
+    highs = [(lon, lat) for lon, lat, _p, letter in kept if letter == "H"]
+    lows = [(lon, lat) for lon, lat, _p, letter in kept if letter == "L"]
+    return highs, lows
+
+
+def _add_mslp_hl_labels(fig, lons, lats, z) -> None:
+    """Bold H / L on MSLP centres. One dark glyph, no halo (weather-chart style)."""
+    highs, lows = _mslp_pressure_centers(lons, lats, z)
+    xs = [p[0] for p in highs] + [p[0] for p in lows]
+    ys = [p[1] for p in highs] + [p[1] for p in lows]
+    texts = (["H"] * len(highs)) + (["L"] * len(lows))
+    if not xs:
+        return
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys, text=texts,
+        mode="text",
+        textposition="middle center",
+        cliponaxis=False,
+        hoverinfo="skip",
+        showlegend=False,
+        textfont=dict(
+            size=18,
+            color=ATMOPULSE_OVERLAY["mslp_contour"],
+            family=ATMOPULSE_FONTS["sora_css"],
+            weight=700,
+        ),
+    ))
+
+
+def _land_fraction_grid(lons, lats):
+    """Land fraction 0..1 on the map grid. ERA5 LSM when present, else Natural Earth."""
+    try:
+        inv = load_invariant_fields()
+    except Exception:
+        inv = None
+    if inv is not None:
+        name = next((n for n in ("lsm", "land_sea_mask") if n in inv.variables), None)
+        if name is not None:
+            da = inv[name]
+            for dim in list(da.dims):
+                if dim not in ("latitude", "longitude", "lat", "lon") and da.sizes.get(dim, 1) == 1:
+                    da = da.isel({dim: 0})
+            try:
+                da = da.reindex(latitude=lats, longitude=lons, method="nearest")
+                z = np.squeeze(np.asarray(da.values, dtype=float))
+                if z.shape == (len(lats), len(lons)):
+                    return np.clip(z, 0.0, 1.0)
+                if z.shape == (len(lons), len(lats)):
+                    return np.clip(z.T, 0.0, 1.0)
+            except Exception:
+                pass
+    from backend_map_locations import build_land_sea_grid
+    return build_land_sea_grid(np.asarray(lons), np.asarray(lats))
+
+
+@st.cache_data(show_spinner=False)
+def _cached_land_fraction_grid(lons_tuple, lats_tuple):
+    return _land_fraction_grid(np.asarray(lons_tuple), np.asarray(lats_tuple))
+
+
+def _add_land_sea_base(fig, lons, lats) -> None:
+    """Quiet land/sea wash under the extremes so uncoloured cells are not stark white."""
+    try:
+        z = _cached_land_fraction_grid(tuple(np.asarray(lons)), tuple(np.asarray(lats)))
+    except Exception:
+        return
+    if z is None or np.asarray(z).size == 0:
+        return
+    fig.add_trace(go.Heatmap(
+        x=lons, y=lats, z=z,
+        colorscale=[
+            [0.0, ATMOPULSE_OVERLAY["sea"]],
+            [1.0, ATMOPULSE_OVERLAY["land"]],
+        ],
+        zmin=0, zmax=1, showscale=False,
+        hoverinfo="skip", opacity=1.0, zsmooth=False,
+    ))
+
+
+def _mslp_smooth_field(z, sigma=_MSLP_CONTOUR_SMOOTH_SIGMA):
+    """Nan-safe Gaussian smooth so isolines do not fray into tiny closed blobs."""
+    field = np.squeeze(np.asarray(getattr(z, "values", z), dtype=float))
+    while field.ndim > 2:
+        field = field[0]
+    finite = np.isfinite(field)
+    if not np.any(finite):
+        return field
+    fill = float(np.nanmean(field))
+    smooth = gaussian_filter(np.where(finite, field, fill), sigma=sigma, mode="nearest")
+    return np.where(finite, smooth, np.nan)
+
 
 def _add_map_contour(fig, lons, lats, z, color, start, end, step):
     fig.add_trace(go.Contour(
         x=lons, y=lats, z=z,
         colorscale=[[0, color], [1, color]],
-        contours=dict(start=start, end=end, size=step, showlabels=True, labelfont=map_contour_label_font()),
-        contours_coloring='lines', showscale=False, line_width=MAP_CONTOUR_LINE_WIDTH, opacity=0.8, hoverinfo="skip",
+        contours=dict(
+            start=start, end=end, size=step, showlabels=True,
+            labelfont=map_contour_label_font(color=color),
+        ),
+        contours_coloring="lines", showscale=False,
+        line_width=MAP_CONTOUR_LINE_WIDTH,
+        line_smoothing=MAP_CONTOUR_LINE_SMOOTHING,
+        opacity=1.0, hoverinfo="skip",
+        connectgaps=True,
     ))
 
 def build_baseline_map(
@@ -272,9 +683,11 @@ def build_baseline_map(
         
     suffix, doy = ("A" if baseline_type == "A" else "B"), etccdi_doy_365(target_date)
     tx_curr, tn_curr = _synoptic_temp_pair(map_phys_data)
-    if tx_curr is None or tn_curr is None:
-        return go.Figure()
     lons, lats = _synoptic_lonlat(map_phys_data)
+    if lons is None or lats is None:
+        return go.Figure()
+    if map_var != "T850" and (tx_curr is None or tn_curr is None):
+        return go.Figure()
     
     # Align the climatology grid to the live/archive field's actual lat/lon
     # coordinates (nearest-neighbor) instead of assuming positional array
@@ -284,33 +697,25 @@ def build_baseline_map(
     daily_ref = ref_data.sel(dayofyear=doy).reindex(
         latitude=lats, longitude=lons, method="nearest"
     )
+    shape = tx_curr.shape if tx_curr is not None else (len(lats), len(lons))
     
     def safe_get(var_key, fallback=np.nan):
         if var_key in daily_ref.variables: 
             return daily_ref[var_key].values
-        return np.full(tx_curr.shape, fallback)
+        return np.full(shape, fallback)
 
-    if map_var == "TX":
-        v_curr, v_p95, v_p90, v_p75 = tx_curr, safe_get(f'tx_p95_doy_{suffix}'), safe_get(f'tx_p90_doy_{suffix}'), safe_get(f'tx_p75_doy_{suffix}')
-        v_p25, v_p10, v_p5 = safe_get(f'tx_p25_doy_{suffix}'), safe_get(f'tx_p10_doy_{suffix}'), safe_get(f'tx_p5_doy_{suffix}')
-    elif map_var == "TN":
-        v_curr, v_p95, v_p90, v_p75 = tn_curr, safe_get(f'tn_p95_doy_{suffix}'), safe_get(f'tn_p90_doy_{suffix}'), safe_get(f'tn_p75_doy_{suffix}')
-        v_p25, v_p10, v_p5 = safe_get(f'tn_p25_doy_{suffix}'), safe_get(f'tn_p10_doy_{suffix}'), safe_get(f'tn_p5_doy_{suffix}')
-    else:
-        tg_curr = map_phys_data.get("tg")
-        v_curr = _synoptic_array(tg_curr) if tg_curr is not None else (tx_curr + tn_curr) / 2.0
-        v_p95 = (safe_get(f'tx_p95_doy_{suffix}') + safe_get(f'tn_p95_doy_{suffix}')) / 2
-        v_p90 = (safe_get(f'tx_p90_doy_{suffix}') + safe_get(f'tn_p90_doy_{suffix}')) / 2
-        v_p75 = (safe_get(f'tx_p75_doy_{suffix}') + safe_get(f'tn_p75_doy_{suffix}')) / 2
-        v_p25 = (safe_get(f'tx_p25_doy_{suffix}') + safe_get(f'tn_p25_doy_{suffix}')) / 2
-        v_p10 = (safe_get(f'tx_p10_doy_{suffix}') + safe_get(f'tn_p10_doy_{suffix}')) / 2
-        v_p5 = (safe_get(f'tx_p5_doy_{suffix}') + safe_get(f'tn_p5_doy_{suffix}')) / 2
+    v_curr, v_p95, v_p90, v_p75, v_p25, v_p10, v_p5 = _map_var_threshold_arrays(
+        map_var, map_phys_data, safe_get, suffix, tx_curr, tn_curr,
+    )
+    if v_curr is None:
+        return go.Figure()
 
     # All-time records: archive only, strictly before the viewed year (keeps the
     # previous record visible when the current year breaks it).
-    v_rec_w, v_rec_c, yr_w, yr_c = _map_historical_records(ref_data, doy, target_date, map_var, tx_curr.shape, anchor_date)
+    v_rec_w, v_rec_c, yr_w, yr_c = _map_historical_records(ref_data, doy, target_date, map_var, v_curr.shape, anchor_date)
 
     fig = go.Figure()
+    _add_land_sea_base(fig, lons, lats)
     loc_labels = get_map_location_labels(tuple(lons), tuple(lats))
     
     # Pure NumPy math without string loops (100x faster, minimal RAM footprint)
@@ -342,7 +747,8 @@ def build_baseline_map(
         fig.add_trace(go.Heatmap(
             x=lons, y=lats, z=mask, text=loc_labels, customdata=daily_customdata,
             colorscale=colorscale, showscale=False,
-            opacity=0.85, zmin=1, zmax=8, zsmooth=False,
+            opacity=MAP_EXTREMES_OPACITY, zmin=1, zmax=8, zsmooth=False,
+            hoverongaps=True,
             hovertemplate=daily_hovertemplate,
         ))
         
@@ -366,7 +772,8 @@ def build_baseline_map(
                 else: 
                     h_idx, c_idx = 0, 4
                 
-                hatch_mask = (streaks[h_idx] >= 6) | (streaks[c_idx] >= 6)
+                min_days = int(toggles.get("spell_days", 6) or 6)
+                hatch_mask = (streaks[h_idx] >= min_days) | (streaks[c_idx] >= min_days)
                 if np.any(hatch_mask):
                     h_lons, h_lats = lon_grid[hatch_mask][::2], lat_grid[hatch_mask][::2]
                     fig.add_trace(go.Scatter(x=h_lons, y=h_lats, mode='markers', marker=dict(symbol='x', color='rgba(0,0,0,0.15)', size=3), hoverinfo='skip', showlegend=False))
@@ -379,12 +786,13 @@ def build_baseline_map(
         )
         if streaks is not None:
             mapping = {
-                "Moderate": (0, 4, 60),
-                "Strong": (1, 5, 30),
-                "Extreme": (2, 6, 20),
-                "All-Time Record": (3, 7, 15),
+                "Moderate": (0, 4),
+                "Strong": (1, 5),
+                "Extreme": (2, 6),
+                "All-Time Record": (3, 7),
             }
-            w_idx, c_idx, max_days = mapping.get(persist_metric, (1, 5, 30))
+            w_idx, c_idx = mapping.get(persist_metric, (1, 5))
+            max_days = PERSISTENCE_COLORBAR_DAYS
             warm = streaks[w_idx].astype(float)
             cold = streaks[c_idx].astype(float)
             warm_only = (warm > 0) & (cold == 0)
@@ -405,8 +813,8 @@ def build_baseline_map(
             persist_hovertemplate = (
                 "<b>%{text}</b><br>"
                 "Latitude: %{y:.2f}, Longitude: %{x:.2f}<br><br>"
-                "Persistence: Warm: %{customdata[0]} days<br>"
-                "Persistence: Cold: %{customdata[1]} days"
+                "Warm: %{customdata[0]} days<br>"
+                "Cold: %{customdata[1]} days"
                 "<extra></extra>"
             )
             fig.add_trace(go.Heatmap(
@@ -417,10 +825,16 @@ def build_baseline_map(
                 hovertemplate=persist_hovertemplate,
             ))
             
-    if border_trace is not None: 
-        fig.add_trace(border_trace)
+    if border_trace is not None:
+        traces = border_trace if isinstance(border_trace, (list, tuple)) else (border_trace,)
+        for tr in traces:
+            if tr is not None:
+                fig.add_trace(tr)
     if toggles.get("mslp", False) and "mslp" in map_phys_data:
-        _add_map_contour(fig, lons, lats, np.squeeze(_synoptic_array(map_phys_data["mslp"])), ATMOPULSE_OVERLAY['mslp_contour'], 980, 1040, 5)
+        mslp_z = np.squeeze(_synoptic_array(map_phys_data["mslp"]))
+        mslp_draw = _mslp_smooth_field(mslp_z)
+        _add_map_contour(fig, lons, lats, mslp_draw, ATMOPULSE_OVERLAY['mslp_contour'], 980, 1040, 5)
+        _add_mslp_hl_labels(fig, lons, lats, mslp_z)
     if toggles.get("z500", False) and "z500" in map_phys_data:
         _add_map_contour(fig, lons, lats, np.squeeze(_synoptic_array(map_phys_data["z500"])), ATMOPULSE_OVERLAY['z500_contour'], 500, 600, 8)
 
@@ -444,7 +858,8 @@ def build_baseline_map(
 def get_cached_baseline_map(
     date_str, baseline_type, map_var, view_mode, persist_metric, top10_threshold,
     t_warm_items, t_cold_items, active_toggles, source_mtime, forecast_model,
-    full_width=False, anchor_date_str=None, *, _ref_data, _map_phys_data,
+    full_width=False, anchor_date_str=None, spell_days=6, _hl_version=_MSLP_HL_VERSION,
+    *, _ref_data, _map_phys_data,
 ):
     """Schritt C: @st.cache_data front door for build_baseline_map.
 
@@ -486,6 +901,7 @@ def get_cached_baseline_map(
     t_warm = dict(t_warm_items)
     t_cold = dict(t_cold_items)
     toggles = {name: (name in active_toggles) for name in ("mslp", "z500", "hatching")}
+    toggles["spell_days"] = int(spell_days)
 
     return build_baseline_map(
         _ref_data, _map_phys_data, target_date, t_warm, t_cold, toggles, view_mode,
@@ -520,8 +936,8 @@ def _plotly_compare_slider(*, active: int, prefix: str, steps: list) -> dict:
 
 def build_opacity_slider_map(
     fig_a, fig_b,
-    label_a="1961–1990",
-    label_b="1996–2025",
+    label_a=epoch_period_label("A"),
+    label_b=epoch_period_label("B"),
     n_steps=21,
 ):
     """Cross-fade two already-built maps with a Plotly layout slider.
@@ -617,24 +1033,8 @@ def render_swipe_compare_map(fig_a, fig_b) -> None:
         # EUROPE_BBOX. Modebar zoom buttons (fixed-step) still work.
         dragmode=False,
     )
-    fig_bottom.update_layout(**common_layout)
-    fig_top.update_layout(**common_layout)
-    # Belt-and-suspenders: explicit ranges must win regardless of dragmode.
-    # Critically, `constrain="domain"` is forced on BOTH axes here (the
-    # shared `_map_yaxis_kwargs()` only sets it on X; Y falls back to
-    # Plotly's default `constrain="range"` for a scaleanchor'd axis). In
-    # every other map the CSS box is pixel-perfect to the 70:42 ratio, so
-    # that default never bites. Here the box size comes from a JS-measured
-    # iframe width and is only ever approximately 70:42 — with the old
-    # X-only constrain, any sub-pixel mismatch made Plotly silently CROP
-    # the latitude range (chopping off southern Europe) to preserve the
-    # 1:1 scaleanchor ratio. Constraining both axes' domains instead means
-    # any leftover mismatch just adds a thin blank margin — the data range
-    # itself (and therefore the zoom level) can never be cropped.
-    fig_bottom.update_xaxes(range=list(MAP_VIEW_LON), autorange=False, constrain="domain")
-    fig_bottom.update_yaxes(range=list(MAP_VIEW_LAT), autorange=False, constrain="domain")
-    fig_top.update_xaxes(range=list(MAP_VIEW_LON), autorange=False, constrain="domain")
-    fig_top.update_yaxes(range=list(MAP_VIEW_LAT), autorange=False, constrain="domain")
+    fig_bottom.update_layout(**common_layout, xaxis=_map_xaxis_kwargs(), yaxis=_map_yaxis_kwargs())
+    fig_top.update_layout(**common_layout, xaxis=_map_xaxis_kwargs(), yaxis=_map_yaxis_kwargs())
 
     st.markdown(
         "<p class='atmopulse-map-title'>Swipe Compare: Historical (left) | Recent (right)</p>",
@@ -644,9 +1044,6 @@ def render_swipe_compare_map(fig_a, fig_b) -> None:
     primary = ATMOPULSE_BRAND["primary"]
     json_a = fig_bottom.to_json()
     json_b = fig_top.to_json()
-
-    lon_span, lat_span = (MAP_VIEW_LON[1] - MAP_VIEW_LON[0]), (MAP_VIEW_LAT[1] - MAP_VIEW_LAT[0])
-    aspect = lat_span / lon_span  # height / width, e.g. 42/70
 
     html = f"""
 <div id="swipe-stack">
@@ -665,6 +1062,8 @@ def render_swipe_compare_map(fig_a, fig_b) -> None:
   #swipe-stack {{
     position: relative;
     width: 100%;
+    aspect-ratio: 70 / 42;
+    height: auto;
     overflow: hidden;
     --swipe: 50%;
   }}
@@ -695,12 +1094,9 @@ def render_swipe_compare_map(fig_a, fig_b) -> None:
   .atmopulse-swipe-ctrl span {{ white-space: nowrap; }}
   .atmopulse-swipe-ctrl input[type=range] {{ flex: 1; accent-color: {primary}; }}
 </style>
-<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@4.0.0/plotly.min.js"></script>
 <script>
 (function() {{
-  // The EUROPE_BBOX aspect ratio (height/width), computed in Python from
-  // MAP_VIEW_LON/MAP_VIEW_LAT so it always matches the other maps exactly.
-  var ASPECT = {aspect!r};
   var SLIDER_H = 46;
 
   var figA = {json_a};
@@ -719,27 +1115,18 @@ def render_swipe_compare_map(fig_a, fig_b) -> None:
     if (String(slider.value) !== String(v)) slider.value = v;
   }}
 
-  // Height is derived from WIDTH (known immediately, independent of the
-  // iframe's own height) instead of measuring the box's rendered height
-  // and feeding that back — that read-back loop is what kept producing a
-  // wrong/cropped zoom, because it raced against Streamlit's own iframe
-  // sizing. Width -> explicit pixel height is a one-way, race-free
-  // calculation that always reproduces the exact EUROPE_BBOX ratio.
+  // The stack uses CSS aspect-ratio 70/42 (EUROPE_BBOX), same as the
+  // Streamlit map frames. Do not set height from full iframe width:
+  // Plotly's colour bar then shrinks the plot area and scaleanchor
+  // crops latitude (appears as a zoomed-in map).
   function layout() {{
-    var w = document.documentElement.clientWidth || document.body.clientWidth || stack.clientWidth;
-    if (!w) return;
-    var mapH = Math.round(w * ASPECT);
-    stack.style.height = mapH + "px";
-    window.parent.postMessage({{type: "streamlit:setFrameHeight", height: mapH + SLIDER_H}}, "*");
+    var ctrl = document.querySelector(".atmopulse-swipe-ctrl");
+    var mapH = stack.getBoundingClientRect().height || 0;
+    var ctrlH = ctrl ? (ctrl.getBoundingClientRect().height || SLIDER_H) : SLIDER_H;
+    if (mapH > 0) {{
+      window.parent.postMessage({{type: "streamlit:setFrameHeight", height: Math.ceil(mapH + ctrlH + 8)}}, "*");
+    }}
     if (plotted) {{
-      // Plotly.relayout({{width, height}}) does NOT reliably recompute
-      // scaleanchor/constrain="domain" margins on an existing graph — it
-      // can leave the two independently-resized instances (A and B) with
-      // subtly different domain math, which is exactly what showed up as
-      // a mismatched/distorted map and a jagged seam where they meet.
-      // Plotly.Plots.resize() re-measures the (already CSS-sized) div and
-      // redoes the full autosize/constrain pass, so both instances always
-      // resolve to the identical EUROPE_BBOX geometry.
       Plotly.Plots.resize("swipe-a");
       Plotly.Plots.resize("swipe-b");
     }}
@@ -832,14 +1219,19 @@ def render_swipe_compare_map(fig_a, fig_b) -> None:
 
   window.addEventListener("resize", layout);
   if (window.ResizeObserver) {{
-    new ResizeObserver(layout).observe(document.body);
+    new ResizeObserver(layout).observe(stack);
   }}
   [50, 150, 300, 600, 1000].forEach(function(t) {{ setTimeout(layout, t); }});
 }})();
 </script>
 """
-    components.html(html, height=int(700 * aspect) + 46, scrolling=False)
+    components.html(html, height=520, scrolling=False)
     st.caption("Drag the map or the slider: left is 1961–1990, right is 1996–2025.")
+    e1, e2 = st.columns(2)
+    with e1:
+        render_press_export(fig_bottom, "swipe_historical", heavy=True)
+    with e2:
+        render_press_export(fig_top, "swipe_recent", heavy=True)
 
 # --- METEOGRAM CORE TRACES (For Subplots) ---
 def _densify_at_level_crossings(x, y, *levels):
@@ -952,11 +1344,17 @@ def get_meteogram_traces(df_live, ref_clim, lat, lon, target_date, epoch, meteo_
     doys = etccdi_doy_365(df_live['Date']) - 1
     
     dates = df_live['Date']
-
-    col_target = 'TG' if meteo_var == "Mean Temp (TG)" else ('TX' if meteo_var == "Max Temp (TX)" else 'TN')
-    t_hist = df_live.loc[dates <= tgt_dt_norm, col_target].values if col_target in df_live.columns else ((df_live.loc[dates <= tgt_dt_norm, 'TX'].values + df_live.loc[dates <= tgt_dt_norm, 'TN'].values) / 2.0)
     d_hist = dates[dates <= tgt_dt_norm]
-    t_full = df_live[col_target].values if col_target in df_live.columns else ((df_live['TX'].values + df_live['TN'].values) / 2.0)
+
+    col_target = meteo_var_code(meteo_var)
+    if col_target in df_live.columns:
+        t_hist = df_live.loc[dates <= tgt_dt_norm, col_target].values
+        t_full = df_live[col_target].values
+        y_all = t_full
+    else:
+        t_hist = (df_live.loc[dates <= tgt_dt_norm, 'TX'].values + df_live.loc[dates <= tgt_dt_norm, 'TN'].values) / 2.0
+        t_full = (df_live['TX'].values + df_live['TN'].values) / 2.0
+        y_all = t_full
 
     c_base, p75_daily, p90_daily, p95_daily, rec_w_daily, p25_daily, p10_daily, p5_daily, rec_c_daily = (
         point_clim_ladder(pt_clim, doys, meteo_var, epoch)
@@ -1029,12 +1427,16 @@ def get_meteogram_traces(df_live, ref_clim, lat, lon, target_date, epoch, meteo_
     # unified hover (hoverdistance ~20px ≈ a week on a 365-day axis) pull in the
     # neighbouring day as a second "Current Value" block.
     fcst_line_mask = dates >= tgt_dt_norm
-    y_all = df_live[col_target].values if col_target in df_live.columns else ((df_live['TX'].values + df_live['TN'].values) / 2.0)
+    if col_target in df_live.columns:
+        y_all = df_live[col_target].values
 
-    if meteo_var == "Max Temp (TX)":
+    code = meteo_var_code(meteo_var)
+    if code == "TX":
         rec_wd_key, rec_cd_key = "tx_max_date", "tx_min_date"
-    elif meteo_var == "Min Temp (TN)":
+    elif code == "TN":
         rec_wd_key, rec_cd_key = "tn_max_date", "tn_min_date"
+    elif code == "T850":
+        rec_wd_key, rec_cd_key = "t850_max_date", "t850_min_date"
     else:
         rec_wd_key = "tg_max_date" if "tg_max_date" in pt_clim.variables else "tx_max_date"
         rec_cd_key = "tg_min_date" if "tg_min_date" in pt_clim.variables else "tn_min_date"
@@ -1086,100 +1488,196 @@ def get_meteogram_traces(df_live, ref_clim, lat, lon, target_date, epoch, meteo_
     return traces
 
 
-@st.cache_resource(show_spinner=False)
-def build_yearly_extremes_chart(lat, lon, epoch, is_warm, _ref_clim=None, _load_point_archive_series=None):
+def _days_in_runs(flag, dates, min_len=6):
+    """Days inside a spell of at least `min_len` consecutive calendar days.
+
+    Spells continue across 1 January; each day is later counted in its own year.
+    A missing calendar day breaks the run.
     """
-    `_ref_clim` / `_load_point_archive_series` are app.py-owned (module-level
-    climatology handle + cached loader), passed in explicitly by the caller.
-    Leading underscores exclude them from Streamlit's cache-key hash (same
-    convention as the rest of this codebase), so the cache key stays exactly
-    (lat, lon, epoch, is_warm) as before.
+    flag = np.asarray(flag, dtype=bool)
+    idx = pd.DatetimeIndex(pd.to_datetime(dates))
+    if idx.tz is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    ns = idx.normalize().asi8
+    n = len(flag)
+    out = np.zeros(n, dtype=bool)
+    if n == 0 or not flag.any():
+        return out
+    one_day = np.int64(86_400_000_000_000)
+    i = 0
+    while i < n:
+        if not flag[i]:
+            i += 1
+            continue
+        j = i + 1
+        while j < n and flag[j] and (ns[j] - ns[j - 1]) == one_day:
+            j += 1
+        if (j - i) >= min_len:
+            out[i:j] = True
+        i = j
+    return out
+
+
+@st.cache_resource(show_spinner=False)
+def build_yearly_extremes_chart(
+    lat, lon, epoch, var_code, panel="warm_cold_v8",
+    wsdi=False, csdi=False,
+    _ref_clim=None, _load_point_archive_series=None,
+):
+    """Warm (top) and cold (bottom) days beyond the selected parameter's
+    percentile ladder (TG / TX / TN / T850), for one reference period.
     """
     if _ref_clim is None or _load_point_archive_series is None:
         return go.Figure()
-    df = _load_point_archive_series(lat, lon, is_warm)
+    code = var_code if var_code in ("TX", "TN", "TG", "T850") else meteo_var_code(str(var_code))
+    df = _load_point_archive_series(lat, lon, code)
     if df is None:
-        return go.Figure()
-
-    pt_clim = _ref_clim.sel(latitude=lat, longitude=lon, method='nearest')
-    doys = df['doy'].values
-    v = df['val'].values
-
-    if is_warm and f'tx_p95_doy_{epoch}' in pt_clim.variables:
-        c_75, c_90, c_95, c_rec = pt_clim[f'tx_p75_doy_{epoch}'].values[doys], pt_clim[f'tx_p90_doy_{epoch}'].values[doys], pt_clim[f'tx_p95_doy_{epoch}'].values[doys], pt_clim['tx_max_val'].values[doys]
-        df['p75'], df['p90'], df['p95'], df['rec'] = (v >= c_75) & (v < c_90), (v >= c_90) & (v < c_95), (v >= c_95) & (v < c_rec), v >= c_rec
-    elif not is_warm and f'tn_p5_doy_{epoch}' in pt_clim.variables:
-        c_25, c_10, c_5, c_rec = pt_clim[f'tn_p25_doy_{epoch}'].values[doys], pt_clim[f'tn_p10_doy_{epoch}'].values[doys], pt_clim[f'tn_p5_doy_{epoch}'].values[doys], pt_clim['tn_min_val'].values[doys]
-        df['p25'], df['p10'], df['p5'], df['rec'] = (v <= c_25) & (v > c_10), (v <= c_10) & (v > c_5), (v <= c_5) & (v > c_rec), v <= c_rec
-    else: 
         return go.Figure().add_annotation(text="Data Missing.", showarrow=False)
+    time_col = "time" if "time" in df.columns else ("Date" if "Date" in df.columns else None)
+    if time_col is not None:
+        df = df.sort_values(time_col)
 
-    cols_to_sum = ['year', 'p75', 'p90', 'p95', 'rec'] if is_warm else ['year', 'p25', 'p10', 'p5', 'rec']
-    res = df[cols_to_sum].groupby('year').sum()
-    
-    cols_mod, cols_str, cols_ext, cols_rec = (
-        ("p75", "p90", "p95", "rec") if is_warm else ("p25", "p10", "p5", "rec")
+    pt_clim = _ref_clim.sel(latitude=lat, longitude=lon, method="nearest")
+    doys = df["doy"].values
+    v = np.asarray(df["val"].values, dtype=np.float64)
+    _c_base, p75, p90, p95, rec_w, p25, p10, p5, rec_c = point_clim_ladder(
+        pt_clim, doys, code, epoch
     )
-    hover_cd = np.column_stack([
-        res[cols_mod].to_numpy(dtype=int),
-        res[cols_str].to_numpy(dtype=int),
-        res[cols_ext].to_numpy(dtype=int),
-        res[cols_rec].to_numpy(dtype=int),
-    ])
-    hover_tmpl = (
-        "<b>%{x}</b><br>"
-        "Moderate: %{customdata[0]}<br>"
-        "Strong: %{customdata[1]}<br>"
-        "Extreme: %{customdata[2]}<br>"
-        "Records: %{customdata[3]}"
-        "<extra></extra>"
-    )
+
+    df = df.copy()
+    dates_arr = pd.to_datetime(df["time"] if "time" in df.columns else df.get("Date", df.index))
+    warm_p75 = (v >= p75) & (v < p90)
+    warm_p90 = (v >= p90) & (v < p95)
+    warm_p95 = (v >= p95) & (v < rec_w)
+    warm_rec = v >= rec_w
+    cold_p25 = (v <= p25) & (v > p10)
+    cold_p10 = (v <= p10) & (v > p5)
+    cold_p5 = (v <= p5) & (v > rec_c)
+    cold_rec = v <= rec_c
+    if wsdi:
+        in_w = _days_in_runs(np.isfinite(v) & (v >= p90), dates_arr, 6)
+        warm_p75 = np.zeros_like(warm_p75)
+        warm_p90 = in_w & warm_p90
+        warm_p95 = in_w & warm_p95
+        warm_rec = in_w & warm_rec
+    if csdi:
+        in_c = _days_in_runs(np.isfinite(v) & (v <= p10), dates_arr, 6)
+        cold_p25 = np.zeros_like(cold_p25)
+        cold_p10 = in_c & cold_p10
+        cold_p5 = in_c & cold_p5
+        cold_rec = in_c & cold_rec
+    df["p75"], df["p90"], df["p95"], df["rec_w"] = warm_p75, warm_p90, warm_p95, warm_rec
+    df["p25"], df["p10"], df["p5"], df["rec_c"] = cold_p25, cold_p10, cold_p5, cold_rec
+    res = df.groupby("year")[
+        ["p75", "p90", "p95", "rec_w", "p25", "p10", "p5", "rec_c"]
+    ].sum()
+
+    years = res.index
     bar_kw = dict(hoverinfo="skip", hovertemplate=None)
-    fig = go.Figure()
-    if is_warm:
-        fig.add_trace(go.Bar(x=res.index, y=res['p75'], name='Moderate', marker_color=ATMOPULSE_WARM['p75'], **bar_kw))
-        fig.add_trace(go.Bar(x=res.index, y=res['p90'], name='Strong', marker_color=ATMOPULSE_WARM['p90'], **bar_kw))
-        fig.add_trace(go.Bar(x=res.index, y=res['p95'], name='Extreme', marker_color=ATMOPULSE_WARM['p95'], **bar_kw))
-        fig.add_trace(go.Bar(x=res.index, y=res['rec'], name='Records', marker_color=ATMOPULSE_WARM['rec'], **bar_kw))
-    else:
-        fig.add_trace(go.Bar(x=res.index, y=res['p25'], name='Moderate', marker_color=ATMOPULSE_COLD['p25'], **bar_kw))
-        fig.add_trace(go.Bar(x=res.index, y=res['p10'], name='Strong', marker_color=ATMOPULSE_COLD['p10'], **bar_kw))
-        fig.add_trace(go.Bar(x=res.index, y=res['p5'],  name='Extreme', marker_color=ATMOPULSE_COLD['p5'], **bar_kw))
-        fig.add_trace(go.Bar(x=res.index, y=res['rec'], name='Records', marker_color=ATMOPULSE_COLD['rec'], **bar_kw))
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.26,
+        subplot_titles=(
+            "Warm · WSDI (6×P90)" if wsdi else "Warm",
+            "Cold · CSDI (6×P10)" if csdi else "Cold",
+        ),
+    )
 
-    y_top = res[cols_mod] + res[cols_str] + res[cols_ext] + res[cols_rec]
-    fig.add_trace(go.Scatter(
-        x=res.index, y=y_top,
-        mode="markers",
-        marker=dict(size=1, opacity=0),
-        customdata=hover_cd,
-        hovertemplate=hover_tmpl,
-        hoverlabel=dict(align="left"),
-        showlegend=False,
-        name="year-hover",
-    ))
+    def _hover(cols):
+        hover_cd = np.column_stack([res[c].to_numpy(dtype=int) for c in cols])
+        y_top = sum(res[c] for c in cols)
+        return go.Scatter(
+            x=years, y=y_top, mode="markers",
+            marker=dict(size=1, opacity=0),
+            customdata=hover_cd,
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "Moderate: %{customdata[0]}<br>"
+                "Strong: %{customdata[1]}<br>"
+                "Extreme: %{customdata[2]}<br>"
+                "Records: %{customdata[3]}"
+                "<extra></extra>"
+            ),
+            hoverlabel=dict(align="left"),
+            showlegend=False, name="year-hover",
+        )
 
+    fig.add_trace(go.Bar(x=years, y=res["p75"], name="Moderate", marker_color=ATMOPULSE_WARM["p75"], legend="legend", **bar_kw), row=1, col=1)
+    fig.add_trace(go.Bar(x=years, y=res["p90"], name="Strong", marker_color=ATMOPULSE_WARM["p90"], legend="legend", **bar_kw), row=1, col=1)
+    fig.add_trace(go.Bar(x=years, y=res["p95"], name="Extreme", marker_color=ATMOPULSE_WARM["p95"], legend="legend", **bar_kw), row=1, col=1)
+    fig.add_trace(go.Bar(x=years, y=res["rec_w"], name="Records", marker_color=ATMOPULSE_WARM["rec"], legend="legend", **bar_kw), row=1, col=1)
+    fig.add_trace(_hover(("p75", "p90", "p95", "rec_w")), row=1, col=1)
+
+    fig.add_trace(go.Bar(x=years, y=res["p25"], name="Moderate", marker_color=ATMOPULSE_COLD["p25"], legend="legend2", **bar_kw), row=2, col=1)
+    fig.add_trace(go.Bar(x=years, y=res["p10"], name="Strong", marker_color=ATMOPULSE_COLD["p10"], legend="legend2", **bar_kw), row=2, col=1)
+    fig.add_trace(go.Bar(x=years, y=res["p5"], name="Extreme", marker_color=ATMOPULSE_COLD["p5"], legend="legend2", **bar_kw), row=2, col=1)
+    fig.add_trace(go.Bar(x=years, y=res["rec_c"], name="Records", marker_color=ATMOPULSE_COLD["rec"], legend="legend2", **bar_kw), row=2, col=1)
+    fig.add_trace(_hover(("p25", "p10", "p5", "rec_c")), row=2, col=1)
+
+    y_warm = float((res["p75"] + res["p90"] + res["p95"] + res["rec_w"]).max())
+    y_cold = float((res["p25"] + res["p10"] + res["p5"] + res["rec_c"]).max())
     fig.update_layout(
         **plotly_typography(),
         barmode="stack",
         hovermode="x",
-        title=f"Days exceeding thresholds | {'1961–1990' if epoch=='A' else '1996–2025'}",
-        height=340,
-        margin=dict(t=40, b=88, l=50, r=20),
+        title=f"Days exceeding thresholds | {epoch_period_label(epoch)}",
+        height=580,
+        margin=dict(t=56, b=56, l=50, r=20),
         template="plotly_white",
         legend=dict(
-            orientation="h",
-            yanchor="top",
-            y=-0.28,
-            xanchor="center",
-            x=0.5,
-            bgcolor="rgba(0,0,0,0)",
+            orientation="h", y=0.63, yanchor="top",
+            x=0.5, xanchor="center", bgcolor="rgba(0,0,0,0)",
             traceorder="normal",
         ),
-        yaxis=dict(rangemode="tozero"),
-        xaxis=dict(automargin=True),
+        legend2=dict(
+            orientation="h", y=-0.06, yanchor="top",
+            x=0.5, xanchor="center", bgcolor="rgba(0,0,0,0)",
+            traceorder="normal",
+        ),
+        meta={
+            "y_warm_max": y_warm,
+            "y_cold_max": y_cold,
+            "press_csv": (
+                res.reset_index()
+                .rename(columns={
+                    res.index.name or "index": "year",
+                    "p75": "warm_moderate_days",
+                    "p90": "warm_strong_days",
+                    "p95": "warm_extreme_days",
+                    "rec_w": "warm_record_days",
+                    "p25": "cold_moderate_days",
+                    "p10": "cold_strong_days",
+                    "p5": "cold_extreme_days",
+                    "rec_c": "cold_record_days",
+                })
+                .to_csv(index=False)
+            ),
+        },
     )
+    grid = dict(
+        showgrid=True,
+        gridcolor=ATMOPULSE_OVERLAY["grid"],
+        gridwidth=1,
+        zeroline=False,
+    )
+    fig.update_yaxes(title_text="WSDI days" if wsdi else "days ≥ P75", rangemode="tozero", **grid, row=1, col=1)
+    fig.update_yaxes(title_text="CSDI days" if csdi else "days ≤ P25", rangemode="tozero", **grid, row=2, col=1)
+    fig.update_xaxes(dtick=20, tick0=1960, automargin=True, **grid, row=1, col=1)
+    fig.update_xaxes(dtick=20, tick0=1960, automargin=True, **grid, row=2, col=1)
     return fig
+
+
+def align_yearly_extremes_yranges(fig_a, fig_b):
+    """Same Warm/Cold y-scale on side-by-side Historical vs Recent charts."""
+    meta_a = fig_a.layout.meta or {}
+    meta_b = fig_b.layout.meta or {}
+    yw = max(float(meta_a.get("y_warm_max") or 0), float(meta_b.get("y_warm_max") or 0))
+    yc = max(float(meta_a.get("y_cold_max") or 0), float(meta_b.get("y_cold_max") or 0))
+    if yw > 0:
+        fig_a.update_yaxes(range=[0, yw * 1.08], row=1, col=1)
+        fig_b.update_yaxes(range=[0, yw * 1.08], row=1, col=1)
+    if yc > 0:
+        fig_a.update_yaxes(range=[0, yc * 1.08], row=2, col=1)
+        fig_b.update_yaxes(range=[0, yc * 1.08], row=2, col=1)
 
 
 # --- Point Wavogram ---
@@ -1228,7 +1726,7 @@ def build_kysely_wave_figs(payload: dict) -> tuple[go.Figure, go.Figure]:
     fig_main.update_layout(
         **plotly_typography(),
         title=dict(
-            text=f"Duration and Intensity of Local {parameter} {t_suff} (1940–2026) | {lvl_text}<br><span style='font-size:11px;color:gray;'>Reference Period {'1961–1990' if suffix=='A' else '1996–2025'}</span>",
+            text=f"Duration and Intensity of Local {parameter} {t_suff} (1940–2026) | {lvl_text}<br><span style='font-size:11px;color:gray;'>{epoch_period_label(suffix)}</span>",
             font=plotly_title_font(size=13),
         ),
         xaxis=dict(tickmode='array', tickvals=tick_vals, ticktext=tick_text, range=[start_plot_x, end_plot_x], showgrid=False, zeroline=False),
@@ -1284,6 +1782,20 @@ def build_kysely_wave_figs(payload: dict) -> tuple[go.Figure, go.Figure]:
     else:
         fig_main.add_annotation(text="No wave events detected.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False, font=dict(size=16, color="gray", family=ATMOPULSE_FONTS["sora_css"]))
 
+    wave_csv = None
+    if waves_data:
+        wave_csv = pd.DataFrame([
+            {
+                "year": w.get("year"),
+                "start_date": w.get("start_date"),
+                "end_date": w.get("end_date"),
+                "duration_days": w.get("duration_days"),
+                "intensity": w.get("intensity"),
+            }
+            for w in waves_data
+        ]).to_csv(index=False)
+        _attach_press_csv(fig_main, wave_csv)
+
     if stat_metric == "Annual Cycle Frequency":
         freq_series = payload["freq_series"]
         f_str, f_ext = freq_series["f_str"], freq_series["f_ext"]
@@ -1299,13 +1811,19 @@ def build_kysely_wave_figs(payload: dict) -> tuple[go.Figure, go.Figure]:
 
         fig_stats.update_layout(
             **plotly_typography(),
-            title=f"Annual Cycle Frequency (5-Day Smoothing) | Reference {'1961–1990' if suffix=='A' else '1996–2025'}",
+            title=f"Annual Cycle Frequency (5-Day Smoothing) | {epoch_period_label(suffix)}",
             xaxis=dict(tickmode='array', tickvals=tick_vals, ticktext=tick_text, showgrid=True),
             yaxis_title="Relative Frequency (%)",
             height=350, template="plotly_white",
             margin=dict(t=40, b=10, l=10, r=10),
             legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5)
         )
+        freq_csv = pd.DataFrame({
+            "plot_x": np.asarray(f_str.index),
+            "strong_pct": np.asarray(f_str.values),
+            "extreme_pct": np.asarray(f_ext.values),
+        }).to_csv(index=False)
+        _attach_press_csv(fig_stats, freq_csv)
         return fig_main, fig_stats
 
     stats = payload["annual_stats"]
@@ -1343,7 +1861,7 @@ def build_kysely_wave_figs(payload: dict) -> tuple[go.Figure, go.Figure]:
 
     fig_stats.update_layout(
         **plotly_typography(),
-        title=f"{stat_metric} | Reference Period {'1961–1990' if suffix=='A' else '1996–2025'}",
+        title=f"{stat_metric} | {epoch_period_label(suffix)}",
         height=350, template="plotly_white",
         margin=dict(t=40, b=10, l=55, r=10),
         legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
@@ -1351,5 +1869,6 @@ def build_kysely_wave_figs(payload: dict) -> tuple[go.Figure, go.Figure]:
         yaxis=dict(title=y_titles.get(sel_col, "Intensity (K·days)"), showgrid=True, gridcolor="rgba(180,180,180,0.35)", gridwidth=1, zeroline=False),
         bargap=0.15,
     )
+    _attach_press_csv(fig_stats, stats.reset_index().to_csv(index=False))
 
     return fig_main, fig_stats
