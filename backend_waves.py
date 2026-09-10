@@ -20,11 +20,13 @@ import json
 import os
 import subprocess
 import sys
+from collections import Counter
+from pathlib import Path
+
 import xarray as xr
 import numpy as np
 import pandas as pd
 import streamlit as st
-from pathlib import Path
 
 from backend_maps import drop_era5t_aux
 from config import ZARR_MASTER_TIME_SERIES
@@ -35,9 +37,8 @@ if not CLIM_FILE.exists():
     CLIM_FILE = Path("ERA5_ClimateTool/Reference_Climatology/climatology_reference.nc")
 
 # All parameters the Point Wavogram can plot. "var" is the on-disk/Zarr
-# variable name; "is_warm" drives season windowing (JJA/May-Sep vs
-# DJF/Nov-Mar), percentile direction (p75/90/95 vs p25/10/5), and detection
-# direction (>= threshold vs <= threshold) throughout this module.
+# variable name; "is_warm" is the default season/direction when the UI does
+# not pass an event-type override (Heatwaves vs Coldwaves).
 WAVE_PARAM_CONFIG = {
     "TX": {"var": "tx", "is_warm": True},
     "TN": {"var": "tn", "is_warm": False},
@@ -54,6 +55,13 @@ def _param_is_warm(parameter: str) -> bool:
     return WAVE_PARAM_CONFIG.get(parameter, {"is_warm": True})["is_warm"]
 
 
+def _resolve_is_warm(parameter: str, is_warm=None) -> bool:
+    """Heatwaves/Coldwaves from the UI wins; otherwise the parameter default."""
+    if is_warm is None:
+        return _param_is_warm(parameter)
+    return bool(is_warm)
+
+
 _POINT_SERIES_EXTRACT_SCRIPT = r"""
 import json, sys
 import numpy as np, pandas as pd, xarray as xr
@@ -66,7 +74,7 @@ try:
         ds = ds.rename({"mx2t": "tx"})
     if "mn2t" in ds.data_vars and "tn" not in ds.data_vars:
         ds = ds.rename({"mn2t": "tn"})
-    keep = [v for v in ("tx", "tn", "tg", "t850") if v in ds.data_vars]
+    keep = [v for v in ("tx", "tn", "tg", "t850", "z500") if v in ds.data_vars]
     if not keep:
         raise SystemExit(2)
     lat_name = "latitude" if "latitude" in ds.coords else "lat"
@@ -84,9 +92,22 @@ try:
         if finite.size and float(np.mean(finite)) > 100:
             a = a - 273.15
         return [None if not np.isfinite(x) else float(x) for x in a]
+    def _z(v):
+        if v not in pt:
+            return [None] * len(days)
+        a = np.squeeze(np.asarray(pt[v].values, dtype=float))
+        a = np.atleast_1d(a)
+        finite = a[np.isfinite(a)]
+        if finite.size:
+            sample = float(np.mean(finite))
+            if sample > 10000:
+                a = a / 9.80665 / 10.0
+            elif sample > 2000:
+                a = a / 10.0
+        return [None if not np.isfinite(x) else float(x) for x in a]
     payload = {"Date": [d.strftime("%Y-%m-%d") for d in days]}
     for v in keep:
-        payload[v] = _c(v)
+        payload[v] = _z(v) if v == "z500" else _c(v)
     json.dump(payload, sys.stdout)
 finally:
     ds.close()
@@ -117,6 +138,17 @@ def _point_series_from_master_isolated(path, lat, lon) -> pd.DataFrame:
 
 
 WAVE_ARCHIVE_VARS = ("tx", "tn", "tg", "t850")
+WAVE_SYNOPTIC_VARS = ("z500",)
+# Wave-mean Z500 anomaly (dam) that counts as a supporting ridge (heat)
+# or trough (cold). Two map-tracker anomaly isolines (8 dam), not one.
+WAVE_Z500_RIDGE_DAM = 8.0
+
+
+def _decode_point_var(name: str, values) -> np.ndarray:
+    if name == "z500":
+        from backend_io import _z500_to_dam
+        return _z500_to_dam(values)
+    return _kelvin_to_celsius_if_needed(values)
 
 
 def _kelvin_to_celsius_if_needed(arr: np.ndarray) -> np.ndarray:
@@ -143,7 +175,7 @@ def _era5_master_point_series_from_zarr(lat: float, lon: float) -> pd.DataFrame:
         except Exception:
             return pd.DataFrame()
 
-    keep = [v for v in WAVE_ARCHIVE_VARS if v in zds.data_vars]
+    keep = [v for v in WAVE_ARCHIVE_VARS + WAVE_SYNOPTIC_VARS if v in zds.data_vars]
     if not keep:
         return pd.DataFrame()
 
@@ -154,7 +186,7 @@ def _era5_master_point_series_from_zarr(lat: float, lon: float) -> pd.DataFrame:
             t = t.tz_convert("UTC").tz_localize(None)
         rec = {"Date": pd.DatetimeIndex(t).normalize()}
         for v in keep:
-            rec[v] = _kelvin_to_celsius_if_needed(pt[v].values)
+            rec[v] = _decode_point_var(v, pt[v].values)
         return pd.DataFrame(rec)
     except Exception:
         return pd.DataFrame()
@@ -185,7 +217,7 @@ def _era5_master_point_series_from_netcdf(lat: float, lon: float) -> list[pd.Dat
                 ds = ds.rename({"mx2t": "tx"})
             if "mn2t" in ds.data_vars and "tn" not in ds.data_vars:
                 ds = ds.rename({"mn2t": "tn"})
-            keep = [v for v in WAVE_ARCHIVE_VARS if v in ds.data_vars]
+            keep = [v for v in WAVE_ARCHIVE_VARS + WAVE_SYNOPTIC_VARS if v in ds.data_vars]
             if not keep:
                 continue
             lat_name = "latitude" if "latitude" in ds.coords else "lat"
@@ -196,7 +228,7 @@ def _era5_master_point_series_from_netcdf(lat: float, lon: float) -> list[pd.Dat
                 t = t.tz_convert("UTC").tz_localize(None)
             rec = {"Date": pd.DatetimeIndex(t).normalize()}
             for v in keep:
-                rec[v] = _kelvin_to_celsius_if_needed(pt[v].values)
+                rec[v] = _decode_point_var(v, pt[v].values)
             frames.append(pd.DataFrame(rec))
         except Exception:
             continue
@@ -210,8 +242,8 @@ def _era5_master_point_series_from_netcdf(lat: float, lon: float) -> list[pd.Dat
 
 
 @st.cache_data(show_spinner=False)
-def _era5_master_point_series(lat: float, lon: float, _archive_version=7) -> pd.DataFrame:
-    """Full 1940–present TX/TN/TG/T850 at one grid cell.
+def _era5_master_point_series(lat: float, lon: float, include_z500: bool = True, _archive_version=8) -> pd.DataFrame:
+    """Full 1940–present TX/TN/TG/T850 (and Z500) at one grid cell.
 
     Fast path: reads the point-extraction-optimal Zarr mirror of the master
     archive (see batch_convert_netcdf_to_zarr.py / config.ZARR_MASTER_TIME_SERIES)
@@ -221,7 +253,7 @@ def _era5_master_point_series(lat: float, lon: float, _archive_version=7) -> pd.
     the migration having been run.
 
     IFS/AIFS is overlaid solely for the last 6 days through the forecast,
-    for whichever of tx/tn/tg/t850 the live forecast dataset carries.
+    for whichever of tx/tn/tg/t850/z500 the live forecast dataset carries.
     """
     from backend_maps import _open_live_forecast_ds, LIVE_OVERLAY_PAST_DAYS
 
@@ -253,6 +285,9 @@ def _era5_master_point_series(lat: float, lon: float, _archive_version=7) -> pd.
                 if extra in pt.data_vars:
                     rec[extra] = _kelvin_to_celsius_if_needed(pt[extra].values)
                     has_any = True
+            if "z500" in pt.data_vars:
+                rec["z500"] = _decode_point_var("z500", pt["z500"].values)
+                has_any = True
             if has_any:
                 frames.append(pd.DataFrame(rec))
         except Exception:
@@ -285,20 +320,21 @@ def _load_waves_climatology():
 
 
 @st.cache_data(show_spinner=False)
-def _wave_season_thresholds(lat: float, lon: float, suffix: str, parameter: str = "TX") -> dict:
+def _wave_season_thresholds(lat: float, lon: float, suffix: str, parameter: str = "TX", is_warm=None) -> dict:
     """
-    Kyselý seasonal thresholds from true 24h daily max (JJA, warm params:
-    TX/TG/T850) / min (DJF, TN) of the requested `parameter`, read via
+    Kyselý seasonal thresholds from true 24h daily max (JJA, heat) / min
+    (DJF, cold) of the requested `parameter`, read via
     `_era5_master_point_series` (Zarr fast path, NetCDF fallback). IFS/AIFS
     is used only for the last 6 days and the forecast — never as a
-    historical fill.
+    historical fill. `is_warm` follows Heatwaves/Coldwaves when the UI
+    passes it; otherwise the parameter default (TX/TG/T850 warm, TN cold).
 
     Returned dict keys are prefixed with the parameter's variable name
     (e.g. "tx_p75"/"tg_p90"/"t850_p95") so multiple parameters' thresholds
     never collide, plus "epoch_years".
     """
     var_key = _param_var(parameter)
-    is_warm = _param_is_warm(parameter)
+    is_warm = _resolve_is_warm(parameter, is_warm)
 
     df_pt = _era5_master_point_series(lat, lon)
     if df_pt.empty or var_key not in df_pt.columns:
@@ -340,7 +376,7 @@ def _wave_season_thresholds(lat: float, lon: float, suffix: str, parameter: str 
     return result
 
 
-def _prepare_wave_season_df(lat, lon, parameter="TX") -> tuple[pd.DataFrame, str, dict]:
+def _prepare_wave_season_df(lat, lon, parameter="TX", is_warm=None) -> tuple[pd.DataFrame, str, dict]:
     """
     Shared data-prep pipeline for Kyselý wave analytics: point extraction,
     Kelvin normalization, Feb-29 excision, true-24h daily resampling and
@@ -349,6 +385,7 @@ def _prepare_wave_season_df(lat, lon, parameter="TX") -> tuple[pd.DataFrame, str
     Factored out so `compute_kysely_waves_data` (ridge-plot data) and
     the historical-rank lookup (`get_wave_historical_rank`) run the exact
     same season/day construction and can never silently drift apart.
+    `is_warm` is the Heatwaves/Coldwaves override when the UI passes it.
 
     Returns (df_season, group_key, diagnostics) where `diagnostics` carries
     the raw-value QA fields used by the ridge-plot's debug panel.
@@ -358,7 +395,7 @@ def _prepare_wave_season_df(lat, lon, parameter="TX") -> tuple[pd.DataFrame, str
         return pd.DataFrame(), "", {}
 
     var_key = _param_var(parameter)
-    is_warm = _param_is_warm(parameter)
+    is_warm = _resolve_is_warm(parameter, is_warm)
     if var_key not in df_pt.columns:
         return pd.DataFrame(), "", {}
 
@@ -406,7 +443,7 @@ def _prepare_wave_season_df(lat, lon, parameter="TX") -> tuple[pd.DataFrame, str
     return df_season, group_key, diagnostics
 
 
-def _detect_kysely_waves(df_season: pd.DataFrame, group_key: str, p_thresh: float, p_drop: float, parameter: str) -> list[dict]:
+def _detect_kysely_waves(df_season: pd.DataFrame, group_key: str, p_thresh: float, p_drop: float, parameter: str, is_warm=None) -> list[dict]:
     """
     Core Kyselý wave-detection loop (>=3 consecutive days past `p_thresh`,
     continues while the running mean stays past it, breaks on a single-day
@@ -418,7 +455,7 @@ def _detect_kysely_waves(df_season: pd.DataFrame, group_key: str, p_thresh: floa
     season-days in the event) on top of the ridge-plot's native fields.
     """
     waves_data: list[dict] = []
-    is_warm = _param_is_warm(parameter)
+    is_warm = _resolve_is_warm(parameter, is_warm)
 
     for yr, group in df_season.groupby(group_key):
         group = group.drop_duplicates(subset=['date'], keep='first')
@@ -481,6 +518,53 @@ def _detect_kysely_waves(df_season: pd.DataFrame, group_key: str, p_thresh: floa
     return waves_data
 
 
+def _attach_wave_z500_anomalies(waves_data: list[dict], lat, lon, suffix: str) -> None:
+    """Mean Z500 anomaly (dam) over each wave window vs that epoch's DOY mean.
+
+    Does not change Kyselý detection. Missing Z500 or climatology leaves
+    the anomaly fields unset / NaN. Mean, max and min are all over the
+    full [start, end] window.
+    """
+    if not waves_data:
+        return
+    from backend_io import load_synoptic_climatology, synoptic_clim_point_doy
+    from backend_maps import etccdi_doy_365
+
+    df_pt = _era5_master_point_series(lat, lon)
+    if df_pt.empty or "z500" not in df_pt.columns:
+        return
+    clim = synoptic_clim_point_doy(load_synoptic_climatology(), "z500", suffix, lat, lon)
+    if clim is None or clim.size < 365:
+        return
+
+    dates_pt = pd.DatetimeIndex(pd.to_datetime(df_pt["Date"]))
+    if dates_pt.tz is not None:
+        dates_pt = dates_pt.tz_convert("UTC").tz_localize(None)
+    dates_pt = dates_pt.normalize()
+    z_vals = np.asarray(df_pt["z500"].values, dtype=np.float64)
+
+    for w in waves_data:
+        start = pd.Timestamp(w["start_date"]).normalize()
+        end = pd.Timestamp(w["end_date"]).normalize()
+        mask = (dates_pt >= start) & (dates_pt <= end)
+        if not bool(np.any(mask)):
+            w["z500_anom_mean"] = float("nan")
+            w["z500_anom_max"] = float("nan")
+            w["z500_anom_min"] = float("nan")
+            continue
+        doys = etccdi_doy_365(dates_pt[mask])
+        z_clim = clim[np.clip(doys - 1, 0, len(clim) - 1)]
+        anom = z_vals[mask] - z_clim
+        if np.isfinite(anom).any():
+            w["z500_anom_mean"] = float(np.nanmean(anom))
+            w["z500_anom_max"] = float(np.nanmax(anom))
+            w["z500_anom_min"] = float(np.nanmin(anom))
+        else:
+            w["z500_anom_mean"] = float("nan")
+            w["z500_anom_max"] = float("nan")
+            w["z500_anom_min"] = float("nan")
+
+
 _ORDINAL_SUFFIXES = {1: "st", 2: "nd", 3: "rd"}
 
 
@@ -489,9 +573,47 @@ def _ordinal(n: int) -> str:
     return f"{n}{suffix}"
 
 
+def _wave_day_frequency(waves_data, df_season, group_key, n_plot_x) -> pd.Series:
+    """Percent of years in which that season-day sits inside a detected wave.
+
+    Isolated threshold exceedances that never formed a 3-day Kyselý event
+    do not count. Zeros stay zero so the frequency panel can hide empty
+    stretches of the season. A 5-day centered rolling mean matches the
+    previous threshold-day smoother.
+    """
+    idx = list(range(1, int(n_plot_x) + 1))
+    if df_season is None or df_season.empty:
+        return pd.Series(np.nan, index=idx)
+
+    wave_days = set()
+    for w in waves_data or []:
+        yr = int(w["year"])
+        for x in w.get("xs", []):
+            wave_days.add((yr, int(x)))
+
+    valid = df_season.dropna(subset=["Temp"]).copy()
+    if valid.empty:
+        return pd.Series(np.nan, index=idx)
+
+    px = pd.to_numeric(valid["plot_x"], errors="coerce")
+    valid = valid.loc[px.notna()].copy()
+    valid["plot_x"] = px.loc[valid.index].astype(int)
+    n_map = valid.groupby("plot_x")[group_key].nunique().to_dict()
+    n_map = {int(k): int(v) for k, v in n_map.items()}
+    counts = Counter(x for (_yr, x) in wave_days)
+    pct = []
+    for x in idx:
+        n = n_map.get(x, 0)
+        if n <= 0:
+            pct.append(np.nan)
+        else:
+            pct.append(100.0 * counts.get(x, 0) / n)
+    return pd.Series(pct, index=idx).rolling(5, center=True, min_periods=1).mean()
+
+
 def get_wave_historical_rank(
     lat, lon, parameter="TX", selected_epoch="B", threshold_level="Strong (P90/10)",
-    target_date=None, top_n: int = 20,
+    target_date=None, top_n: int = 20, is_warm=None,
 ) -> dict | None:
     """
     Point Wavogram historical-rank narrative logic (backend_narrative.py
@@ -508,8 +630,8 @@ def get_wave_historical_rank(
     """
     suffix = "A" if selected_epoch == "A" else "B"
     var_key = _param_var(parameter)
-    is_warm = _param_is_warm(parameter)
-    thr = _wave_season_thresholds(lat, lon, suffix, parameter)
+    is_warm = _resolve_is_warm(parameter, is_warm)
+    thr = _wave_season_thresholds(lat, lon, suffix, parameter, is_warm=is_warm)
     if not thr:
         return None
 
@@ -523,11 +645,11 @@ def get_wave_historical_rank(
     if np.isnan(p_thresh) or np.isnan(p_drop):
         return None
 
-    df_season, group_key, _ = _prepare_wave_season_df(lat, lon, parameter)
+    df_season, group_key, _ = _prepare_wave_season_df(lat, lon, parameter, is_warm=is_warm)
     if df_season.empty:
         return None
 
-    waves_data = _detect_kysely_waves(df_season, group_key, p_thresh, p_drop, parameter)
+    waves_data = _detect_kysely_waves(df_season, group_key, p_thresh, p_drop, parameter, is_warm=is_warm)
     if not waves_data:
         return None
 
@@ -560,28 +682,32 @@ def get_wave_historical_rank(
 
 
 @st.cache_data(show_spinner=False)
-def compute_kysely_waves_data(lat, lon, parameter="TX", selected_epoch="B", threshold_level="Strong (P90/10)", stat_metric="Cumulative Annual Wave Intensity"):
+def compute_kysely_waves_data(lat, lon, parameter="TX", selected_epoch="B", threshold_level="Strong (P90/10)", stat_metric="Cumulative Annual Wave Intensity", is_warm=None, z500_ctx=5):
     """
     Compute-only payload for the Point Wavogram (ridge-plot + stats panel).
     Pure pandas/numpy/xarray — no Plotly, no theme, no drawing-only spline
     smoothing (that lives in `frontend_plots.build_kysely_wave_figs`, along
     with the WAVE_RIDGE_*/WAVE_BREAK_* aesthetic constants). Cached on the
-    hashable (lat, lon, parameter, selected_epoch, threshold_level,
-    stat_metric) inputs; the two rendered Figures are built from this
+    hashable (lat, lon, parameter, selected_epoch, threshold_level, is_warm)
+    inputs. Annual intensity stacks and the seasonal frequency series are
+    always computed together. The two rendered Figures are built from this
     unhashed payload separately so they never have to be pickled/hashed by
     Streamlit's cache.
 
     `empty=True` means "the caller should render the placeholder figure" —
     same trigger conditions (missing archive, missing thresholds, empty
     season data, NaN thresholds) as the previous `get_kiesely_waves_figs`.
+    Frequency is the share of years in which that season-day belongs to a
+    detected Strong / Extreme Kyselý wave, not isolated threshold days.
     """
     suffix = "A" if selected_epoch == "A" else "B"
+    is_warm = _resolve_is_warm(parameter, is_warm)
     base = {
         "empty": True,
         "parameter": parameter,
         "epoch": suffix,
         "threshold_level": threshold_level,
-        "stat_metric": stat_metric,
+        "is_warm": is_warm,
     }
 
     ds_archive = _load_waves_archive_ds()
@@ -589,8 +715,7 @@ def compute_kysely_waves_data(lat, lon, parameter="TX", selected_epoch="B", thre
         return base
 
     var_key = _param_var(parameter)
-    is_warm = _param_is_warm(parameter)
-    thr = _wave_season_thresholds(lat, lon, suffix, parameter)
+    thr = _wave_season_thresholds(lat, lon, suffix, parameter, is_warm=is_warm)
     if not thr:
         return base
 
@@ -605,13 +730,16 @@ def compute_kysely_waves_data(lat, lon, parameter="TX", selected_epoch="B", thre
     if np.isnan(p_thresh) or np.isnan(p_drop):
         return base
 
-    df_season, group_key, diagnostics = _prepare_wave_season_df(lat, lon, parameter)
+    df_season, group_key, diagnostics = _prepare_wave_season_df(lat, lon, parameter, is_warm=is_warm)
     if df_season.empty:
         return base
 
     # SUMMER-BUG FIX: _detect_kysely_waves() reindexes each season group onto
     # a full native Pandas date range internally, forcing clean date/day counting.
-    waves_data = _detect_kysely_waves(df_season, group_key, p_thresh, p_drop, parameter)
+    waves_str = _detect_kysely_waves(df_season, group_key, p_t_str, p_d_str, parameter, is_warm=is_warm)
+    waves_ext = _detect_kysely_waves(df_season, group_key, p_t_ext, p_d_ext, parameter, is_warm=is_warm)
+    waves_data = waves_ext if "Extreme" in threshold_level else waves_str
+    _attach_wave_z500_anomalies(waves_data, lat, lon, suffix)
 
     # TEMP DIAGNOSTICS (see app.py debug panel) — safe to remove once the
     # TX-vs-TN wave-count discrepancy is root-caused.
@@ -637,12 +765,12 @@ def compute_kysely_waves_data(lat, lon, parameter="TX", selected_epoch="B", thre
         "parameter": parameter,
         "epoch": suffix,
         "threshold_level": threshold_level,
-        "stat_metric": stat_metric,
         "is_warm": is_warm,
         "var_key": var_key,
         # Wave table / ridge series: one dict per detected event (year, xs,
         # temps, intensity, start_date, end_date, duration_days).
         "waves_data": waves_data,
+        "z500_ridge_dam": WAVE_Z500_RIDGE_DAM,
         "group_key": group_key,
         "p_thresh": p_thresh,
         "p_drop": p_drop,
@@ -654,27 +782,60 @@ def compute_kysely_waves_data(lat, lon, parameter="TX", selected_epoch="B", thre
 
     start_year, end_year = 1940, 2026
 
-    if stat_metric == "Annual Cycle Frequency":
-        df_season = df_season.copy()
-        df_season['is_str'] = (df_season['Temp'] >= p_t_str) if is_warm else (df_season['Temp'] <= p_t_str)
-        df_season['is_ext'] = (df_season['Temp'] >= p_t_ext) if is_warm else (df_season['Temp'] <= p_t_ext)
-        f_str = (df_season.groupby('plot_x')['is_str'].mean() * 100).rolling(5, center=True, min_periods=1).mean()
-        f_ext = (df_season.groupby('plot_x')['is_ext'].mean() * 100).rolling(5, center=True, min_periods=1).mean()
-        # Annual stats table (bar/trend panel) — mutually exclusive with the
-        # frequency series above, mirroring the original single-branch logic.
-        payload["freq_series"] = {"f_str": f_str, "f_ext": f_ext}
-        return payload
+    n_plot_x = 153 if is_warm else 152
+    payload["freq_series"] = {
+        "f_str": _wave_day_frequency(waves_str, df_season, group_key, n_plot_x),
+        "f_ext": _wave_day_frequency(waves_ext, df_season, group_key, n_plot_x),
+    }
 
     stats = pd.DataFrame(index=np.arange(start_year, end_year + 1))
-    stats['max_int'], stats['sum_int'], stats['total_heat'] = 0.0, 0.0, 0.0
+    stats["max_int"] = 0.0
+    stats["sum_int"] = 0.0
+    stats["total_heat"] = 0.0
+    stats["max_days"] = 0.0
+    stats["sum_days"] = 0.0
+    stats["isolated_days"] = 0.0
+    stats["max_z500_mean"] = np.nan
+    stats["max_z500_ext"] = np.nan
+    stats["max_supporting"] = 0.0
+
+    wave_day_keys = {
+        (int(w["year"]), int(x))
+        for w in waves_data
+        for x in w.get("xs", [])
+    }
 
     for yr in stats.index:
-        y_waves = [w for w in waves_data if w['year'] == yr]
+        y_waves = [w for w in waves_data if int(w["year"]) == int(yr)]
         if y_waves:
-            stats.loc[yr, 'max_int'] = max(w['intensity'] for w in y_waves)
-            stats.loc[yr, 'sum_int'] = sum(w['intensity'] for w in y_waves)
+            stats.loc[yr, "max_int"] = max(w["intensity"] for w in y_waves)
+            stats.loc[yr, "sum_int"] = sum(w["intensity"] for w in y_waves)
+            top = max(y_waves, key=lambda w: w["intensity"])
+            stats.loc[yr, "max_days"] = float(top["duration_days"])
+            stats.loc[yr, "sum_days"] = float(sum(w["duration_days"] for w in y_waves))
+            z_mean = top.get("z500_anom_mean")
+            z_mean = float(z_mean) if z_mean is not None and np.isfinite(z_mean) else float("nan")
+            z_ext = top.get("z500_anom_max") if is_warm else top.get("z500_anom_min")
+            z_ext = float(z_ext) if z_ext is not None and np.isfinite(z_ext) else float("nan")
+            stats.loc[yr, "max_z500_mean"] = z_mean
+            stats.loc[yr, "max_z500_ext"] = z_ext
+            if np.isfinite(z_mean):
+                supporting = (z_mean >= WAVE_Z500_RIDGE_DAM) if is_warm else (z_mean <= -WAVE_Z500_RIDGE_DAM)
+                stats.loc[yr, "max_supporting"] = 1.0 if supporting else 0.0
         y_df = df_season[df_season[group_key] == yr]
-        stats.loc[yr, 'total_heat'] = sum(t - p_thresh for t in y_df['Temp'] if t >= p_thresh) if is_warm else sum(p_thresh - t for t in y_df['Temp'] if t <= p_thresh)
+        temps = np.asarray(y_df["Temp"], dtype=float)
+        px = pd.to_numeric(y_df["plot_x"], errors="coerce")
+        if is_warm:
+            stats.loc[yr, "total_heat"] = sum(t - p_thresh for t in temps if t >= p_thresh)
+            exc = temps >= p_thresh
+        else:
+            stats.loc[yr, "total_heat"] = sum(p_thresh - t for t in temps if t <= p_thresh)
+            exc = temps <= p_thresh
+        in_wave = np.array([
+            (int(yr), int(x)) in wave_day_keys if np.isfinite(x) else False
+            for x in px
+        ], dtype=bool)
+        stats.loc[yr, "isolated_days"] = float(np.sum(np.isfinite(temps) & exc & ~in_wave))
 
     payload["annual_stats"] = stats
     return payload

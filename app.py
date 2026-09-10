@@ -17,7 +17,6 @@ Core functionalities:
   ETCCDI-compliant 365-day leap-year adjustments.
 """
 
-import base64
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -72,30 +71,37 @@ from config import (
     is_daily_map_view,
     epoch_period_label,
     epoch_from_label,
+    meteo_var_code,
 )
 from frontend_widgets import render_grid_cell_profile
 from page_map_tracker import render_map_tracker
 from page_meteogram import render_meteogram
-from frontend_plots import st_plotly_press
+from frontend_plots import st_plotly_press, align_wave_stats_yranges
 
 
 # --- WAVE CACHE WRAPPER ---
 # `compute_kysely_waves_data` (backend_waves.py, compute-only: pandas/numpy/
 # xarray) is cached on the hashable (lat, lon, param_code, selected_epoch,
-# wave_thresh, wave_stat_metric) inputs. `build_kysely_wave_figs`
+# wave_thresh, is_warm) inputs. `build_kysely_wave_figs`
 # (frontend_plots.py) then turns that payload into the two Plotly Figures —
 # kept OUT of the cached function so Streamlit never has to hash/pickle
 # go.Figure objects. Owned by app.py (not backend_io.py) so backend_io never
 # has to import backend_waves, and backend_waves never has to import Plotly.
 @st.cache_data(show_spinner=False)
-def _compute_wave_payload(lat_target, lon_target, param_code, selected_epoch, wave_thresh, wave_stat_metric, _axis_version=4):
-    return compute_kysely_waves_data(lat_target, lon_target, parameter=param_code, selected_epoch=selected_epoch, threshold_level=wave_thresh, stat_metric=wave_stat_metric)
+def _compute_wave_payload(lat_target, lon_target, param_code, selected_epoch, wave_thresh, is_warm=True, z500_ctx=5):
+    return compute_kysely_waves_data(
+        lat_target, lon_target, parameter=param_code, selected_epoch=selected_epoch,
+        threshold_level=wave_thresh, is_warm=is_warm, z500_ctx=z500_ctx,
+    )
 
 
-def fetch_wave_figs(lat_target, lon_target, param_code, selected_epoch, wave_thresh, wave_stat_metric, _axis_version=4):
+def fetch_wave_figs(lat_target, lon_target, param_code, selected_epoch, wave_thresh, is_warm=True, z500_outline=False, stack_metric="Intensity", z500_ctx=5):
     from frontend_plots import build_kysely_wave_figs
-    payload = _compute_wave_payload(lat_target, lon_target, param_code, selected_epoch, wave_thresh, wave_stat_metric, _axis_version=_axis_version)
-    return build_kysely_wave_figs(payload)
+    payload = _compute_wave_payload(
+        lat_target, lon_target, param_code, selected_epoch, wave_thresh,
+        is_warm=is_warm, z500_ctx=z500_ctx,
+    )
+    return build_kysely_wave_figs(payload, z500_outline=z500_outline, stack_metric=stack_metric)
 
 # --- UI & CSS: TOP NAVIGATION BAR ---
 st.set_page_config(page_title="AtmoPulse", layout="wide", page_icon="assets/favicon.svg", initial_sidebar_state="expanded")
@@ -435,6 +441,26 @@ with st.sidebar:
                     )
                 else:
                     toggles["z500"] = STANDARD_DEFAULTS["z500"]
+                if show_expert("synoptic_anomalies"):
+                    toggles["mslp_anom"] = st.checkbox(
+                        "Sea-level pressure anomaly",
+                        value=STANDARD_DEFAULTS["mslp_anom"],
+                        help=HELP["mslp_anomaly"],
+                        key="map_overlay_mslp_anom",
+                    )
+                    toggles["z500_anom"] = st.checkbox(
+                        "\u200b500 hPa height anomaly",
+                        value=STANDARD_DEFAULTS["z500_anom"],
+                        help=HELP["z500_anomaly"],
+                        key="map_overlay_z500_anom",
+                    )
+                    st.caption(
+                        "Anomaly isolines are relative to each map's reference period. "
+                        "Solid = above that DOY mean, dashed = below."
+                    )
+                else:
+                    toggles["mslp_anom"] = STANDARD_DEFAULTS["mslp_anom"]
+                    toggles["z500_anom"] = STANDARD_DEFAULTS["z500_anom"]
             
         elif nav_selection in (NAV_METEO, NAV_WAVE):
             st.markdown("---")
@@ -467,16 +493,37 @@ with st.sidebar:
             
             if nav_selection == NAV_WAVE:
                 wave_focus = st.radio("Wave Event Type:", ("Heatwaves", "Coldwaves"), index=default_wave_idx, help=HELP["wave_event_type"])
-                wave_thresh = st.radio("Wave Intensity Threshold:", ("Strong", "Extreme"), help=HELP["wave_intensity_threshold"])
-                if show_expert("wave_stat_metric"):
-                    st.markdown("---")
-                    wave_stat_metric = st.radio(
-                        "Wave Statistic Metric:", 
-                        ("Cumulative Annual Wave Intensity", "Maximum Annual Wave Intensity", "Cumulative Heat/Cold Intensity", "Annual Cycle Frequency"),
-                        help=HELP["wave_stat_metric"],
+                is_warm = "Heatwaves" in wave_focus
+                if show_expert("meteo_tx_tn") or show_expert("t850"):
+                    if "wave_var" not in st.session_state:
+                        st.session_state.wave_var = (
+                            "Maximum Temperature (TX)" if is_warm else "Minimum Temperature (TN)"
+                        )
+                    wave_var = st.radio(
+                        "Variable:",
+                        MAP_VAR_OPTIONS,
+                        key="wave_var",
+                        help=HELP["map_variable"],
                     )
                 else:
-                    wave_stat_metric = STANDARD_DEFAULTS["wave_stat_metric"]
+                    wave_var = "Maximum Temperature (TX)" if is_warm else "Minimum Temperature (TN)"
+                wave_thresh = st.radio("Wave Intensity Threshold:", ("Strong", "Extreme"), help=HELP["wave_intensity_threshold"])
+                wave_stack_metric = st.radio(
+                    "Wave statistic:",
+                    ("Intensity", "Days"),
+                    index=0,
+                    help=HELP["wave_stack_metric"],
+                    key="wave_stack_metric",
+                )
+                if show_expert("z500"):
+                    wave_z500_outline = st.checkbox(
+                        "\u200b500 hPa ridge/trough outline",
+                        value=STANDARD_DEFAULTS["wave_z500_outline"],
+                        help=HELP["wave_z500_outline"],
+                        key="wave_z500_outline",
+                    )
+                else:
+                    wave_z500_outline = STANDARD_DEFAULTS["wave_z500_outline"]
 
 if nav_selection == NAV_WELCOME:
     st.markdown(f"### Welcome to {atmopulse_wordmark_html()}", unsafe_allow_html=True)
@@ -591,15 +638,24 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                 st.warning(AIFS_TXTN_WARNING)
             else:
                 with st.spinner("Generating Historical Waves..."):
-                    param_code = "TX" if "Heatwaves" in wave_focus else "TN"
-                    fig_m_a, fig_s_a = fetch_wave_figs(lat_target, lon_target, param_code, "A", wave_thresh, wave_stat_metric)
-                    fig_m_b, fig_s_b = fetch_wave_figs(lat_target, lon_target, param_code, "B", wave_thresh, wave_stat_metric)
+                    param_code = meteo_var_code(wave_var)
+                    fig_m_a, fig_s_a, fig_f_a = fetch_wave_figs(
+                        lat_target, lon_target, param_code, "A", wave_thresh,
+                        is_warm=is_warm, z500_outline=wave_z500_outline,
+                        stack_metric=wave_stack_metric,
+                    )
+                    fig_m_b, fig_s_b, fig_f_b = fetch_wave_figs(
+                        lat_target, lon_target, param_code, "B", wave_thresh,
+                        is_warm=is_warm, z500_outline=wave_z500_outline,
+                        stack_metric=wave_stack_metric,
+                    )
 
                 # STATIC vs. UI overlay state: always ranks against the full 1940-present
                 # ERA5 record, independent of the Side-by-Side / Flicker layout selected above.
                 wave_rank_info = get_wave_historical_rank(
                     lat_target, lon_target, parameter=param_code,
                     selected_epoch="B", threshold_level=wave_thresh,
+                    is_warm=is_warm,
                 )
                 if wave_rank_info is not None:
                     wave_rank_text = (
@@ -609,71 +665,41 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                     )
                     st.markdown(f"**{wave_rank_text}**")
 
-                def get_safe_max(fig, fallback=100.0):
-                    """Type-safe max across all trace y-values.
-
-                    Plotly (esp. after Streamlit caching round-trips figures
-                    through JSON) may hand back t.y in several shapes:
-                    - a tuple of numpy scalars / plain floats / None
-                    - Plotly's compact "typed array" encoding, a dict like
-                      {'dtype': 'f8', 'bdata': '<base64>'}, which Plotly.js
-                      itself understands but np.asarray(..., dtype=float)
-                      chokes on ("float() argument must be a string or a
-                      real number, not 'dict'").
-                    This decodes both shapes and always returns a plain
-                    float, so downstream `g_max = ... * 1.1` never breaks.
-                    """
-                    def _to_array(y):
-                        if y is None:
-                            return np.array([], dtype=np.float64)
-                        if isinstance(y, dict):
-                            try:
-                                raw = base64.b64decode(y["bdata"])
-                                return np.frombuffer(raw, dtype=np.dtype(y["dtype"])).astype(np.float64)
-                            except Exception:
-                                return np.array([], dtype=np.float64)
-                        try:
-                            return np.asarray(y, dtype=np.float64).ravel()
-                        except (TypeError, ValueError):
-                            # Mixed list (e.g. stray dict/None entries mixed
-                            # with numbers) — coerce element-by-element and
-                            # silently drop anything non-numeric.
-                            cleaned = []
-                            for v in y:
-                                try:
-                                    cleaned.append(float(v))
-                                except (TypeError, ValueError):
-                                    continue
-                            return np.asarray(cleaned, dtype=np.float64)
-
-                    best = None
-                    for t in fig.data:
-                        arr = _to_array(getattr(t, "y", None))
-                        if arr.size == 0:
-                            continue
-                        arr = arr[np.isfinite(arr)]
-                        if arr.size == 0:
-                            continue
-                        local_max = float(arr.max())
-                        if best is None or local_max > best:
-                            best = local_max
-                    return float(best) if best is not None else float(fallback)
-
                 if fig_s_a.data and fig_s_b.data:
-                    max_a = get_safe_max(fig_s_a)
-                    max_b = get_safe_max(fig_s_b)
-                    g_max = max(max_a, max_b) * 1.1
-                    fig_s_a.update_yaxes(range=[0, g_max])
-                    fig_s_b.update_yaxes(range=[0, g_max])
+                    align_wave_stats_yranges(fig_s_a, fig_s_b, fig_f_a, fig_f_b)
+
+                stack_heading = (
+                    "Intensity [days]"
+                    if str(wave_stack_metric).lower().startswith("day")
+                    else "Intensity [K]"
+                )
 
                 if map_layout == LAYOUT_SIDE_BY_SIDE:
                     w_col1, w_col2 = st.columns(2)
                     with w_col1:
                         st_plotly_press(fig_m_a, "wavogram_ridge_historical")
+                        st.markdown(
+                            f"**{stack_heading} | {epoch_period_label('A')}**",
+                            help=HELP["wave_annual_stack"],
+                        )
                         st_plotly_press(fig_s_a, "wavogram_stats_historical")
+                        st.markdown(
+                            f"**Frequency [%] | {epoch_period_label('A')}**",
+                            help=HELP["wave_annual_cycle"],
+                        )
+                        st_plotly_press(fig_f_a, "wavogram_freq_historical")
                     with w_col2:
                         st_plotly_press(fig_m_b, "wavogram_ridge_recent")
+                        st.markdown(
+                            f"**{stack_heading} | {epoch_period_label('B')}**",
+                            help=HELP["wave_annual_stack"],
+                        )
                         st_plotly_press(fig_s_b, "wavogram_stats_recent")
+                        st.markdown(
+                            f"**Frequency [%] | {epoch_period_label('B')}**",
+                            help=HELP["wave_annual_cycle"],
+                        )
+                        st_plotly_press(fig_f_b, "wavogram_freq_recent")
                 else:
                     flicker_epoch = st.radio(
                         "Select Reference Period:",
@@ -681,8 +707,21 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                         horizontal=True, key="wave_ep", index=1,
                     )
                     use_a = epoch_from_label(flicker_epoch) == "A"
-                    st_plotly_press(fig_m_a if use_a else fig_m_b, f"wavogram_ridge_{'A' if use_a else 'B'}")
-                    st_plotly_press(fig_s_a if use_a else fig_s_b, f"wavogram_stats_{'A' if use_a else 'B'}")
+                    ep = "A" if use_a else "B"
+                    st_plotly_press(fig_m_a if use_a else fig_m_b, f"wavogram_ridge_{ep}")
+                    st.markdown(
+                        f"**{stack_heading} | {epoch_period_label(ep)}**",
+                        help=HELP["wave_annual_stack"],
+                    )
+                    st_plotly_press(fig_s_a if use_a else fig_s_b, f"wavogram_stats_{ep}")
+                    st.markdown(
+                        f"**Frequency [%] | {epoch_period_label(ep)}**",
+                        help=HELP["wave_annual_cycle"],
+                    )
+                    st_plotly_press(fig_f_a if use_a else fig_f_b, f"wavogram_freq_{ep}")
+
+                if show_expert("z500") and wave_z500_outline:
+                    st.caption(HELP["wave_z500_outline"])
 
 elif nav_selection == NAV_METHODS:
     methods_md = _load_markdown_page(METHODS_MD)

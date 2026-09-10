@@ -37,7 +37,12 @@ from backend_analytics import (
     _yyyymmdd_dot_date_arr,
 )
 from backend_maps import _synoptic_array, etccdi_doy_365
-from backend_io import load_invariant_fields, point_clim_ladder
+from backend_io import (
+    load_invariant_fields,
+    point_clim_ladder,
+    synoptic_clim_mean_display,
+    synoptic_clim_point_doy,
+)
 from config import epoch_period_label
 from atmopulse_theme import (
     ATMOPULSE_BRAND,
@@ -53,7 +58,7 @@ from atmopulse_theme import (
     plotly_typography,
     warm_rgba,
 )
-from config import MAP_VAR_LABELS, PERSISTENCE_COLORBAR_DAYS, is_aifs_model, is_daily_map_view, meteo_var_code, selected_forecast_model
+from config import MAP_VAR_LABELS, PERSISTENCE_COLORBAR_DAYS, is_aifs_model, is_daily_map_view, meteo_var_code, selected_forecast_model, show_expert
 
 # --- Point Wavogram ridge-plot layout (tune wave shape / break aesthetics
 # here — drawing-only, moved from backend_waves.py so that module stays
@@ -66,6 +71,7 @@ WAVE_BREAK_TAIL_STEPS = 30       # Number of points along the decay tail
 WAVE_BREAK_CTRL_X = -0.25        # Bezier ctrl-x (× tail_len); negative -> mid-fall bulges left
 WAVE_BREAK_CTRL_Y = 0.42         # Bezier ctrl-y (× peak height); shapes the curl
 WAVE_LINE_WIDTH = 1.0
+WAVE_Z500_LINE_WIDTH = 1.7  # Expert outline when wave-mean Z500 anomaly supports the event
 WAVE_FILL_ALPHA_BASE = 0.55      # Gradient fill opacity at ridge base
 WAVE_FILL_ALPHA_PEAK = 0.88      # Gradient fill opacity at ridge peak
 WAVE_LINE_ALPHA = 0.92
@@ -119,6 +125,26 @@ MAP_VIEW_LAT = (EUROPE_BBOX[1], EUROPE_BBOX[3])
 MAP_CONTOUR_LINE_WIDTH = 1.35
 MAP_CONTOUR_LINE_SMOOTHING = 1.15
 _MSLP_CONTOUR_SMOOTH_SIGMA = 2.8
+_Z500_ANOM_SMOOTH_SIGMA = 1.4
+# Isoline intervals. MSLP is hPa; Z500 is dam (decameters of geopotential
+# height), never hPa. Absolute MSLP uses the WMO/synoptic 5 hPa step.
+# Absolute Z500 uses 8 dam so the overlay stays readable on the percentile
+# heatmap (a dedicated 500 hPa chart would typically be 4 dam). Anomaly
+# MSLP uses 2 hPa (composite/reanalysis practice; 5 hPa hides typical
+# ±4…±15 hPa departures). Anomaly Z500 uses 4 dam because typical
+# European departures (±8…±24 dam) would nearly vanish at 8 dam.
+_MSLP_CONTOUR_START = 980.0
+_MSLP_CONTOUR_END = 1040.0
+_MSLP_CONTOUR_INTERVAL = 5.0
+_Z500_CONTOUR_START = 500.0
+_Z500_CONTOUR_END = 600.0
+_Z500_CONTOUR_INTERVAL = 8.0
+_MSLP_ANOM_INTERVAL = 2.0
+_MSLP_ANOM_SPAN = 40.0
+_Z500_ANOM_INTERVAL = 4.0
+_Z500_ANOM_SPAN = 40.0
+_Z500_ANOM_Y_FLOOR = 12.0
+_MAP_OVERLAY_TOGGLES = ("mslp", "z500", "hatching", "mslp_anom", "z500_anom")
 # Synoptic H/L: only label centres with a closed-system footprint
 # (neighbourhood span of at least one 5 hPa isoline) and keep glyphs apart.
 _MSLP_HL_SMOOTH_SIGMA = 2.5
@@ -302,56 +328,59 @@ def _kaleido_image(fig: go.Figure, fmt: str) -> bytes:
     return blob
 
 
+def _press_vector_slot(fig: go.Figure, stem: str, fmt: str, label: str, mime: str) -> None:
+    """One SVG or PDF control: click to render, then a download button.
+
+    Kaleido only runs after the user asks for that format, and only for that
+    format. A figure change (new fingerprint) clears the prepared state so
+    date/toggle reruns do not silently re-export.
+    """
+    fp = _fig_fingerprint(fig)
+    ready_key = f"press_ready_{fmt}_{stem}"
+    fp_key = f"press_fp_{fmt}_{stem}"
+    if st.session_state.get(fp_key) != fp:
+        st.session_state[ready_key] = False
+        st.session_state[fp_key] = fp
+    if not st.session_state.get(ready_key):
+        if st.button(label, key=f"press_go_{fmt}_{stem}"):
+            st.session_state[ready_key] = True
+            st.rerun()
+        return
+    try:
+        with st.spinner(f"Rendering {label}…"):
+            blob = _kaleido_image(fig, fmt)
+    except Exception as exc:
+        st.caption(f"{label} unavailable")
+        st.caption(f"Vector export needs the kaleido package ({exc})")
+        return
+    st.download_button(
+        label, data=blob,
+        file_name=f"AtmoPulse_{stem}.{fmt}",
+        mime=mime, key=f"press_{stem}_{fmt}",
+    )
+
+
 def render_press_export(
     fig: go.Figure, stem: str, csv_text: str | None = None, *, heavy: bool = False,
 ) -> None:
-    """Download row under a figure: SVG/PDF (Kaleido) and optional CSV."""
+    """Compact SVG / PDF / CSV row. Vector files are built only on request.
+
+    ``heavy`` is kept so existing map call-sites do not break; it is no longer
+    a separate code path (maps used to bundle SVG+PDF behind one Prepare click).
+    """
+    del heavy
     if csv_text is None:
         meta = fig.layout.meta
         if isinstance(meta, dict):
             csv_text = meta.get("press_csv")
     stem = _press_stem(stem)
+    n = 3 if csv_text else 2
     with st.container(key=f"press-row-{stem}"):
-        if heavy and not st.session_state.get(f"press_ready_{stem}"):
-            b1, b2, _ = st.columns([1.1, 1.1, 8], gap="small")
-            with b1:
-                if st.button("Prepare SVG/PDF", key=f"press_go_{stem}"):
-                    st.session_state[f"press_ready_{stem}"] = True
-                    st.rerun()
-            if csv_text:
-                with b2:
-                    st.download_button(
-                        "CSV", data=csv_text.encode("utf-8"),
-                        file_name=f"AtmoPulse_{stem}.csv", mime="text/csv",
-                        key=f"press_{stem}_csv",
-                    )
-            return
-        n = 3 if csv_text else 2
-        cols = st.columns([1.1] * n + [8], gap="small")
-        err = None
-        svg = pdf = None
-        try:
-            with st.spinner("Rendering SVG/PDF…"):
-                svg = _kaleido_image(fig, "svg")
-                pdf = _kaleido_image(fig, "pdf")
-        except Exception as exc:
-            err = str(exc)
+        cols = st.columns([1] * n + [10], gap="small")
         with cols[0]:
-            if svg:
-                st.download_button(
-                    "SVG", data=svg, file_name=f"AtmoPulse_{stem}.svg",
-                    mime="image/svg+xml", key=f"press_{stem}_svg",
-                )
-            else:
-                st.caption("SVG unavailable")
+            _press_vector_slot(fig, stem, "svg", "SVG", "image/svg+xml")
         with cols[1]:
-            if pdf:
-                st.download_button(
-                    "PDF", data=pdf, file_name=f"AtmoPulse_{stem}.pdf",
-                    mime="application/pdf", key=f"press_{stem}_pdf",
-                )
-            else:
-                st.caption("PDF unavailable")
+            _press_vector_slot(fig, stem, "pdf", "PDF", "application/pdf")
         if csv_text:
             with cols[2]:
                 st.download_button(
@@ -359,8 +388,6 @@ def render_press_export(
                     file_name=f"AtmoPulse_{stem}.csv", mime="text/csv",
                     key=f"press_{stem}_csv",
                 )
-        if err and svg is None:
-            st.caption(f"Vector export needs the kaleido package ({err})")
 
 
 def st_plotly_press(fig: go.Figure, stem: str, csv_text: str | None = None, **chart_kw) -> None:
@@ -649,7 +676,7 @@ def _mslp_smooth_field(z, sigma=_MSLP_CONTOUR_SMOOTH_SIGMA):
     return np.where(finite, smooth, np.nan)
 
 
-def _add_map_contour(fig, lons, lats, z, color, start, end, step):
+def _add_map_contour(fig, lons, lats, z, color, start, end, step, *, dash=None, width=None):
     fig.add_trace(go.Contour(
         x=lons, y=lats, z=z,
         colorscale=[[0, color], [1, color]],
@@ -658,16 +685,37 @@ def _add_map_contour(fig, lons, lats, z, color, start, end, step):
             labelfont=map_contour_label_font(color=color),
         ),
         contours_coloring="lines", showscale=False,
-        line_width=MAP_CONTOUR_LINE_WIDTH,
+        line=dict(
+            width=MAP_CONTOUR_LINE_WIDTH if width is None else width,
+            color=color,
+            dash=dash or "solid",
+        ),
         line_smoothing=MAP_CONTOUR_LINE_SMOOTHING,
         opacity=1.0, hoverinfo="skip",
         connectgaps=True,
     ))
 
+
+def _add_anomaly_contours(fig, lons, lats, z, color, interval, span, *, smooth_sigma=None):
+    """Signed isolines of a departure field; zero contour omitted.
+
+    Solid = above the selected reference-period DOY mean, dashed = below.
+    """
+    field = np.squeeze(np.asarray(z, dtype=float))
+    if smooth_sigma:
+        field = _mslp_smooth_field(field, sigma=smooth_sigma)
+    if not np.isfinite(field).any():
+        return
+    _add_map_contour(fig, lons, lats, field, color, interval, span, interval)
+    _add_map_contour(
+        fig, lons, lats, field, color, -span, -interval, interval, dash="dash",
+    )
+
 def build_baseline_map(
     ref_data, map_phys_data, target_date, t_warm, t_cold, toggles, view_mode, persist_metric, top10_threshold,
     baseline_type="A", map_var="TG", anchor_date=None, *, full_width=False,
     border_trace=None, get_map_location_labels=None, get_persistence_arrays=None,
+    syn_clim=None,
 ):
     """
     `border_trace` / `get_map_location_labels` / `get_persistence_arrays` are
@@ -833,10 +881,45 @@ def build_baseline_map(
     if toggles.get("mslp", False) and "mslp" in map_phys_data:
         mslp_z = np.squeeze(_synoptic_array(map_phys_data["mslp"]))
         mslp_draw = _mslp_smooth_field(mslp_z)
-        _add_map_contour(fig, lons, lats, mslp_draw, ATMOPULSE_OVERLAY['mslp_contour'], 980, 1040, 5)
+        _add_map_contour(
+            fig, lons, lats, mslp_draw, ATMOPULSE_OVERLAY['mslp_contour'],
+            _MSLP_CONTOUR_START, _MSLP_CONTOUR_END, _MSLP_CONTOUR_INTERVAL,
+        )
         _add_mslp_hl_labels(fig, lons, lats, mslp_z)
     if toggles.get("z500", False) and "z500" in map_phys_data:
-        _add_map_contour(fig, lons, lats, np.squeeze(_synoptic_array(map_phys_data["z500"])), ATMOPULSE_OVERLAY['z500_contour'], 500, 600, 8)
+        _add_map_contour(
+            fig, lons, lats, np.squeeze(_synoptic_array(map_phys_data["z500"])),
+            ATMOPULSE_OVERLAY['z500_contour'],
+            _Z500_CONTOUR_START, _Z500_CONTOUR_END, _Z500_CONTOUR_INTERVAL,
+        )
+
+    want_mslp_anom = bool(toggles.get("mslp_anom")) and "mslp" in map_phys_data
+    want_z500_anom = bool(toggles.get("z500_anom")) and "z500" in map_phys_data
+    if syn_clim is not None and (want_mslp_anom or want_z500_anom):
+        if want_mslp_anom:
+            clim_mslp = synoptic_clim_mean_display(
+                syn_clim, "mslp", suffix, doy, lats, lons,
+            )
+            live_mslp = np.squeeze(_synoptic_array(map_phys_data["mslp"]))
+            if clim_mslp is not None and live_mslp.shape == clim_mslp.shape:
+                _add_anomaly_contours(
+                    fig, lons, lats, live_mslp - clim_mslp,
+                    ATMOPULSE_OVERLAY["mslp_anom_contour"],
+                    _MSLP_ANOM_INTERVAL, _MSLP_ANOM_SPAN,
+                    smooth_sigma=_MSLP_CONTOUR_SMOOTH_SIGMA,
+                )
+        if want_z500_anom:
+            clim_z500 = synoptic_clim_mean_display(
+                syn_clim, "z500", suffix, doy, lats, lons,
+            )
+            live_z500 = np.squeeze(_synoptic_array(map_phys_data["z500"]))
+            if clim_z500 is not None and live_z500.shape == clim_z500.shape:
+                _add_anomaly_contours(
+                    fig, lons, lats, live_z500 - clim_z500,
+                    ATMOPULSE_OVERLAY["z500_anom_contour"],
+                    _Z500_ANOM_INTERVAL, _Z500_ANOM_SPAN,
+                    smooth_sigma=_Z500_ANOM_SMOOTH_SIGMA,
+                )
 
     _add_map_source_label(fig)
     fig.update_layout(
@@ -858,8 +941,9 @@ def build_baseline_map(
 def get_cached_baseline_map(
     date_str, baseline_type, map_var, view_mode, persist_metric, top10_threshold,
     t_warm_items, t_cold_items, active_toggles, source_mtime, forecast_model,
-    full_width=False, anchor_date_str=None, spell_days=6, _hl_version=_MSLP_HL_VERSION,
-    *, _ref_data, _map_phys_data,
+    full_width=False, anchor_date_str=None, spell_days=6,
+    anom_mslp_hpa=_MSLP_ANOM_INTERVAL, _hl_version=_MSLP_HL_VERSION,
+    *, _ref_data, _map_phys_data, _syn_clim=None,
 ):
     """Schritt C: @st.cache_data front door for build_baseline_map.
 
@@ -871,17 +955,19 @@ def get_cached_baseline_map(
     (no functions, no Plotly traces in a cache key). This wrapper reduces the
     call to ONLY hashable primitives — `date_str`/`anchor_date_str` as ISO
     strings (not Timestamps), `t_warm`/`t_cold` as `tuple(sorted(d.items()))`,
-    the mslp/z500/hatching toggle dict as a `frozenset` of the active names,
+    the mslp/z500/hatching/mslp_anom/z500_anom toggle dict as a `frozenset`
+    of the active names,
     `source_mtime` (see `backend_io.synoptic_source_mtime`) so a fresh
     forecast download busts this cache even for the same date/toggles, and
     `forecast_model` purely so the key differs per model even though
     build_baseline_map itself reads the active model from `config`'s global
     session state, not from an argument.
 
-    `_ref_data`/`_map_phys_data` are keyword-only with a leading underscore
-    (Streamlit's convention for cache-key-EXCLUDED args) — identical role to
-    every other `_ref_data`/`_map_phys_data` pair already used throughout
-    this codebase (`compute_map_footprint`, `calculate_top10`).
+    `_ref_data`/`_map_phys_data`/`_syn_clim` are keyword-only with a leading
+    underscore (Streamlit's convention for cache-key-EXCLUDED args) — identical
+    role to every other `_ref_data`/`_map_phys_data` pair already used throughout
+    this codebase (`compute_map_footprint`, `calculate_top10`). `_syn_clim` is
+    the MSLP/Z500 DOY-mean climatology used only for expert anomaly isolines.
 
     The three callables (`border_trace` source + the two location/persistence
     loaders) are resolved with a LOCAL import of `page_map_tracker` inside
@@ -900,7 +986,7 @@ def get_cached_baseline_map(
     anchor_date = pd.Timestamp(anchor_date_str) if anchor_date_str else None
     t_warm = dict(t_warm_items)
     t_cold = dict(t_cold_items)
-    toggles = {name: (name in active_toggles) for name in ("mslp", "z500", "hatching")}
+    toggles = {name: (name in active_toggles) for name in _MAP_OVERLAY_TOGGLES}
     toggles["spell_days"] = int(spell_days)
 
     return build_baseline_map(
@@ -910,6 +996,7 @@ def get_cached_baseline_map(
         border_trace=get_europe_borders_trace(),
         get_map_location_labels=get_map_location_labels,
         get_persistence_arrays=get_persistence_arrays,
+        syn_clim=_syn_clim,
     )
 
 
@@ -1488,6 +1575,93 @@ def get_meteogram_traces(df_live, ref_clim, lat, lon, target_date, epoch, meteo_
     return traces
 
 
+def _z500_fill_rgba(hex_color: str, alpha: float) -> str:
+    r, g, b = _wave_hex_to_rgb(hex_color)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def get_z500_anomaly_traces(df_live, syn_clim, lat, lon, target_date, epoch):
+    """Expert driver panel: point Z500 minus the epoch's 5-day DOY mean (dam).
+
+    Returns ``(traces, y_range)``. ``y_range`` is symmetric about zero.
+    Empty traces and ``None`` when Z500 or the synoptic climatology is missing.
+    """
+    if syn_clim is None or df_live is None or df_live.empty or "Z500" not in df_live.columns:
+        return [], None
+    clim = synoptic_clim_point_doy(syn_clim, "z500", epoch, lat, lon)
+    if clim is None or clim.size < 365:
+        return [], None
+
+    dates = pd.to_datetime(df_live["Date"], utc=True).dt.tz_convert(None)
+    tgt_dt_norm = pd.to_datetime(target_date, utc=True).tz_convert(None)
+    doys = etccdi_doy_365(dates)
+    z_live = np.asarray(df_live["Z500"].values, dtype=np.float64)
+    z_clim = clim[np.clip(doys - 1, 0, len(clim) - 1)]
+    anom = z_live - z_clim
+    if not np.isfinite(anom).any():
+        return [], None
+
+    span = float(np.nanmax(np.abs(anom)))
+    y_lim = max(_Z500_ANOM_Y_FLOOR, span * 1.15)
+    y_range = (-y_lim, y_lim)
+
+    ridge = _z500_fill_rgba(ATMOPULSE_OVERLAY["z500_anom_contour"], 0.32)
+    trough = _z500_fill_rgba(ATMOPULSE_OVERLAY["z500_contour"], 0.28)
+    line_col = ATMOPULSE_OVERLAY["z500_anom_contour"]
+
+    y_pos = np.where(np.isfinite(anom) & (anom > 0), anom, 0.0)
+    y_neg = np.where(np.isfinite(anom) & (anom < 0), anom, 0.0)
+    traces = [
+        go.Scatter(
+            x=dates, y=np.zeros(len(dates)), mode="lines",
+            line=dict(color="rgba(0,0,0,0.45)", width=1),
+            name="Zero", showlegend=False, hoverinfo="skip",
+        ),
+        go.Scatter(
+            x=dates, y=y_pos, mode="lines",
+            line=dict(width=0), fill="tozeroy", fillcolor=ridge,
+            name="Ridge", showlegend=False, hoverinfo="skip",
+        ),
+        go.Scatter(
+            x=dates, y=y_neg, mode="lines",
+            line=dict(width=0), fill="tozeroy", fillcolor=trough,
+            name="Trough", showlegend=False, hoverinfo="skip",
+        ),
+    ]
+
+    fcst_mask = dates >= tgt_dt_norm
+    hist_mask = dates <= tgt_dt_norm
+    traces.append(go.Scatter(
+        x=dates[hist_mask], y=anom[hist_mask.values], mode="lines",
+        line=dict(color=line_col, width=1.5, shape="linear"),
+        name="Z500 anomaly", showlegend=False, hoverinfo="skip",
+    ))
+    traces.append(go.Scatter(
+        x=dates[fcst_mask], y=anom[fcst_mask.values], mode="lines",
+        line=dict(color=line_col, width=2.0, dash="dot"),
+        name="Z500 anomaly (forecast)", showlegend=False, hoverinfo="skip",
+    ))
+
+    c_data = np.empty((len(dates), 3), dtype=object)
+    c_data[:, 0] = np.round(z_live, 1)
+    c_data[:, 1] = np.round(z_clim, 1)
+    c_data[:, 2] = np.round(anom, 1)
+    traces.append(go.Scatter(
+        x=dates, y=anom, mode="lines",
+        line=dict(width=0, color="rgba(0,0,0,0)"),
+        customdata=c_data, name="Z500 anomaly",
+        showlegend=False,
+        hovertemplate=(
+            "<b>Z500 anomaly</b><br>"
+            "Anomaly: %{customdata[2]:+.1f} dam<br>"
+            "Z500: %{customdata[0]:.1f} dam<br>"
+            "DOY mean: %{customdata[1]:.1f} dam"
+            "<extra></extra>"
+        ),
+    ))
+    return traces, y_range
+
+
 def _days_in_runs(flag, dates, min_len=6):
     """Days inside a spell of at least `min_len` consecutive calendar days.
 
@@ -1680,30 +1854,235 @@ def align_yearly_extremes_yranges(fig_a, fig_b):
         fig_b.update_yaxes(range=[0, yc * 1.08], row=2, col=1)
 
 
+def _empty_wave_fig() -> go.Figure:
+    fig = go.Figure().add_annotation(
+        text="Data Missing or Processing.", x=0.5, y=0.5, showarrow=False,
+        font=dict(size=16, color="red", family=ATMOPULSE_FONTS["sora_css"]),
+    )
+    fig.update_layout(**plotly_typography())
+    return fig
+
+
+def _zero_to_nan(arr) -> np.ndarray:
+    out = np.asarray(arr, dtype=float).copy()
+    out[~np.isfinite(out) | (out <= 0)] = np.nan
+    return out
+
+
+def _stack_y(arr) -> np.ndarray:
+    """Keep zeros as zeros so stacked bars share a common baseline."""
+    out = np.asarray(arr, dtype=float)
+    return np.where(np.isfinite(out), np.maximum(out, 0.0), 0.0)
+
+
+def _wave_stack_from_payload(payload: dict | None, stack_metric: str = "Intensity") -> dict | None:
+    if not payload or payload.get("empty") or "annual_stats" not in payload:
+        return None
+    stats = payload["annual_stats"]
+    years = np.asarray(stats.index)
+    use_days = str(stack_metric).lower().startswith("day")
+    is_warm = bool(payload.get("is_warm", True))
+    if use_days:
+        strongest = _stack_y(stats.get("max_days", stats["max_int"]))
+        all_waves = np.maximum(0.0, _stack_y(stats.get("sum_days", stats["sum_int"])) - strongest)
+        isolated = _stack_y(stats.get("isolated_days", 0.0))
+        if isolated.shape != strongest.shape:
+            isolated = np.zeros_like(strongest)
+        unit = "days"
+    else:
+        strongest = _stack_y(stats["max_int"])
+        all_waves = np.maximum(0.0, _stack_y(stats["sum_int"]) - strongest)
+        isolated = np.maximum(0.0, _stack_y(stats["total_heat"]) - _stack_y(stats["sum_int"]))
+        unit = "K"
+    stacked = strongest + all_waves + isolated
+    y_max = float(np.nanmax(stacked)) if stacked.size and np.isfinite(stacked).any() else 0.0
+    if is_warm:
+        names = ("Strongest heatwave", "All heatwaves", "All days over threshold")
+    else:
+        names = ("Strongest coldwave", "All coldwaves", "All days under threshold")
+    return {
+        "years": years,
+        "strongest": strongest,
+        "all_waves": all_waves,
+        "isolated": isolated,
+        "y_max": y_max,
+        "unit": unit,
+        "use_days": use_days,
+        "is_warm": is_warm,
+        "names": names,
+    }
+
+
+def _wave_stack_hover(stack: dict) -> go.Scatter:
+    n = len(stack["years"])
+    unit = stack["unit"]
+    n0, n1, n2 = stack["names"]
+    fmt = "{:.0f}" if stack["use_days"] else "{:.1f}"
+    cd = np.empty((n, 4), dtype=object)
+    for i in range(n):
+        s = float(stack["strongest"][i])
+        a = s + float(stack["all_waves"][i])
+        t = a + float(stack["isolated"][i])
+        cd[i, 0] = fmt.format(s)
+        cd[i, 1] = fmt.format(a)
+        cd[i, 2] = fmt.format(t)
+        cd[i, 3] = fmt.format(t)
+    y_top = stack["strongest"] + stack["all_waves"] + stack["isolated"]
+    return go.Scatter(
+        x=stack["years"], y=y_top, mode="markers",
+        marker=dict(size=1, opacity=0),
+        customdata=cd,
+        hovertemplate=(
+            "<b>%{x}</b><br>"
+            f"{n0}: %{{customdata[0]}} {unit}<br>"
+            f"{n1}: %{{customdata[1]}} {unit}<br>"
+            f"{n2}: %{{customdata[2]}} {unit}"
+            "<extra></extra>"
+        ),
+        hoverlabel=dict(align="left"),
+        showlegend=False, name="year-hover",
+    )
+
+
+def _add_wave_stack_traces(fig, stack: dict) -> None:
+    years = stack["years"]
+    n0, n1, n2 = stack["names"]
+    bar_kw = dict(hoverinfo="skip", hovertemplate=None)
+    if stack["is_warm"]:
+        c_iso, c_all, c_top = ATMOPULSE_WARM["p75"], ATMOPULSE_WARM["p90"], ATMOPULSE_WARM["p95"]
+    else:
+        c_iso, c_all, c_top = ATMOPULSE_COLD["p25"], ATMOPULSE_COLD["p10"], ATMOPULSE_COLD["p5"]
+    # Bottom → top: strongest (darkest), remaining waves, remaining threshold days (lightest).
+    fig.add_trace(go.Bar(x=years, y=stack["strongest"], name=n0, marker_color=c_top, **bar_kw))
+    fig.add_trace(go.Bar(x=years, y=stack["all_waves"], name=n1, marker_color=c_all, **bar_kw))
+    fig.add_trace(go.Bar(x=years, y=stack["isolated"], name=n2, marker_color=c_iso, **bar_kw))
+    fig.add_trace(_wave_stack_hover(stack))
+
+
+def _build_kysely_wave_stack_fig(payload, stack_metric: str = "Intensity") -> go.Figure:
+    stack = _wave_stack_from_payload(payload, stack_metric)
+    fig = go.Figure()
+    if stack is not None:
+        _add_wave_stack_traces(fig, stack)
+    y_int = stack["y_max"] if stack is not None else 0.0
+    y_title = "Intensity [days]" if str(stack_metric).lower().startswith("day") else "Intensity [K]"
+    fig.update_layout(
+        **plotly_typography(),
+        barmode="stack",
+        hovermode="x",
+        height=360,
+        margin=dict(t=20, b=56, l=55, r=20),
+        template="plotly_white",
+        legend=dict(
+            orientation="h", y=-0.12, yanchor="top",
+            x=0.5, xanchor="center", bgcolor="rgba(0,0,0,0)",
+            traceorder="normal",
+        ),
+        bargap=0.15,
+        meta={"y_int_max": y_int},
+    )
+    grid = dict(showgrid=True, gridcolor=ATMOPULSE_OVERLAY["grid"], gridwidth=1, zeroline=False)
+    fig.update_yaxes(title_text=y_title, rangemode="tozero", **grid)
+    fig.update_xaxes(dtick=10, tick0=1940, **grid)
+    if payload and not payload.get("empty") and "annual_stats" in payload:
+        df = payload["annual_stats"].reset_index().rename(columns={"index": "year"})
+        _attach_press_csv(fig, df.to_csv(index=False))
+    return fig
+
+
+def _build_kysely_wave_freq_fig(payload) -> go.Figure:
+    freq = None if not payload or payload.get("empty") else payload.get("freq_series")
+    is_warm = bool((payload or {}).get("is_warm", True))
+    fig = go.Figure()
+    y_freq_max = 0.0
+    x_end = 153 if is_warm else 152
+    if freq:
+        f_str, f_ext = freq["f_str"], freq["f_ext"]
+        if is_warm:
+            tick_vals, tick_text = [16, 46, 77, 107, 138], ["MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER"]
+            c_str, c_ext = ATMOPULSE_WARM["p90"], ATMOPULSE_WARM["p95"]
+        else:
+            tick_vals, tick_text = [16, 46, 77, 107, 136], ["NOV", "DEC", "JAN", "FEB", "MAR"]
+            c_str, c_ext = ATMOPULSE_COLD["p10"], ATMOPULSE_COLD["p5"]
+        y_str = _zero_to_nan(f_str.values)
+        y_ext = _zero_to_nan(f_ext.values)
+        fig.add_trace(go.Scatter(
+            x=f_str.index, y=y_str, mode="lines",
+            line=dict(color=c_str, width=2),
+            name="Strong",
+            connectgaps=False, hovertemplate="%{y:.1f}%<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=f_ext.index, y=y_ext, mode="lines",
+            line=dict(color=c_ext, width=2),
+            name="Extreme",
+            connectgaps=False, hovertemplate="%{y:.1f}%<extra></extra>",
+        ))
+        fig.update_xaxes(tickmode="array", tickvals=tick_vals, ticktext=tick_text, range=[1, x_end])
+        finite = np.concatenate([
+            y_str[np.isfinite(y_str)] if y_str.size else np.array([0.0]),
+            y_ext[np.isfinite(y_ext)] if y_ext.size else np.array([0.0]),
+        ])
+        y_freq_max = float(np.nanmax(finite)) if finite.size else 0.0
+        if not np.isfinite(y_freq_max):
+            y_freq_max = 0.0
+    fig.update_layout(
+        **plotly_typography(),
+        hovermode="x",
+        height=320,
+        margin=dict(t=20, b=56, l=55, r=20),
+        template="plotly_white",
+        legend=dict(
+            orientation="h", y=-0.12, yanchor="top",
+            x=0.5, xanchor="center", bgcolor="rgba(0,0,0,0)",
+        ),
+        meta={"y_freq_max": y_freq_max},
+    )
+    grid = dict(showgrid=True, gridcolor=ATMOPULSE_OVERLAY["grid"], gridwidth=1, zeroline=False)
+    fig.update_yaxes(title_text="Frequency [%]", rangemode="tozero", **grid)
+    return fig
+
+
+def align_wave_stats_yranges(stack_a, stack_b, freq_a, freq_b):
+    """Same intensity/frequency y-scales on side-by-side wavogram stats."""
+    yi = max(
+        float((stack_a.layout.meta or {}).get("y_int_max") or 0),
+        float((stack_b.layout.meta or {}).get("y_int_max") or 0),
+    )
+    yf = max(
+        float((freq_a.layout.meta or {}).get("y_freq_max") or 0),
+        float((freq_b.layout.meta or {}).get("y_freq_max") or 0),
+    )
+    if yi > 0:
+        stack_a.update_yaxes(range=[0, yi * 1.08])
+        stack_b.update_yaxes(range=[0, yi * 1.08])
+    if yf > 0:
+        freq_a.update_yaxes(range=[0, yf * 1.08])
+        freq_b.update_yaxes(range=[0, yf * 1.08])
+
+
 # --- Point Wavogram ---
-def build_kysely_wave_figs(payload: dict) -> tuple[go.Figure, go.Figure]:
+def build_kysely_wave_figs(payload: dict, z500_outline: bool = False, stack_metric: str = "Intensity") -> tuple[go.Figure, go.Figure, go.Figure]:
     """
-    Renders the two Point Wavogram Plotly figures (ridge-plot `fig_main` +
-    stats/frequency panel `fig_stats`) from the compute-only payload
-    returned by `backend_waves.compute_kysely_waves_data`. All Plotly/theme
-    concerns (colours, fonts, ridge-curve spline smoothing, break-tail
-    Bezier closure) live here; `backend_waves.py` never imports Plotly or
-    atmopulse_theme.
+    Renders the Point Wavogram Plotly figures (ridge-plot, seasonal intensity
+    stack, annual-cycle frequency) from the compute-only payload returned by
+    `backend_waves.compute_kysely_waves_data`. All Plotly/theme concerns
+    (colours, fonts, ridge-curve spline smoothing, break-tail Bezier closure)
+    live here; `backend_waves.py` never imports Plotly or atmopulse_theme.
     """
     if payload.get("empty", True):
-        empty_fig = go.Figure().add_annotation(text="Data Missing or Processing.", x=0.5, y=0.5, showarrow=False, font=dict(size=16, color="red", family=ATMOPULSE_FONTS["sora_css"]))
-        empty_fig.update_layout(**plotly_typography())
-        return empty_fig, empty_fig
+        return (
+            _empty_wave_fig(),
+            _build_kysely_wave_stack_fig(payload, stack_metric),
+            _build_kysely_wave_freq_fig(payload),
+        )
 
     parameter = payload["parameter"]
     suffix = payload["epoch"]
     threshold_level = payload["threshold_level"]
-    stat_metric = payload["stat_metric"]
     is_warm = payload["is_warm"]
     waves_data = payload["waves_data"]
     p_thresh = payload["p_thresh"]
-    p_t_ext, p_d_ext = payload["p_t_ext"], payload["p_d_ext"]
-    p_t_str, p_d_str = payload["p_t_str"], payload["p_d_str"]
     debug_info = payload["debug_info"]
 
     if is_warm:
@@ -1766,17 +2145,45 @@ def build_kysely_wave_figs(payload: dict) -> tuple[go.Figure, go.Figure]:
             (r_b, g_b, b_b), (r, g, b) = _wave_ridge_colors(parameter, is_warm, norm_val)
 
             sd_str, ed_str = pd.to_datetime(w['start_date']).strftime('%d.%m.'), pd.to_datetime(w['end_date']).strftime('%d.%m.%Y')
+            hover = (
+                f"<b>Duration: {sd_str}–{ed_str}</b><br>"
+                f"Length: {len(w_xs)} days<br>"
+                f"Severity: {w['intensity']:.1f} K"
+            )
+            line_color = f"rgba({r},{g},{b},{WAVE_LINE_ALPHA})"
+            line_width = WAVE_LINE_WIDTH
+            if show_expert("z500"):
+                z_mean = w.get("z500_anom_mean")
+                ridge_dam = float(payload.get("z500_ridge_dam") or 8.0)
+                if z_mean is not None and np.isfinite(z_mean):
+                    tag = ""
+                    if z_mean >= ridge_dam:
+                        tag = " (Ridge)"
+                    elif z_mean <= -ridge_dam:
+                        tag = " (Trough)"
+                    hover += f"<br>Z500-Mean: {z_mean:+.1f} dam{tag}"
+                    z_ext = w.get("z500_anom_max") if is_warm else w.get("z500_anom_min")
+                    ext_label = "Z500-Max" if is_warm else "Z500-Min"
+                    if z_ext is not None and np.isfinite(z_ext):
+                        hover += f"<br>{ext_label}: {z_ext:+.1f} dam"
+                    supporting = (
+                        (is_warm and z_mean >= ridge_dam)
+                        or ((not is_warm) and z_mean <= -ridge_dam)
+                    )
+                    if z500_outline and supporting:
+                        line_color = ATMOPULSE_OVERLAY["z500_anom_contour"]
+                        line_width = WAVE_Z500_LINE_WIDTH
 
             fig_main.add_trace(go.Scatter(
                 x=x_full, y=y_coords, mode='lines',
-                line=dict(color=f"rgba({r},{g},{b},{WAVE_LINE_ALPHA})", width=WAVE_LINE_WIDTH, shape='spline'),
+                line=dict(color=line_color, width=line_width, shape='spline'),
                 fill='toself',
                 fillgradient=dict(type='vertical', colorscale=[
                     [0, f"rgba({r_b},{g_b},{b_b},{WAVE_FILL_ALPHA_BASE})"],
                     [1, f"rgba({r},{g},{b},{WAVE_FILL_ALPHA_PEAK})"],
                 ]),
                 hoverinfo='text',
-                text=f"<b>Duration: {sd_str}–{ed_str}</b><br>Length: {len(w_xs)} days<br>Severity: {w['intensity']:.1f} K",
+                text=hover,
                 showlegend=False,
             ))
     else:
@@ -1791,84 +2198,17 @@ def build_kysely_wave_figs(payload: dict) -> tuple[go.Figure, go.Figure]:
                 "end_date": w.get("end_date"),
                 "duration_days": w.get("duration_days"),
                 "intensity": w.get("intensity"),
+                **(
+                    {
+                        "z500_anom_mean": w.get("z500_anom_mean"),
+                        "z500_anom_max": w.get("z500_anom_max"),
+                        "z500_anom_min": w.get("z500_anom_min"),
+                    }
+                    if "z500_anom_mean" in w else {}
+                ),
             }
             for w in waves_data
         ]).to_csv(index=False)
         _attach_press_csv(fig_main, wave_csv)
 
-    if stat_metric == "Annual Cycle Frequency":
-        freq_series = payload["freq_series"]
-        f_str, f_ext = freq_series["f_str"], freq_series["f_ext"]
-
-        fig_stats = go.Figure()
-        if is_warm:
-            c_str, c_ext = ATMOPULSE_WARM["p90"], ATMOPULSE_WARM["p95"]
-        else:
-            c_str, c_ext = ATMOPULSE_COLD["p10"], ATMOPULSE_COLD["p5"]
-
-        fig_stats.add_trace(go.Scatter(x=f_str.index, y=f_str.values, mode='lines', line=dict(color=c_str, width=2), name="Strong", hovertemplate='%{y:.1f}%<extra></extra>'))
-        fig_stats.add_trace(go.Scatter(x=f_ext.index, y=f_ext.values, mode='lines', line=dict(color=c_ext, width=2), name="Extreme", hovertemplate='%{y:.1f}%<extra></extra>'))
-
-        fig_stats.update_layout(
-            **plotly_typography(),
-            title=f"Annual Cycle Frequency (5-Day Smoothing) | {epoch_period_label(suffix)}",
-            xaxis=dict(tickmode='array', tickvals=tick_vals, ticktext=tick_text, showgrid=True),
-            yaxis_title="Relative Frequency (%)",
-            height=350, template="plotly_white",
-            margin=dict(t=40, b=10, l=10, r=10),
-            legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5)
-        )
-        freq_csv = pd.DataFrame({
-            "plot_x": np.asarray(f_str.index),
-            "strong_pct": np.asarray(f_str.values),
-            "extreme_pct": np.asarray(f_ext.values),
-        }).to_csv(index=False)
-        _attach_press_csv(fig_stats, freq_csv)
-        return fig_main, fig_stats
-
-    stats = payload["annual_stats"]
-    col_map = {"Cumulative Annual Wave Intensity": 'sum_int', "Maximum Annual Wave Intensity": 'max_int', "Cumulative Heat/Cold Intensity": 'total_heat'}
-    sel_col = col_map.get(stat_metric, 'sum_int')
-    y_titles = {
-        'sum_int': 'Σ wave intensity (K·days)',
-        'max_int': 'Max wave intensity (K·days)',
-        'total_heat': f'Σ excess vs. threshold (K·days)',
-    }
-
-    fig_stats = go.Figure()
-    if is_warm:
-        bar_color, mean_color = "#E8A8A0", ATMOPULSE_WARM["p95"]
-    else:
-        bar_color, mean_color = "#9EC5E8", ATMOPULSE_COLD["p5"]
-
-    fig_stats.add_trace(go.Bar(
-        x=stats.index, y=stats[sel_col], marker_color=bar_color, name="Intensity",
-        hovertemplate='Year: %{x}<br>Value: %{y:.1f} K<extra></extra>',
-    ))
-    fig_stats.add_trace(go.Scatter(
-        x=stats.index, y=stats[sel_col].rolling(11, center=True).mean(), mode='lines',
-        line=dict(color=mean_color, width=2.5), name="11-yr Mean",
-        hovertemplate='Year: %{x}<br>11-year mean: %{y:.1f} K<extra></extra>',
-    ))
-
-    valid = stats[sel_col].dropna()
-    if len(valid) > 2:
-        z = np.polyfit(valid.index, valid.values, 1)
-        fig_stats.add_trace(go.Scatter(
-            x=valid.index, y=np.poly1d(z)(valid.index), mode='lines',
-            line=dict(color=mean_color, width=1.5, dash='dot'), name="Trend", hoverinfo='skip',
-        ))
-
-    fig_stats.update_layout(
-        **plotly_typography(),
-        title=f"{stat_metric} | {epoch_period_label(suffix)}",
-        height=350, template="plotly_white",
-        margin=dict(t=40, b=10, l=55, r=10),
-        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
-        xaxis=dict(showgrid=True, gridcolor="rgba(180,180,180,0.35)", gridwidth=1, dtick=10, zeroline=False),
-        yaxis=dict(title=y_titles.get(sel_col, "Intensity (K·days)"), showgrid=True, gridcolor="rgba(180,180,180,0.35)", gridwidth=1, zeroline=False),
-        bargap=0.15,
-    )
-    _attach_press_csv(fig_stats, stats.reset_index().to_csv(index=False))
-
-    return fig_main, fig_stats
+    return fig_main, _build_kysely_wave_stack_fig(payload, stack_metric), _build_kysely_wave_freq_fig(payload)

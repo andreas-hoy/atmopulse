@@ -492,9 +492,9 @@ def synoptic_vars_for_map(
         wanted.append("t850")
     else:
         wanted.extend(("tg", "tx", "tn"))
-    if toggles.get("mslp"):
+    if toggles.get("mslp") or toggles.get("mslp_anom"):
         wanted.append("mslp")
-    if toggles.get("z500"):
+    if toggles.get("z500") or toggles.get("z500_anom"):
         wanted.append("z500")
     if toggles.get("hatching") or view_mode == MAP_VIEW_PERSISTENCE:
         if code == "T850":

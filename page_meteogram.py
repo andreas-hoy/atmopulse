@@ -25,6 +25,7 @@ from backend_narrative import (
     epoch_period_label,
     epoch_from_label,
 )
+from labels import HELP
 from atmopulse_theme import (
     ATMOPULSE_OVERLAY,
     legend_badge_style,
@@ -42,12 +43,14 @@ from config import (
 )
 from backend_io import (
     load_reference_climatology,
+    load_synoptic_climatology,
     get_live_point_series,
     compute_point_thresholds,
     _load_point_archive_series,
 )
 from frontend_plots import (
     get_meteogram_traces,
+    get_z500_anomaly_traces,
     build_yearly_extremes_chart,
     align_yearly_extremes_yranges,
     st_plotly_press,
@@ -181,6 +184,25 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
             traces_a = get_meteogram_traces(df_live, ref_clim, lat_target, lon_target, target_date, "A", meteo_env, meteo_var, current_condition=(cat_a, dir_a))
             traces_b = get_meteogram_traces(df_live, ref_clim, lat_target, lon_target, target_date, "B", meteo_env, meteo_var, current_condition=(cat_b, dir_b))
 
+            show_z500 = show_expert("z500")
+            syn_clim = load_synoptic_climatology() if show_z500 else None
+            z500_a, z500_rng_a = get_z500_anomaly_traces(
+                df_live, syn_clim, lat_target, lon_target, target_date, "A",
+            ) if show_z500 else ([], None)
+            z500_b, z500_rng_b = get_z500_anomaly_traces(
+                df_live, syn_clim, lat_target, lon_target, target_date, "B",
+            ) if show_z500 else ([], None)
+            use_z500 = bool(z500_a and z500_b)
+            z500_ylim = None
+            if use_z500 and z500_rng_a and z500_rng_b:
+                z500_ylim = (
+                    min(z500_rng_a[0], z500_rng_b[0]),
+                    max(z500_rng_a[1], z500_rng_b[1]),
+                )
+            vline_x = tgt_dt_norm.timestamp() * 1000
+            title_a = f"{epoch_period_label('A').replace(' (', '<br>(')}"
+            title_b = f"{epoch_period_label('B').replace(' (', '<br>(')}"
+
             # Five warm + five cold chips. Moderate/Strong/Extreme/Record share
             # the Map Tracker palette; Above/Below average are the pale extras.
             st.markdown(
@@ -206,33 +228,65 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
             if map_layout == LAYOUT_SIDE_BY_SIDE:
                 fig = make_subplots(
                     rows=1, cols=2, shared_yaxes=True,
-                    subplot_titles=(
-                        f"{epoch_period_label('A').replace(' (', '<br>(')}",
-                        f"{epoch_period_label('B').replace(' (', '<br>(')}",
-                    ),
+                    subplot_titles=(title_a, title_b),
                 )
-                for trace in traces_a: 
+                for trace in traces_a:
                     fig.add_trace(trace, row=1, col=1)
-                for trace in traces_b: 
+                for trace in traces_b:
                     fig.add_trace(trace, row=1, col=2)
-                    
-                fig.add_vline(x=tgt_dt_norm.timestamp() * 1000, line_dash="dash", line_color="gray", opacity=0.8, row=1, col=1)
-                fig.add_vline(x=tgt_dt_norm.timestamp() * 1000, line_dash="dash", line_color="gray", opacity=0.8, row=1, col=2)
-                fig.update_xaxes(dtick="M2", tickformat="%b\n%Y", hoverformat="%d.%m.%Y", showgrid=True, gridcolor=ATMOPULSE_OVERLAY['grid'])
+                fig.add_vline(x=vline_x, line_dash="dash", line_color="gray", opacity=0.8, row=1, col=1)
+                fig.add_vline(x=vline_x, line_dash="dash", line_color="gray", opacity=0.8, row=1, col=2)
                 fig.update_yaxes(range=[global_min, global_max], row=1, col=1)
                 fig.update_yaxes(range=[global_min, global_max], row=1, col=2)
-                fig.update_layout(**plotly_typography(), hovermode="x", height=520, template="plotly_white", margin=dict(t=56, b=10), showlegend=False)
+                fig.update_layout(
+                    **plotly_typography(), hovermode="x", height=520,
+                    template="plotly_white", margin=dict(t=56, b=10), showlegend=False,
+                )
+                fig.update_xaxes(dtick="M2", tickformat="%b\n%Y", hoverformat="%d.%m.%Y", showgrid=True, gridcolor=ATMOPULSE_OVERLAY['grid'])
                 live_csv = df_live.to_csv(index=False)
                 st_plotly_press(fig, "meteogram_compare", csv_text=live_csv)
+                if use_z500:
+                    st.markdown("**Z500 anomaly**", help=HELP["meteo_z500_panel"])
+                    fig_z = make_subplots(rows=1, cols=2, shared_yaxes=True)
+                    for trace in z500_a:
+                        fig_z.add_trace(trace, row=1, col=1)
+                    for trace in z500_b:
+                        fig_z.add_trace(trace, row=1, col=2)
+                    fig_z.add_vline(x=vline_x, line_dash="dash", line_color="gray", opacity=0.8, row=1, col=1)
+                    fig_z.add_vline(x=vline_x, line_dash="dash", line_color="gray", opacity=0.8, row=1, col=2)
+                    fig_z.update_yaxes(
+                        range=list(z500_ylim), title_text="Z500 anom. (dam)",
+                        showticklabels=True, ticks="outside", automargin=True,
+                        showgrid=True, gridcolor=ATMOPULSE_OVERLAY["grid"],
+                        zeroline=True, zerolinecolor="rgba(0,0,0,0.45)",
+                        row=1, col=1,
+                    )
+                    fig_z.update_yaxes(
+                        range=list(z500_ylim),
+                        showticklabels=True, ticks="outside",
+                        showgrid=True, gridcolor=ATMOPULSE_OVERLAY["grid"],
+                        zeroline=True, zerolinecolor="rgba(0,0,0,0.45)",
+                        row=1, col=2,
+                    )
+                    fig_z.update_xaxes(
+                        dtick="M2", tickformat="%b\n%Y", hoverformat="%d.%m.%Y",
+                        showgrid=True, gridcolor=ATMOPULSE_OVERLAY["grid"],
+                        ticks="outside", automargin=True,
+                    )
+                    fig_z.update_layout(
+                        **plotly_typography(), hovermode="x", height=280,
+                        template="plotly_white", margin=dict(t=10, b=40), showlegend=False,
+                    )
+                    st_plotly_press(fig_z, "meteogram_z500_compare")
                 st.markdown("<div class='atmopulse-meteo-yearly-gap'></div>", unsafe_allow_html=True)
-                
+
                 fig_yr_a = build_yearly_extremes_chart(lat_target, lon_target, "A", col_target, wsdi=meteo_spell, csdi=meteo_spell, _ref_clim=ref_clim, _load_point_archive_series=_load_point_archive_series)
                 fig_yr_b = build_yearly_extremes_chart(lat_target, lon_target, "B", col_target, wsdi=meteo_spell, csdi=meteo_spell, _ref_clim=ref_clim, _load_point_archive_series=_load_point_archive_series)
                 align_yearly_extremes_yranges(fig_yr_a, fig_yr_b)
                 c1, c2 = st.columns(2)
-                with c1: 
+                with c1:
                     st_plotly_press(fig_yr_a, "yearly_historical")
-                with c2: 
+                with c2:
                     st_plotly_press(fig_yr_b, "yearly_recent")
             else:
                 # Same widget key ("met_ep") whose value we already read into
@@ -244,11 +298,37 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
                     horizontal=True, key="met_ep", index=1,
                 )
                 met_active_epoch = epoch_from_label(flicker_epoch)
-                fig = go.Figure(data=traces_a if met_active_epoch == "A" else traces_b)
-                fig.add_vline(x=tgt_dt_norm.timestamp() * 1000, line_dash="dash", line_color="gray", opacity=0.8)
-                fig.update_xaxes(dtick="M2", tickformat="%b\n%Y", hoverformat="%d.%m.%Y", showgrid=True, gridcolor=ATMOPULSE_OVERLAY['grid'])
+                traces = traces_a if met_active_epoch == "A" else traces_b
+                z500_tr = z500_a if met_active_epoch == "A" else z500_b
+                fig = go.Figure(data=traces)
+                fig.add_vline(x=vline_x, line_dash="dash", line_color="gray", opacity=0.8)
                 fig.update_yaxes(range=[global_min, global_max])
-                fig.update_layout(**plotly_typography(), title=epoch_period_label(met_active_epoch), hovermode="x", height=500, template="plotly_white", margin=dict(t=40, b=10), showlegend=False)
+                fig.update_layout(
+                    **plotly_typography(), title=epoch_period_label(met_active_epoch),
+                    hovermode="x", height=500, template="plotly_white",
+                    margin=dict(t=40, b=10), showlegend=False,
+                )
+                fig.update_xaxes(dtick="M2", tickformat="%b\n%Y", hoverformat="%d.%m.%Y", showgrid=True, gridcolor=ATMOPULSE_OVERLAY['grid'])
                 st_plotly_press(fig, f"meteogram_{met_active_epoch}", csv_text=df_live.to_csv(index=False))
+                if use_z500:
+                    st.markdown("**Z500 anomaly**", help=HELP["meteo_z500_panel"])
+                    fig_z = go.Figure(data=z500_tr)
+                    fig_z.add_vline(x=vline_x, line_dash="dash", line_color="gray", opacity=0.8)
+                    fig_z.update_yaxes(
+                        range=list(z500_ylim), title_text="Z500 anom. (dam)",
+                        showticklabels=True, ticks="outside", automargin=True,
+                        showgrid=True, gridcolor=ATMOPULSE_OVERLAY["grid"],
+                        zeroline=True, zerolinecolor="rgba(0,0,0,0.45)",
+                    )
+                    fig_z.update_xaxes(
+                        dtick="M2", tickformat="%b\n%Y", hoverformat="%d.%m.%Y",
+                        showgrid=True, gridcolor=ATMOPULSE_OVERLAY["grid"],
+                        ticks="outside", automargin=True,
+                    )
+                    fig_z.update_layout(
+                        **plotly_typography(), hovermode="x", height=280,
+                        template="plotly_white", margin=dict(t=10, b=40), showlegend=False,
+                    )
+                    st_plotly_press(fig_z, f"meteogram_z500_{met_active_epoch}")
                 st.markdown("<div class='atmopulse-meteo-yearly-gap'></div>", unsafe_allow_html=True)
                 st_plotly_press(build_yearly_extremes_chart(lat_target, lon_target, met_active_epoch, col_target, wsdi=meteo_spell, csdi=meteo_spell, _ref_clim=ref_clim, _load_point_archive_series=_load_point_archive_series), f"yearly_{met_active_epoch}")

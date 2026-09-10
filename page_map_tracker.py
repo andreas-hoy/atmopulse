@@ -33,9 +33,16 @@ from config import (
     is_daily_map_view,
 )
 from backend_analytics import compute_map_footprint, calculate_top10
-from frontend_plots import _render_synoptic_map, get_cached_baseline_map, build_opacity_slider_map, render_swipe_compare_map
+from frontend_plots import (
+    _MAP_OVERLAY_TOGGLES,
+    _render_synoptic_map,
+    get_cached_baseline_map,
+    build_opacity_slider_map,
+    render_swipe_compare_map,
+)
 from backend_io import (
     load_reference_climatology,
+    load_synoptic_climatology,
     fetch_cached_synoptic_data,
     get_persistence_arrays,
     synoptic_source_mtime,
@@ -351,6 +358,7 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
     if ref_clim is None:
         st.error("Reference Climatology missing or corrupted! Please rebuild.")
         st.stop()
+    syn_clim = load_synoptic_climatology()
     # get_europe_borders_trace() is now resolved INSIDE get_cached_baseline_map
     # (Schritt C: a Plotly trace can't be a cache-data key), so it is no
     # longer fetched here directly.
@@ -522,12 +530,13 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
                         tuple(sorted(st.session_state.toggles_cold.items())),
                         frozenset(
                             name for name, active in toggles.items()
-                            if name in ("mslp", "z500", "hatching") and active
+                            if name in _MAP_OVERLAY_TOGGLES and active
                         ),
                         source_mtime, forecast_model,
                         full_width=full_width, anchor_date_str=anchor_date_str,
                         spell_days=int(toggles.get("spell_days", 6)),
                         _ref_data=ref_clim, _map_phys_data=map_phys_data,
+                        _syn_clim=syn_clim,
                     )
 
                 if map_layout == LAYOUT_SIDE_BY_SIDE:

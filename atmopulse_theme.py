@@ -678,13 +678,24 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     max-height: 100% !important;
 }}
 
-/* Compact left-aligned press-export buttons */
+/* Compact left-aligned press-export buttons; stay on one row. */
+div[class*="st-key-press-row"] [data-testid="stHorizontalBlock"] {{
+    flex-wrap: nowrap !important;
+    align-items: center !important;
+    gap: 0.35rem !important;
+}}
+div[class*="st-key-press-row"] [data-testid="stHorizontalBlock"] > div:not(:last-child) {{
+    flex: 0 0 auto !important;
+    width: auto !important;
+    min-width: 0 !important;
+}}
 div[class*="st-key-press-row"] [data-testid="stDownloadButton"] button,
 div[class*="st-key-press-row"] button {{
     min-height: 1.65rem !important;
     padding: 0.12rem 0.7rem !important;
     font-size: 12px !important;
     line-height: 1.2 !important;
+    white-space: nowrap !important;
 }}
 .atmopulse-meteo-yearly-gap {{
     height: 1.75rem !important;
@@ -742,7 +753,11 @@ section[data-testid="stSidebar"] .stCheckbox {{
 .st-key-map_overlay_mslp [data-testid="stMarkdownContainer"],
 .st-key-map_overlay_mslp [data-testid="stMarkdownContainer"] *,
 .st-key-map_overlay_z500 [data-testid="stMarkdownContainer"],
-.st-key-map_overlay_z500 [data-testid="stMarkdownContainer"] * {{
+.st-key-map_overlay_z500 [data-testid="stMarkdownContainer"] *,
+.st-key-map_overlay_mslp_anom [data-testid="stMarkdownContainer"],
+.st-key-map_overlay_mslp_anom [data-testid="stMarkdownContainer"] *,
+.st-key-map_overlay_z500_anom [data-testid="stMarkdownContainer"],
+.st-key-map_overlay_z500_anom [data-testid="stMarkdownContainer"] * {{
     font-family: {o} !important;
     font-size: 14px !important;
     font-weight: {uw} !important;
@@ -750,7 +765,8 @@ section[data-testid="stSidebar"] .stCheckbox {{
     font-variant-numeric: lining-nums !important;
 }}
 .st-key-map_synoptic_overlays [data-testid="stCheckbox"] [data-testid="stMarkdownContainer"] ol,
-.st-key-map_overlay_z500 [data-testid="stMarkdownContainer"] ol {{
+.st-key-map_overlay_z500 [data-testid="stMarkdownContainer"] ol,
+.st-key-map_overlay_z500_anom [data-testid="stMarkdownContainer"] ol {{
     list-style: none !important;
     padding-left: 0 !important;
     margin: 0 !important;
@@ -914,7 +930,9 @@ ATMOPULSE_COLD = {
 ATMOPULSE_OVERLAY = {
     "mslp_contour": "#2E7D32",
     "mslp_hl": "#2E7D32",
+    "mslp_anom_contour": "#6B4F1D",
     "z500_contour": "#0056B3",
+    "z500_anom_contour": "#7B1FA2",
     "coast": "#5A5A5A",
     "coast_width": 1.25,
     "border": "#8E9499",

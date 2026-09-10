@@ -70,6 +70,59 @@ def load_reference_climatology():
 
 
 @st.cache_resource(show_spinner=False)
+def load_synoptic_climatology():
+    """Epoch A/B DOY-mean MSLP and Z500 from ``climatology_synoptics.nc``.
+
+    Stored units match the ERA5 master batches (MSLP in Pa, Z500 as
+    geopotential). Convert to map display units (hPa, dam) at extract time
+    via ``synoptic_clim_mean_display``.
+    """
+    clim_path = DATA_ROOT / "Reference_Climatology/climatology_synoptics.nc"
+    return xr.open_dataset(clim_path) if clim_path.exists() else None
+
+
+def synoptic_clim_mean_display(syn_clim, param: str, epoch: str, doy, lats, lons):
+    """DOY-mean synoptic field on the live map grid, in map display units.
+
+    MSLP → hPa, Z500 → dam (geopotential / g / 10), matching
+    ``backend_maps.get_synoptic_map_data``. Returns None if the climatology
+    or variable is missing.
+    """
+    if syn_clim is None:
+        return None
+    key = f"{param}_mean_doy_{epoch}"
+    if key not in syn_clim.variables:
+        return None
+    da = syn_clim[key].sel(dayofyear=int(doy)).reindex(
+        latitude=lats, longitude=lons, method="nearest",
+    )
+    arr = np.squeeze(np.asarray(da.values, dtype=float))
+    return _synoptic_clim_to_display(param, arr)
+
+
+def synoptic_clim_point_doy(syn_clim, param: str, epoch: str, lat, lon):
+    """365-length DOY-mean series at the nearest grid point, in display units."""
+    if syn_clim is None:
+        return None
+    key = f"{param}_mean_doy_{epoch}"
+    if key not in syn_clim.variables:
+        return None
+    da = syn_clim[key].sel(latitude=lat, longitude=lon, method="nearest")
+    arr = np.squeeze(np.asarray(da.values, dtype=float))
+    return _synoptic_clim_to_display(param, arr)
+
+
+def _synoptic_clim_to_display(param: str, arr: np.ndarray) -> np.ndarray:
+    """MSLP Pa→hPa, Z500 geopotential→dam — same conversions as the map fields."""
+    sample = float(np.nanmean(arr)) if np.isfinite(arr).any() else float("nan")
+    if param == "mslp" and np.isfinite(sample) and sample > 2000:
+        return arr / 100.0
+    if param == "z500" and np.isfinite(sample) and sample > 10000:
+        return arr / 9.80665 / 10.0
+    return arr
+
+
+@st.cache_resource(show_spinner=False)
 def load_invariant_fields():
     """ERA5 time-invariant physiography fields (land-sea mask, orography,
     sub-grid orography variance) used to describe the physical footprint of
@@ -349,14 +402,27 @@ def _squeeze_celsius(values):
     return arr
 
 
+def _z500_to_dam(values):
+    """Geopotential (m²/s²) → dam, matching ``get_synoptic_map_data``."""
+    arr = np.squeeze(np.asarray(values, dtype=np.float64))
+    finite = arr[np.isfinite(arr)]
+    if finite.size:
+        sample = float(np.mean(finite))
+        if sample > 10000:
+            arr = arr / 9.80665 / 10.0
+        elif sample > 2000:
+            arr = arr / 10.0
+    return arr
+
+
 def _point_frame_from_master_ds(ds, lat, lon, start, end):
-    """1D TX/TN/TG at (lat, lon) for [start, end], then drop the rest of the cube."""
+    """1D TX/TN/TG/T850/Z500 at (lat, lon) for [start, end], then drop the rest of the cube."""
     ds = _harmonize_master_archive(ds)
     if "mx2t" in ds.data_vars and "tx" not in ds.data_vars:
         ds = ds.rename({"mx2t": "tx"})
     if "mn2t" in ds.data_vars and "tn" not in ds.data_vars:
         ds = ds.rename({"mn2t": "tn"})
-    keep = [v for v in ("tx", "tn", "tg", "t850") if v in ds.data_vars]
+    keep = [v for v in ("tx", "tn", "tg", "t850", "z500") if v in ds.data_vars]
     if not keep:
         return pd.DataFrame()
     lat_name = "latitude" if "latitude" in ds.coords else "lat"
@@ -368,11 +434,13 @@ def _point_frame_from_master_ds(ds, lat, lon, start, end):
     if getattr(times, "tz", None) is not None:
         times = times.tz_convert("UTC").tz_localize(None)
     days = pd.DatetimeIndex(times).normalize()
-    tx = _squeeze_celsius(pt["tx"].values) if "tx" in pt else np.full(len(days), np.nan)
-    tn = _squeeze_celsius(pt["tn"].values) if "tn" in pt else np.full(len(days), np.nan)
+    n = len(days)
+    tx = _squeeze_celsius(pt["tx"].values) if "tx" in pt else np.full(n, np.nan)
+    tn = _squeeze_celsius(pt["tn"].values) if "tn" in pt else np.full(n, np.nan)
     tg = _squeeze_celsius(pt["tg"].values) if "tg" in pt else (tx + tn) / 2.0
-    t850 = _squeeze_celsius(pt["t850"].values) if "t850" in pt else np.full(len(days), np.nan)
-    return pd.DataFrame({"Date": days, "TX": tx, "TN": tn, "TG": tg, "T850": t850})
+    t850 = _squeeze_celsius(pt["t850"].values) if "t850" in pt else np.full(n, np.nan)
+    z500 = _z500_to_dam(pt["z500"].values) if "z500" in pt else np.full(n, np.nan)
+    return pd.DataFrame({"Date": days, "TX": tx, "TN": tn, "TG": tg, "T850": t850, "Z500": z500})
 
 
 _POINT_EXTRACT_SCRIPT = r"""
@@ -388,7 +456,7 @@ try:
         ds = ds.rename({"mx2t": "tx"})
     if "mn2t" in ds.data_vars and "tn" not in ds.data_vars:
         ds = ds.rename({"mn2t": "tn"})
-    keep = [v for v in ("tx", "tn", "tg", "t850") if v in ds.data_vars]
+    keep = [v for v in ("tx", "tn", "tg", "t850", "z500") if v in ds.data_vars]
     if not keep:
         raise SystemExit(2)
     lat_name = "latitude" if "latitude" in ds.coords else "lat"
@@ -406,7 +474,20 @@ try:
         if finite.size and float(np.mean(finite)) > 100:
             a = a - 273.15
         return [None if not np.isfinite(x) else float(x) for x in a]
-    json.dump({"Date": [d.strftime("%Y-%m-%d") for d in days], "TX": _c("tx"), "TN": _c("tn"), "TG": _c("tg"), "T850": _c("t850")}, sys.stdout)
+    def _z(v):
+        if v not in pt:
+            return [None] * len(days)
+        a = np.squeeze(np.asarray(pt[v].values, dtype=float))
+        a = np.atleast_1d(a)
+        finite = a[np.isfinite(a)]
+        if finite.size:
+            sample = float(np.mean(finite))
+            if sample > 10000:
+                a = a / 9.80665 / 10.0
+            elif sample > 2000:
+                a = a / 10.0
+        return [None if not np.isfinite(x) else float(x) for x in a]
+    json.dump({"Date": [d.strftime("%Y-%m-%d") for d in days], "TX": _c("tx"), "TN": _c("tn"), "TG": _c("tg"), "T850": _c("t850"), "Z500": _z("z500")}, sys.stdout)
 finally:
     ds.close()
 """
@@ -464,14 +545,14 @@ def _last_finite(series):
 
 
 @st.cache_data(show_spinner=False)
-def get_live_point_series(lat, lon, forecast_model=FORECAST_MODEL_IFS, _series_version=8):
+def get_live_point_series(lat, lon, forecast_model=FORECAST_MODEL_IFS, _series_version=9):
     """
-    Point daily TX/TN/TG/T850 for the Point Meteogram. Does NOT open the maps
+    Point daily TX/TN/TG/T850/Z500 for the Point Meteogram. Does NOT open the maps
     spatial cube (load_global_datasets): that concatenates 2025+2026 and then
     .compute()s every field at the point, which aborted Streamlit on a
     corrupted HDF5 heap in era5_master_daily_2026.nc.
 
-    Each covering year is opened alone, only the point temperature fields are
+    Each covering year is opened alone, only the point fields are
     read, and the current calendar year is isolated in a subprocess.
     """
     end = pd.Timestamp.utcnow().tz_localize(None).floor("D") + pd.Timedelta(days=10)
@@ -509,6 +590,10 @@ def get_live_point_series(lat, lon, forecast_model=FORECAST_MODEL_IFS, _series_v
                 _squeeze_celsius(pt_lf["t850"].values) + _qdm_mean_bias(lat, lon, f_doys, "t850_bias")
                 if "t850" in pt_lf.data_vars else np.full(len(f_days), np.nan)
             )
+            z500_vals = (
+                _z500_to_dam(pt_lf["z500"].values)
+                if "z500" in pt_lf.data_vars else np.full(len(f_days), np.nan)
+            )
             if tx_name in pt_lf.data_vars and tn_name in pt_lf.data_vars:
                 tx_raw = _squeeze_celsius(pt_lf[tx_name].values)
                 tn_raw = _squeeze_celsius(pt_lf[tn_name].values)
@@ -516,16 +601,19 @@ def get_live_point_series(lat, lon, forecast_model=FORECAST_MODEL_IFS, _series_v
                 dtr_corr = (tx_raw - tn_raw) + _qdm_mean_bias(lat, lon, f_doys, "dtr_bias")
                 tg_corr = (tx_raw + tn_raw) / 2.0 + _qdm_mean_bias(lat, lon, f_doys, "tg_bias")
                 frames.append(pd.DataFrame({
-                    "Date": f_days, "TX": tx_corr, "TN": tx_corr - dtr_corr, "TG": tg_corr, "T850": t850_vals,
+                    "Date": f_days, "TX": tx_corr, "TN": tx_corr - dtr_corr, "TG": tg_corr,
+                    "T850": t850_vals, "Z500": z500_vals,
                 }))
             elif "tg" in pt_lf.data_vars:
                 tg_corr = _squeeze_celsius(pt_lf["tg"].values) + _qdm_mean_bias(lat, lon, f_doys, "tg_bias")
                 frames.append(pd.DataFrame({
-                    "Date": f_days, "TX": np.nan, "TN": np.nan, "TG": tg_corr, "T850": t850_vals,
+                    "Date": f_days, "TX": np.nan, "TN": np.nan, "TG": tg_corr,
+                    "T850": t850_vals, "Z500": z500_vals,
                 }))
-            elif "t850" in pt_lf.data_vars:
+            elif "t850" in pt_lf.data_vars or "z500" in pt_lf.data_vars:
                 frames.append(pd.DataFrame({
-                    "Date": f_days, "TX": np.nan, "TN": np.nan, "TG": np.nan, "T850": t850_vals,
+                    "Date": f_days, "TX": np.nan, "TN": np.nan, "TG": np.nan,
+                    "T850": t850_vals, "Z500": z500_vals,
                 }))
         except Exception:
             pass
@@ -537,7 +625,7 @@ def get_live_point_series(lat, lon, forecast_model=FORECAST_MODEL_IFS, _series_v
     df = pd.concat(frames, ignore_index=True)
     df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None).dt.normalize()
     df = df.sort_values("Date")
-    value_cols = [c for c in ("TX", "TN", "TG", "T850") if c in df.columns]
+    value_cols = [c for c in ("TX", "TN", "TG", "T850", "Z500") if c in df.columns]
     df = df.groupby("Date", as_index=False)[value_cols].agg(_last_finite)
     # 29 Feb stays VISIBLE on the live chart (real ERA5/IFS value plotted on
     # its real calendar date) — only the 365-day BASELINE array excises it.

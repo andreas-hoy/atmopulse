@@ -88,8 +88,23 @@ HELP: dict[str, str] = {
         "that set the low-level flow and, with it, warm or cold advection."
     ),
     "z500_contours": (
-        "Height of the 500 hPa surface (about 5.5 km). Ridges (high) and troughs (low) at this "
-        "level steer the weather systems seen in the sea-level pressure field."
+        "Height of the 500 hPa surface (about 5.5 km), as 8 dam isolines (80 geopotential metres — "
+        "not hPa). The coarser step keeps the overlay readable on the temperature map; a dedicated "
+        "500 hPa chart would typically use 4 dam. Ridges (high) and troughs (low) at this level "
+        "steer the weather systems seen in the sea-level pressure field."
+    ),
+    "mslp_anomaly": (
+        "Sea-level pressure minus the 5-day day-of-year mean of the map's selected reference "
+        "period (1961–1990 or 1996–2025). Isolines every 2 hPa (tighter than the 5 hPa absolute "
+        "field, which otherwise hides typical ±4…±15 hPa departures); "
+        "solid = above that baseline, dashed = below. The two maps therefore differ even though "
+        "the observed field is the same."
+    ),
+    "z500_anomaly": (
+        "500 hPa height minus the 5-day day-of-year mean of the map's selected reference period. "
+        "Isolines every 4 dam (not 8: typical European anomalies are ±8 to ±24 dam and would "
+        "nearly vanish at the absolute-field step). Solid = ridge relative to that baseline, "
+        "dashed = trough."
     ),
     "top10_table": "Excludes territories under 3000 km² and countries located completely outside of Europe",
     "europe_share_table": (
@@ -106,6 +121,12 @@ HELP: dict[str, str] = {
         "and 95th (warm) and 5th (cold) for extreme conditions within the reference period. "
         "All-time records are given for the full period (starting 1940) prior to the current year."
     ),
+    "meteo_z500_panel": (
+        "500 hPa height anomaly at this grid cell versus the 5-day day-of-year mean of the "
+        "selected reference period (dam). Positive (purple fill) is a ridge; negative (blue fill) "
+        "is a trough. Same baseline as the temperature envelope above, so the two panels can be "
+        "read together as thermal response versus large-scale driver."
+    ),
     "meteo_annual_count": (
         "Select between: \"all anomaly days\" (counts every day with a warm or cold anomaly) "
         "and \"spell days\" (counts only days that belong to a period of at least 6 consecutive "
@@ -114,23 +135,40 @@ HELP: dict[str, str] = {
 
     # --- Point Wavogram ---
     "wave_event_type": (
-        "Heatwaves: Triggered when the daily maximum temperature (TX) exceeds the local summer (June–August) "
-        "threshold for at least 3 consecutive days. The wave continues as long as the average TX remains above "
-        "this threshold, and terminates immediately if a single day drops below a secondary, lower tolerance threshold.\n\n"
-        "Coldwaves: Triggered when the daily minimum temperature (TN) falls below the local winter (December–February) "
-        "threshold for at least 3 consecutive days. It continues while the average TN remains below this threshold, "
-        "and ends if a single day rises above the upper tolerance limit."
+        "Heatwaves: May–September events using the selected variable (default: daily maximum TX). "
+        "Triggered when the value exceeds the local summer (June–August) threshold for at least 3 consecutive days. "
+        "The wave continues as long as the average remains above this threshold, and terminates immediately if a "
+        "single day drops below a secondary, lower tolerance threshold.\n\n"
+        "Coldwaves: November–March events using the selected variable (default: daily minimum TN). "
+        "Triggered when the value falls below the local winter (December–February) threshold for at least 3 consecutive days. "
+        "It continues while the average remains below this threshold, and ends if a single day rises above the upper tolerance limit."
+    ),
+    "wave_variable": (
+        "Temperature field used for Kyselý detection. Heatwaves default to daily maximum (TX); "
+        "coldwaves to daily minimum (TN). Mean temperature (TG) and 850 hPa temperature (T850) "
+        "keep the same season and heat/cold direction as the selected event type."
     ),
     "wave_intensity_threshold": (
         "Strong: Calculates waves using the 90th (heat) or 10th (cold) percentile as the main trigger.\n\n"
         "Extreme: Calculates waves using the stricter 95th (heat) or 5th (cold) percentile as the main trigger."
     ),
-    "wave_stat_metric": (
-        "Cumulative Annual Wave Intensity: Sum of Kyselý wave intensities (Σ TX−P90 per wave day) for all distinct "
-        "May–Sep events in a year.\n\n"
-        "Maximum Annual Wave Intensity: Intensity of the single strongest wave event of the year.\n\n"
-        "Cumulative Heat/Cold Intensity: Σ excess above/below threshold for every day in the season, even without "
-        "a 3-day wave (closest to literature \u201cTemperatursumme \u2265 P90\u201d).\n\n"
-        "Annual Cycle Frequency: 5-day-smoothed relative frequency of threshold exceedance through the year."
+    "wave_annual_stack": (
+        "Cumulative stack from the axis up: the strongest wave, then the remaining waves "
+        "(together = all waves), then isolated threshold days (together = all days beyond "
+        "the threshold). Intensity is in K; Days is duration."
+    ),
+    "wave_stack_metric": (
+        "Intensity (default): Kyselý excess in K. Days: number of days. "
+        "The stack is the same for heat and cold: strongest wave, all waves, then all days "
+        "beyond the threshold."
+    ),
+    "wave_annual_cycle": (
+        "5-day-smoothed frequency of days that fall inside a detected Strong or Extreme "
+        "Kyselý wave — not isolated hot or cold days."
+    ),
+    "wave_z500_outline": (
+        "Optional purple outline on events whose mean 500 hPa height anomaly over the wave days is at least "
+        "+8 dam (heat, Ridge) or −8 dam (cold, Trough) versus the same reference period used for the "
+        "temperature thresholds."
     ),
 }
