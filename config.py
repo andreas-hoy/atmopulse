@@ -35,6 +35,7 @@ MAP_VIEW_PERSISTENCE = "Persistence duration"
 LAYOUT_SIDE_BY_SIDE = "Side-by-Side Compare"
 LAYOUT_FLICKER = "Single Map Flicker"
 LAYOUT_OPACITY = "Opacity Slider Compare"
+LAYOUT_SWIPE = "Swipe Slider Compare"
 
 AIFS_TXTN_WARNING = (
     "Diurnal extreme analytics (TX/TN and associated Wave Tracking) are currently unavailable "
@@ -62,7 +63,6 @@ EXPERT_FEATURES = frozenset({
     "t850",
     "jet",
     "utci",
-    "apparent_temp",
     "meteo_tx_tn",
     "meteo_envelope",
     "wave_stat_metric",
@@ -79,8 +79,6 @@ STANDARD_DEFAULTS = {
     "z500": False,
     "meteo_var": "Mean Temp (TG)",
     "meteo_env": "Strong",
-    "show_air_temp": True,
-    "show_app_temp": False,
     "wave_thresh": "Strong",
     "wave_stat_metric": "Cumulative Annual Wave Intensity",
     "map_layout": LAYOUT_SIDE_BY_SIDE,

@@ -155,6 +155,7 @@ def precompute_offset(offset: int, anchor_date: pd.Timestamp, ref_clim) -> None:
     try:
         map_phys_data, map_time_meta = fetch_cached_synoptic_data(
             target_date_str, anchor_date_str, forecast_model=FORECAST_MODEL_IFS,
+            needed_vars=("tx", "tn", "tg"),
         )
     except Exception as exc:
         print(f"  SKIPPED {target_date_str} (loader error: {exc})")

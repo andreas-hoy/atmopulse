@@ -80,8 +80,6 @@ HELP: dict[str, str] = {
         "and 95th (warm) and 5th (cold) for extreme conditions within the reference period. "
         "All-time records are given for the full period (starting 1940) prior to the current year."
     ),
-    "meteogram_air_temp_colors": "Colors the space below the curve for cold anomalies and above the curve for warm anomalies.",
-    "meteogram_apparent_temp": "Dotted Line: 'Feels-like' temperature, combining 2m air temperature, relative humidity and wind speed.",
 
     # --- Point Wavogram ---
     "wave_event_type": (

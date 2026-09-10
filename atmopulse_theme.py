@@ -103,8 +103,14 @@ def atmopulse_streamlit_css(brand: dict) -> str:
     align-items: center !important;
     min-height: 72px !important; 
     height: auto !important; 
-    overflow-x: auto !important;
+    overflow-x: hidden !important;
     overflow-y: hidden !important;
+    scrollbar-width: none !important;
+}}
+.st-key-atmopulse_nav_bar::-webkit-scrollbar {{
+    display: none !important;
+    height: 0 !important;
+    width: 0 !important;
 }}
 .st-key-atmopulse_nav_bar > div,
 .st-key-atmopulse_nav_bar [data-testid="stHorizontalBlock"],
@@ -119,9 +125,15 @@ def atmopulse_streamlit_css(brand: dict) -> str:
     padding: 0 !important;
     align-self: center !important;
 }}
-.st-key-atmopulse_nav_bar .st-key-atmopulse_top_nav {{ 
-    flex: 1 !important; 
-    min-width: 0 !important; 
+.st-key-atmopulse_nav_bar .st-key-atmopulse_top_nav {{
+    flex: 1 !important;
+    min-width: 0 !important;
+}}
+.st-key-atmopulse_nav_bar .st-key-atmopulse_top_nav,
+.st-key-atmopulse_nav_bar div[data-testid="stRadio"] {{
+    overflow-x: hidden !important;
+    overflow-y: hidden !important;
+    scrollbar-width: none !important;
 }}
 .atmopulse-nav-logo,
 .atmopulse-sidebar-logo {{
@@ -184,9 +196,8 @@ section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{
     padding: 0 !important; 
 }}
 
-/* Top navigation tabs — single row. A slim, visible scrollbar acts as a
-   "slider" to pan through the tabs on narrow screens / high zoom instead of
-   shrinking or overlapping them. */
+/* Top navigation tabs — single row. Only the radiogroup itself scrolls;
+   the blue thumb is the sole scrollbar (the grey OS/track bar is hidden). */
 .st-key-atmopulse_top_nav div[data-testid="stRadio"] > div[role="radiogroup"] {{
     display: flex !important; 
     flex-direction: row !important; 
@@ -194,15 +205,13 @@ section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{
     align-items: center !important; 
     gap: clamp(4px, 0.6vw, 10px) !important;
     margin: 0 !important; 
-    padding: 0 0 6px 0 !important; 
+    padding: 0 0 8px 0 !important; 
     width: 100% !important; 
     overflow-x: auto !important;
     overflow-y: hidden !important;
-    scrollbar-width: thin !important;
-    scrollbar-color: {brand['primary']} transparent !important;
 }}
 .st-key-atmopulse_top_nav div[data-testid="stRadio"] > div[role="radiogroup"]::-webkit-scrollbar {{
-    height: 5px !important;
+    height: 6px !important;
 }}
 .st-key-atmopulse_top_nav div[data-testid="stRadio"] > div[role="radiogroup"]::-webkit-scrollbar-track {{
     background: transparent !important;
@@ -210,7 +219,12 @@ section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{
 .st-key-atmopulse_top_nav div[data-testid="stRadio"] > div[role="radiogroup"]::-webkit-scrollbar-thumb {{
     background-color: {brand['primary']} !important;
     border-radius: 999px !important;
-    opacity: 0.6 !important;
+}}
+@supports not selector(::-webkit-scrollbar) {{
+    .st-key-atmopulse_top_nav div[data-testid="stRadio"] > div[role="radiogroup"] {{
+        scrollbar-width: thin !important;
+        scrollbar-color: {brand['primary']} transparent !important;
+    }}
 }}
 .st-key-atmopulse_top_nav div[data-testid="stRadio"] > div[role="radiogroup"] > label {{
     background-color: transparent; 
@@ -446,18 +460,58 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     line-height: 1 !important;
 }}
 
-/* Map Tracker: seamless side-by-side Plotly maps, pulled together with a
-   thin vertical divider instead of a wide gutter. */
+/* Map Tracker: side-by-side baselines share one column pair (maps + tables)
+   with a vertical divider. min-width:0 lets nested dataframes shrink. */
 .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] {{
     gap: 0 !important;
+    align-items: stretch !important;
 }}
-.st-key-atmopulse_map_columns [data-testid="column"] {{
+.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"] {{
     padding: 0 !important;
     margin: 0 !important;
+    min-width: 0 !important;
+    overflow-x: auto !important;
 }}
-.st-key-atmopulse_map_columns [data-testid="column"]:nth-of-type(1) {{
-    border-right: 2px solid #D3D3D3 !important;
-    padding-right: 10px !important;
+.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
+.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
+    border-right: 2px solid {_hex_to_rgba(brand['primary'], 0.55)} !important;
+    padding-right: 12px !important;
+}}
+.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child,
+.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"]:last-child {{
+    padding-left: 12px !important;
+}}
+.st-key-atmopulse_map_columns [data-testid="stDataFrame"] {{
+    width: 100% !important;
+    max-width: 100% !important;
+}}
+.st-key-atmopulse_map_columns [data-testid="stDataFrame"] > div {{
+    width: 100% !important;
+    max-width: 100% !important;
+}}
+@media (max-width: 900px) {{
+    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] {{
+        flex-wrap: wrap !important;
+    }}
+    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"] {{
+        flex: 1 1 100% !important;
+        width: 100% !important;
+        max-width: 100% !important;
+    }}
+    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
+    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
+        border-right: none !important;
+        border-bottom: 2px solid {_hex_to_rgba(brand['primary'], 0.55)} !important;
+        padding-right: 0 !important;
+        padding-bottom: 12px !important;
+        margin-bottom: 12px !important;
+    }}
+    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child,
+    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"]:last-child {{
+        padding-left: 0 !important;
+    }}
 }}
 
 /* Synoptic maps: the keyed frame is locked to EUROPE_BBOX (70° lon : 42° lat).
@@ -466,11 +520,11 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
 .atmopulse-map-title {{
     text-align: center !important;
     font-family: {s} !important;
-    font-size: 14px !important;
+    font-size: 18px !important;
     font-weight: 600 !important;
     color: {brand['primary']} !important;
-    margin: 0 0 6px 0 !important;
-    line-height: 1.2 !important;
+    margin: 8px 0 8px 0 !important;
+    line-height: 1.25 !important;
 }}
 .st-key-map_a,
 .st-key-map_b,
@@ -482,33 +536,8 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     max-width: 100% !important;
     overflow: hidden !important;
 }}
-.st-key-map_a > div,
-.st-key-map_b > div,
-.st-key-map_flicker > div,
-.st-key-map_a [data-testid="stPlotlyChart"],
-.st-key-map_b [data-testid="stPlotlyChart"],
-.st-key-map_flicker [data-testid="stPlotlyChart"],
-.st-key-map_a .js-plotly-plot,
-.st-key-map_b .js-plotly-plot,
-.st-key-map_flicker .js-plotly-plot,
-.st-key-map_a .plot-container,
-.st-key-map_b .plot-container,
-.st-key-map_flicker .plot-container,
-.st-key-map_a .svg-container,
-.st-key-map_b .svg-container,
-.st-key-map_flicker .svg-container {{
-    position: absolute !important;
-    inset: 0 !important;
-    width: 100% !important;
-    height: 100% !important;
-    max-width: 100% !important;
-    max-height: 100% !important;
-}}
-/* Opacity-slider map: same EUROPE_BBOX-locked frame as above, plus a bit of
-   extra height so the Plotly layout slider has room beneath the map instead
-   of overlapping it (the slider's own space is reserved via Plotly margin,
-   not by shrinking the map's lon:lat ratio, which stays letterboxed-safe
-   via the shared xaxis/yaxis "constrain: domain" config). */
+/* Slider maps keep a slightly shorter frame so the Plotly layout slider
+   sits under the map instead of overlapping Europe. */
 .st-key-map_opacity {{
     position: relative !important;
     aspect-ratio: 70 / 34 !important;
@@ -517,10 +546,25 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     max-width: 100% !important;
     overflow: hidden !important;
 }}
+.st-key-map_a > div,
+.st-key-map_b > div,
+.st-key-map_flicker > div,
 .st-key-map_opacity > div,
+.st-key-map_a [data-testid="stPlotlyChart"],
+.st-key-map_b [data-testid="stPlotlyChart"],
+.st-key-map_flicker [data-testid="stPlotlyChart"],
 .st-key-map_opacity [data-testid="stPlotlyChart"],
+.st-key-map_a .js-plotly-plot,
+.st-key-map_b .js-plotly-plot,
+.st-key-map_flicker .js-plotly-plot,
 .st-key-map_opacity .js-plotly-plot,
+.st-key-map_a .plot-container,
+.st-key-map_b .plot-container,
+.st-key-map_flicker .plot-container,
 .st-key-map_opacity .plot-container,
+.st-key-map_a .svg-container,
+.st-key-map_b .svg-container,
+.st-key-map_flicker .svg-container,
 .st-key-map_opacity .svg-container {{
     position: absolute !important;
     inset: 0 !important;
@@ -529,6 +573,10 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     max-width: 100% !important;
     max-height: 100% !important;
 }}
+
+/* Swipe compare now renders both maps inside one self-contained
+   components.html iframe (see render_swipe_compare_map in
+   frontend_plots.py) — no outer .st-key-* CSS is needed for it. */
 
 /* Sidebar: Filters & Controls */
 section[data-testid="stSidebar"] {{
@@ -588,7 +636,74 @@ section[data-testid="stSidebar"] [data-baseweb="select"] {{
     font-weight: {uw} !important;
 }}
 
-/* Shared subsection labels: Map legends & Top-10 headers */
+.atmopulse-location-banner {{
+    background-color: {brand['nav_bg']} !important;
+    color: {brand['text_on_light']} !important;
+    padding: 0.75rem 1rem !important;
+    border-radius: 0.5rem !important;
+    font-family: {o} !important;
+    font-weight: {uw} !important;
+    margin: 0 0 0.5rem 0 !important;
+}}
+.atmopulse-narrative-banner {{
+    background-color: {brand['nav_bg']} !important;
+    color: {brand['text_on_light']};
+    padding: 0.75rem 1rem !important;
+    border-radius: 0.5rem !important;
+    font-family: {o} !important;
+    font-weight: {uw} !important;
+    margin: 0 0 0.5rem 0 !important;
+    line-height: 1.55 !important;
+}}
+.atmopulse-narrative-chip {{
+    padding: 1px 6px !important;
+    border-radius: 3px !important;
+    font-family: inherit !important;
+    font-size: inherit !important;
+    font-weight: inherit !important;
+    white-space: normal !important;
+    display: inline !important;
+    box-decoration-break: clone;
+    -webkit-box-decoration-break: clone;
+}}
+.atmopulse-sev-normal {{
+    background-color: {brand['mode_track']} !important;
+    color: {brand['text_on_light']} !important;
+}}
+.atmopulse-sev-warm-moderate {{
+    background-color: {ATMOPULSE_WARM['p75']} !important;
+    color: {brand['text_on_light']} !important;
+}}
+.atmopulse-sev-warm-strong {{
+    background-color: {ATMOPULSE_WARM['p90']} !important;
+    color: {brand['text_on_light']} !important;
+}}
+.atmopulse-sev-warm-extreme {{
+    background-color: {ATMOPULSE_WARM['p95']} !important;
+    color: {brand['text_on_primary']} !important;
+}}
+.atmopulse-sev-warm-record {{
+    background-color: {ATMOPULSE_WARM['rec']} !important;
+    color: {brand['text_on_primary']} !important;
+}}
+.atmopulse-sev-cold-moderate {{
+    background-color: {ATMOPULSE_COLD['p25']} !important;
+    color: {brand['text_on_light']} !important;
+}}
+.atmopulse-sev-cold-strong {{
+    background-color: {ATMOPULSE_COLD['p10']} !important;
+    color: {brand['text_on_light']} !important;
+}}
+.atmopulse-sev-cold-extreme {{
+    background-color: {ATMOPULSE_COLD['p5']} !important;
+    color: {brand['text_on_primary']} !important;
+}}
+.atmopulse-sev-cold-record {{
+    background-color: {ATMOPULSE_COLD['rec']} !important;
+    color: {brand['text_on_primary']} !important;
+}}
+
+
 .atmopulse-subsection-label,
 .atmopulse-map-legend {{
     font-family: {o} !important;
@@ -626,45 +741,56 @@ ATMOPULSE_BRAND = {
 }
 
 # --- Warm (heat) percentiles ---
+# Shared Map Tracker + Meteogram ladder. "above" is meteogram-only (very pale
+# above-average fill); Moderate/Strong/Extreme/Record mean the same colours
+# in every view.
 ATMOPULSE_WARM = {
-    "p75": "#FFE699",   # Moderate (75th percentile)
-    "p90": "#FF9933",   # Strong (90th percentile)
-    "p95": "#CC0000",   # Extreme (95th percentile)
-    "rec": "#E91E8C",   # All-time record (distinct vivid pink)
+    "above": "#FFF4CC",  # very pale gold — meteogram above-average only
+    "p75": "#FFD166",    # Moderate (slightly stronger than the old cream gold)
+    "p90": "#FF9933",    # Strong (90th percentile)
+    "p95": "#CC0000",    # Extreme (95th percentile)
+    "rec": "#E91E8C",    # All-time record (distinct vivid pink)
 }
 
 # --- Cold percentiles ---
 ATMOPULSE_COLD = {
-    "p25": "#CCF2FF",   # Moderate (25th percentile)
-    "p10": "#3399FF",   # Strong (10th percentile)
-    "p5": "#0056B3",    # Extreme (5th percentile, aligned with primary brand)
-    "rec": "#4B0082",   # All-time record (indigo)
+    "below": "#EAF6FF",  # very pale cyan — meteogram below-average only
+    "p25": "#B3E8FF",    # Moderate (slightly stronger than the old ice blue)
+    "p10": "#3399FF",    # Strong (10th percentile)
+    "p5": "#0056B3",     # Extreme (5th percentile, aligned with primary brand)
+    "rec": "#4B0082",    # All-time record (indigo)
 }
 
 # --- Overlays & auxiliary series ---
 ATMOPULSE_OVERLAY = {
     "mslp_contour": "#2E7D32",
     "z500_contour": "#0056B3",
-    "apparent_temp": "#388E3C",
     "border": "#000000",
     "grid": "rgba(200,200,200,0.3)",
     "annotation": "gray",
 }
 
 # --- Meteogram fill opacities ---
-_METEO_ALPHA = {"moderate": 0.50, "strong": 0.60, "extreme": 0.70, "record": 0.85}
+_METEO_ALPHA = {
+    "above": 0.50,
+    "below": 0.50,
+    "moderate": 0.50,
+    "strong": 0.60,
+    "extreme": 0.70,
+    "record": 0.85,
+}
+_WARM_FILL_KEY = {"above": "above", "moderate": "p75", "strong": "p90", "extreme": "p95", "record": "rec"}
+_COLD_FILL_KEY = {"below": "below", "moderate": "p25", "strong": "p10", "extreme": "p5", "record": "rec"}
 
 
 def warm_rgba(level: str) -> str:
-    """Return rgba string for meteogram warm anomaly fills (moderate, strong, extreme, record)."""
-    key = {"moderate": "p75", "strong": "p90", "extreme": "p95", "record": "rec"}[level]
-    return _hex_to_rgba(ATMOPULSE_WARM[key], _METEO_ALPHA[level])
+    """Return rgba string for meteogram warm fills (above, moderate, strong, extreme, record)."""
+    return _hex_to_rgba(ATMOPULSE_WARM[_WARM_FILL_KEY[level]], _METEO_ALPHA[level])
 
 
 def cold_rgba(level: str) -> str:
-    """Return rgba string for meteogram cold anomaly fills (moderate, strong, extreme, record)."""
-    key = {"moderate": "p25", "strong": "p10", "extreme": "p5", "record": "rec"}[level]
-    return _hex_to_rgba(ATMOPULSE_COLD[key], _METEO_ALPHA[level])
+    """Return rgba string for meteogram cold fills (below, moderate, strong, extreme, record)."""
+    return _hex_to_rgba(ATMOPULSE_COLD[_COLD_FILL_KEY[level]], _METEO_ALPHA[level])
 
 
 def map_extremes_colorscale() -> list[list]:
@@ -725,17 +851,13 @@ def cold_persistence_colorscale() -> list[list]:
 
 
 def legend_badge_style(warm_or_cold: str, level: str, *, highlight: bool = False) -> str:
-    """Inline CSS for HTML legend badges rendered inside Streamlit UI containers."""
+    """Inline CSS for HTML legend badges. One palette everywhere: Moderate/Strong/
+    Extreme/Record match Map Tracker; ``above``/``below`` are meteogram-only pales.
+    """
     palette = ATMOPULSE_WARM if warm_or_cold == "warm" else ATMOPULSE_COLD
-    key = {
-        "moderate": "p75" if warm_or_cold == "warm" else "p25",
-        "strong": "p90" if warm_or_cold == "warm" else "p10",
-        "extreme": "p95" if warm_or_cold == "warm" else "p5",
-        "record": "rec",
-    }[level]
+    key = (_WARM_FILL_KEY if warm_or_cold == "warm" else _COLD_FILL_KEY)[level]
     bg = palette[key]
-    # Light fills -> dark text; dark fills -> white text
-    light_keys = {"p75", "p90", "p25", "p10"}
+    light_keys = {"above", "below", "p75", "p90", "p25", "p10"}
     fg = ATMOPULSE_BRAND["text_on_light"] if key in light_keys else ATMOPULSE_BRAND["text_on_primary"]
     style = (
         f"background-color:{bg}; color:{fg}; padding: 1px 6px; border-radius: 3px;"

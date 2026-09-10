@@ -207,7 +207,7 @@ def unflatten_footprint(df: pd.DataFrame) -> dict:
 
 
 @st.cache_data(show_spinner=False)
-def _calc_compute_map_footprint_raw(_ref_data, _map_phys_data, target_date_str, t_warm, t_cold, baseline_type="A", map_var="TG", anchor_date_str=None):
+def _calc_compute_map_footprint_raw(_ref_data, _map_phys_data, target_date_str, t_warm, t_cold, baseline_type="A", map_var="TG", anchor_date_str=None, source_mtime=0.0):
     """
     Area-weighted, CUMULATIVE Moderate/Strong/Extreme/Record spatial footprint
     for the Map Tracker narrative (backend_narrative.spatial_extreme_footprint).
@@ -223,6 +223,15 @@ def _calc_compute_map_footprint_raw(_ref_data, _map_phys_data, target_date_str, 
     `map_var`, `anchor_date_str`), so reruns triggered by unrelated widgets
     (e.g. the Map Layout radio) hit the cache instantly instead of
     recomputing the mask from scratch.
+
+    `source_mtime` (Schritt C): the mtime of the newest forecast/master file
+    behind `_map_phys_data`, passed in by the caller (backend_io.py /
+    page_map_tracker.py). It is intentionally UNUSED inside the function body
+    — its only job is to sit in the hashed cache key next to the other cheap
+    args, so a freshly-downloaded IFS/AIFS run for the SAME date_str/toggles
+    still busts this cache instead of silently narrating stale data computed
+    from the previous file (`_map_phys_data` itself never participates in the
+    key, being underscore-prefixed).
     """
     if _ref_data is None or _map_phys_data is None:
         return None
@@ -266,7 +275,7 @@ def _calc_compute_map_footprint_raw(_ref_data, _map_phys_data, target_date_str, 
 
 
 @st.cache_data(show_spinner=False)
-def compute_map_footprint(_ref_data, _map_phys_data, target_date_str, t_warm, t_cold, baseline_type="A", map_var="TG", anchor_date_str=None):
+def compute_map_footprint(_ref_data, _map_phys_data, target_date_str, t_warm, t_cold, baseline_type="A", map_var="TG", anchor_date_str=None, source_mtime=0.0):
     """
     Lazy-loading front door for the spatial extreme footprint.
 
@@ -278,6 +287,11 @@ def compute_map_footprint(_ref_data, _map_phys_data, target_date_str, t_warm, t_
     window, or before the batch script has ever been run). Same signature
     and return shape as the original function, so every call site keeps
     working unmodified and the app never breaks on a cache miss.
+
+    `source_mtime` (Schritt C): forwarded to `_calc_compute_map_footprint_raw`
+    purely as a cache-key freshness token (see its docstring). The Parquet
+    fast path above is untouched — that file's own staleness is
+    batch_precompute_analytics.py's responsibility, out of scope here.
     """
     if _toggles_all_true(t_warm, t_cold):
         parquet_path = _footprint_parquet_path(target_date_str, map_var, baseline_type)
@@ -289,6 +303,7 @@ def compute_map_footprint(_ref_data, _map_phys_data, target_date_str, t_warm, t_
     return _calc_compute_map_footprint_raw(
         _ref_data, _map_phys_data, target_date_str, t_warm, t_cold,
         baseline_type=baseline_type, map_var=map_var, anchor_date_str=anchor_date_str,
+        source_mtime=source_mtime,
     )
 
 
@@ -297,7 +312,7 @@ def compute_map_footprint(_ref_data, _map_phys_data, target_date_str, t_warm, t_
 def _calc_calculate_top10_raw(
     _ref_data, _map_phys_data, target_date, t_warm, t_cold, view_mode, persist_metric, top10_threshold,
     baseline_type="A", map_var="TG", anchor_date=None, _mask_version=TOP10_MASK_VERSION,
-    _get_persistence_arrays=None, _get_country_weight_grid=None,
+    _get_persistence_arrays=None, _get_country_weight_grid=None, source_mtime=0.0,
 ):
     """
     `_get_persistence_arrays` / `_get_country_weight_grid` are app.py-owned
@@ -307,6 +322,10 @@ def _calc_calculate_top10_raw(
     function would re-execute the whole script from scratch on every call
     and crash on already-instantiated widgets. Leading underscores keep
     these two out of the cache-key hash, same as `_ref_data`/`_map_phys_data`.
+
+    `source_mtime` (Schritt C): same freshness-token role as in
+    `_calc_compute_map_footprint_raw` — unused in the body, present only so
+    a new forecast file for the same date/toggles busts this cache too.
     """
     get_persistence_arrays = _get_persistence_arrays
     get_country_weight_grid = _get_country_weight_grid
@@ -388,7 +407,7 @@ def _calc_calculate_top10_raw(
 def calculate_top10(
     _ref_data, _map_phys_data, target_date, t_warm, t_cold, view_mode, persist_metric, top10_threshold,
     baseline_type="A", map_var="TG", anchor_date=None, _mask_version=TOP10_MASK_VERSION,
-    _get_persistence_arrays=None, _get_country_weight_grid=None,
+    _get_persistence_arrays=None, _get_country_weight_grid=None, source_mtime=0.0,
 ):
     """
     Lazy-loading front door for the Top-10 country impact tables.
@@ -402,6 +421,9 @@ def calculate_top10(
     partial toggle states, or a missing/corrupted cache file). Same
     signature and return shape as the original function, so every call
     site keeps working unmodified and the app never breaks on a cache miss.
+
+    `source_mtime` (Schritt C): forwarded to `_calc_calculate_top10_raw` as a
+    cache-key freshness token only; the Parquet fast path above is untouched.
     """
     if is_daily_map_view(view_mode) and _toggles_all_true(t_warm, t_cold):
         target_date_str = pd.Timestamp(target_date).strftime('%Y-%m-%d')
@@ -413,6 +435,7 @@ def calculate_top10(
                 pass  # corrupted/partial Parquet file -> fall through to raw computation
     return _calc_calculate_top10_raw(
         _ref_data, _map_phys_data, target_date, t_warm, t_cold, view_mode, persist_metric, top10_threshold,
+        source_mtime=source_mtime,
         baseline_type=baseline_type, map_var=map_var, anchor_date=anchor_date, _mask_version=_mask_version,
         _get_persistence_arrays=_get_persistence_arrays, _get_country_weight_grid=_get_country_weight_grid,
     )

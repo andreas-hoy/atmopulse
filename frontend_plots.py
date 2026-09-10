@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 from backend_map_locations import EUROPE_BBOX
 from backend_analytics import (
@@ -30,6 +31,7 @@ from backend_analytics import (
     _yyyymmdd_dot_date_arr,
 )
 from backend_maps import etccdi_doy_365
+from backend_io import point_clim_ladder
 from atmopulse_theme import (
     ATMOPULSE_BRAND,
     ATMOPULSE_COLD,
@@ -66,7 +68,22 @@ def _fmt_hover_diff(v) -> str:
 def _fmt_hover_year(v) -> str:
     return str(int(float(v))) if np.isfinite(v) and float(v) > 0 else "N/A"
 
+# Vectorized once at module scope (Schritt B): reused by the customdata
+# builders below instead of building a per-cell HTML string grid.
+_vfmt_num = np.vectorize(_fmt_hover_num, otypes=[object])
+_vfmt_diff = np.vectorize(_fmt_hover_diff, otypes=[object])
+_vfmt_year = np.vectorize(_fmt_hover_year, otypes=[object])
+
 def _build_standard_hovertext(labels, lat2d, lon2d, v_curr, v_rec_w, yr_w, diff_w, v_rec_c, yr_c, diff_c, var_label):
+    """DEAD CODE as of Schritt B (kept for reference / potential rollback).
+
+    This used to be handed to go.Heatmap as `hovertext=`, producing one full
+    HTML string per grid cell (~47k cells -> ~10 MB of duplicated markup:
+    "<b>", "Latitude:", city names, etc. repeated per cell). It is no longer
+    called anywhere; `_build_map_customdata` / `_build_persistence_customdata`
+    + a static `hovertemplate` replace it for both the Daily and Persistence
+    map heatmaps.
+    """
     fmt1 = np.vectorize(_fmt_hover_num)
     fmtd = np.vectorize(_fmt_hover_diff)
     fyr = np.vectorize(_fmt_hover_year)
@@ -78,6 +95,32 @@ def _build_standard_hovertext(labels, lat2d, lon2d, v_curr, v_rec_w, yr_w, diff_
         "All-Time Warm: " + fmt1(v_rec_w) + " °C (Year " + fyr(yr_w) + "; " + fmtd(diff_w) + " °C diff)<br>"
         "All-Time Cold: " + fmt1(v_rec_c) + " °C (Year " + fyr(yr_c) + "; " + fmtd(diff_c) + " °C diff)"
     )
+
+def _build_map_customdata(v_curr, v_rec_w, yr_w, diff_w, v_rec_c, yr_c, diff_c):
+    """customdata for the Daily map heatmap, shape (nlat, nlon, 7).
+
+    Channels: [0] v_curr, [1] v_rec_w, [2] yr_w, [3] diff_w, [4] v_rec_c,
+    [5] yr_c, [6] diff_c.
+
+    Values are pre-formatted short strings (object dtype), not raw
+    float32/int16, for one hard reason: NaN cannot round-trip through
+    Plotly's JSON payload as a *number* (`fig.to_json()` / the Streamlit
+    component transport both need valid JSON, and bare `NaN`/`null` then
+    format as "NaN"/"0.0" via `%{customdata[i]:.1f}`, not "N/A"). Formatting
+    once here with the existing `_fmt_hover_*` helpers (same rules as the old
+    hovertext path: 1 decimal, signed diff, integer year, "N/A" on non-finite)
+    keeps the hover content byte-identical while cutting per-cell payload
+    from a multi-line HTML block to 7 short tokens.
+    """
+    return np.stack([
+        _vfmt_num(v_curr), _vfmt_num(v_rec_w), _vfmt_year(yr_w), _vfmt_diff(diff_w),
+        _vfmt_num(v_rec_c), _vfmt_year(yr_c), _vfmt_diff(diff_c),
+    ], axis=-1)
+
+def _build_persistence_customdata(warm, cold):
+    """customdata for the Persistence map heatmap, shape (nlat, nlon, 2):
+    [0] warm days, [1] cold days (same 1-decimal "N/A"-safe formatting)."""
+    return np.stack([_vfmt_num(warm), _vfmt_num(cold)], axis=-1)
 
 def _map_xaxis_kwargs(**extra):
     # constrain="domain" on X (not Y): if the box is a pixel off the 70:42
@@ -213,7 +256,6 @@ def build_baseline_map(
     # Pure NumPy math without string loops (100x faster, minimal RAM footprint)
     diff_w = v_curr - v_rec_w
     diff_c = v_curr - v_rec_c
-    lon2d, lat2d = np.meshgrid(lons, lats)
     var_label = MAP_VAR_LABELS.get(map_var, map_var)
 
     if is_daily_map_view(view_mode):
@@ -226,15 +268,22 @@ def build_baseline_map(
         mask = _build_display_mask(v_curr, v_p95, v_p90, v_p75, v_p25, v_p10, v_p5, v_rec_w, v_rec_c, t_warm, t_cold)
 
         colorscale = map_extremes_colorscale()
-        
-        hovertext = _build_standard_hovertext(
-            loc_labels, lat2d, lon2d, v_curr, v_rec_w, yr_w, diff_w, v_rec_c, yr_c, diff_c, var_label,
+
+        daily_customdata = _build_map_customdata(v_curr, v_rec_w, yr_w, diff_w, v_rec_c, yr_c, diff_c)
+        daily_hovertemplate = (
+            "<b>%{text}</b><br>"
+            "Latitude: %{y:.2f}, Longitude: %{x:.2f}<br><br>"
+            + var_label + ": %{customdata[0]} °C<br>"
+            "All-Time Warm: %{customdata[1]} °C (Year %{customdata[2]}; %{customdata[3]} °C diff)<br>"
+            "All-Time Cold: %{customdata[4]} °C (Year %{customdata[5]}; %{customdata[6]} °C diff)"
+            "<extra></extra>"
         )
 
         fig.add_trace(go.Heatmap(
-            x=lons, y=lats, z=mask, hovertext=hovertext, colorscale=colorscale, showscale=False,
-            opacity=0.85, zmin=1, zmax=8, zsmooth='best',
-            hovertemplate="%{hovertext}<extra></extra>",
+            x=lons, y=lats, z=mask, text=loc_labels, customdata=daily_customdata,
+            colorscale=colorscale, showscale=False,
+            opacity=0.85, zmin=1, zmax=8, zsmooth=False,
+            hovertemplate=daily_hovertemplate,
         ))
         
         if toggles.get("hatching", False) and not is_aifs_model():
@@ -292,18 +341,20 @@ def build_baseline_map(
                 tickvals=[-max_days, -max_days // 2, 0, max_days // 2, max_days],
                 ticktext=[str(max_days), str(max_days // 2), "0", str(max_days // 2), str(max_days)],
             )
+            persist_customdata = _build_persistence_customdata(warm, cold)
+            persist_hovertemplate = (
+                "<b>%{text}</b><br>"
+                "Latitude: %{y:.2f}, Longitude: %{x:.2f}<br><br>"
+                "Persistence: Warm: %{customdata[0]} days<br>"
+                "Persistence: Cold: %{customdata[1]} days"
+                "<extra></extra>"
+            )
             fig.add_trace(go.Heatmap(
-                x=lons, y=lats, z=z,
-                hovertext=(
-                    "<b>" + loc_labels.astype(str) + "</b><br>"
-                    "Latitude: " + np.vectorize(_fmt_hover_num)(lat2d) + ", Longitude: " + np.vectorize(_fmt_hover_num)(lon2d) + "<br><br>"
-                    "Persistence: Warm: " + np.vectorize(_fmt_hover_num)(warm) + " days<br>"
-                    "Persistence: Cold: " + np.vectorize(_fmt_hover_num)(cold) + " days"
-                ),
+                x=lons, y=lats, z=z, text=loc_labels, customdata=persist_customdata,
                 zmin=-max_days, zmax=max_days,
-                colorscale=diverging_persistence_colorscale(), showscale=True, opacity=0.9, zsmooth='best',
+                colorscale=diverging_persistence_colorscale(), showscale=True, opacity=0.9, zsmooth=False,
                 colorbar=persist_colorbar,
-                hovertemplate="%{hovertext}<extra></extra>",
+                hovertemplate=persist_hovertemplate,
             ))
             
     if border_trace is not None: 
@@ -329,33 +380,104 @@ def build_baseline_map(
     )
     return fig
 
-def build_opacity_slider_map(fig_a, fig_b, label_a="Historical Baseline (1961–1990)", label_b="Recent Baseline (1996–2025)", n_steps=21):
-    """Cross-fade two baseline map figures (e.g. 1961-1990 vs 1996-2025) into
-    a single Plotly figure driven by a layout slider.
+@st.cache_data(show_spinner=False, max_entries=32)
+def get_cached_baseline_map(
+    date_str, baseline_type, map_var, view_mode, persist_metric, top10_threshold,
+    t_warm_items, t_cold_items, active_toggles, source_mtime, forecast_model,
+    full_width=False, anchor_date_str=None, *, _ref_data, _map_phys_data,
+):
+    """Schritt C: @st.cache_data front door for build_baseline_map.
 
-    The slider uses method="restyle": Plotly.js applies the opacity change
-    entirely client-side in the browser, so scrubbing it does NOT trigger a
-    Streamlit rerun. Zoom, pan, and hover/tooltip state are untouched, and
-    every trace (including colorbars) keeps its own opacity/visibility so
-    nothing from either source figure is lost.
+    build_baseline_map itself is intentionally NOT decorated 1:1 — two of its
+    args (`ref_data`: an xarray Dataset, `map_phys_data`: a dict of full-grid
+    ndarrays) aren't cheap/reliable Streamlit cache keys, and the other two
+    (`border_trace`: a go.Scatter, `get_map_location_labels`/
+    `get_persistence_arrays`: callables) are flatly forbidden as cache keys
+    (no functions, no Plotly traces in a cache key). This wrapper reduces the
+    call to ONLY hashable primitives — `date_str`/`anchor_date_str` as ISO
+    strings (not Timestamps), `t_warm`/`t_cold` as `tuple(sorted(d.items()))`,
+    the mslp/z500/hatching toggle dict as a `frozenset` of the active names,
+    `source_mtime` (see `backend_io.synoptic_source_mtime`) so a fresh
+    forecast download busts this cache even for the same date/toggles, and
+    `forecast_model` purely so the key differs per model even though
+    build_baseline_map itself reads the active model from `config`'s global
+    session state, not from an argument.
+
+    `_ref_data`/`_map_phys_data` are keyword-only with a leading underscore
+    (Streamlit's convention for cache-key-EXCLUDED args) — identical role to
+    every other `_ref_data`/`_map_phys_data` pair already used throughout
+    this codebase (`compute_map_footprint`, `calculate_top10`).
+
+    The three callables (`border_trace` source + the two location/persistence
+    loaders) are resolved with a LOCAL import of `page_map_tracker` inside
+    this function body, never at module scope: `page_map_tracker.py` imports
+    `build_baseline_map`/this wrapper from `frontend_plots.py`, so a
+    module-level import here would be circular. They are page_map_tracker's
+    own `@st.cache_resource`/`@st.cache_data`-decorated singletons — calling
+    them again here is a cheap cache hit, not a rebuild, and (per the
+    existing house rule) this is deliberately NOT `from app import ...`:
+    Streamlit runs app.py as the entrypoint script, not as an importable
+    module, so that would re-execute the whole script from scratch.
+    """
+    from page_map_tracker import get_europe_borders_trace, get_map_location_labels, get_persistence_arrays
+
+    target_date = pd.Timestamp(date_str)
+    anchor_date = pd.Timestamp(anchor_date_str) if anchor_date_str else None
+    t_warm = dict(t_warm_items)
+    t_cold = dict(t_cold_items)
+    toggles = {name: (name in active_toggles) for name in ("mslp", "z500", "hatching")}
+
+    return build_baseline_map(
+        _ref_data, _map_phys_data, target_date, t_warm, t_cold, toggles, view_mode,
+        persist_metric, top10_threshold, baseline_type, map_var,
+        anchor_date=anchor_date, full_width=full_width,
+        border_trace=get_europe_borders_trace(),
+        get_map_location_labels=get_map_location_labels,
+        get_persistence_arrays=get_persistence_arrays,
+    )
+
+
+def _clone_map_trace(trace):
+    data = trace.to_plotly_json()
+    constructors = {"heatmap": go.Heatmap, "contour": go.Contour, "scatter": go.Scatter}
+    return constructors.get(data.get("type", "scatter"), go.Scatter)(data)
+
+
+def _plotly_compare_slider(*, active: int, prefix: str, steps: list) -> dict:
+    return dict(
+        active=active,
+        x=0.08, y=0.02, len=0.84,
+        pad=dict(t=6, b=6),
+        currentvalue=dict(
+            prefix=prefix,
+            visible=True,
+            xanchor="center",
+            font=dict(size=12),
+        ),
+        steps=steps,
+    )
+
+
+def build_opacity_slider_map(
+    fig_a, fig_b,
+    label_a="1961–1990",
+    label_b="1996–2025",
+    n_steps=21,
+):
+    """Cross-fade two already-built maps with a Plotly layout slider.
+
+    `method="restyle"` runs entirely in the browser, so dragging the handle
+    does not trigger a Streamlit rerun or rebuild the NetCDF layers.
     """
     if not fig_a.data and not fig_b.data:
         return go.Figure()
 
     fig = go.Figure(layout=(fig_a.layout if fig_a.data else fig_b.layout))
-
-    traces_a = list(fig_a.data)
-    traces_b = list(fig_b.data)
-    base_op_a = [1.0 if t.opacity is None else t.opacity for t in traces_a]
-    base_op_b = [1.0 if t.opacity is None else t.opacity for t in traces_b]
-
-    # Avoid stacking two identical colorbars for the same value range on top
-    # of one another; the "A" layer's colorbar stays fully visible/functional
-    # and continues to describe both layers since they share one colorscale.
+    traces_a = [_clone_map_trace(t) for t in fig_a.data]
+    traces_b = [_clone_map_trace(t) for t in fig_b.data]
     for t in traces_b:
         if getattr(t, "showscale", None):
             t.showscale = False
-
     for t in traces_a:
         fig.add_trace(t)
     for t in traces_b:
@@ -363,6 +485,8 @@ def build_opacity_slider_map(fig_a, fig_b, label_a="Historical Baseline (1961–
 
     n_a = len(traces_a)
     idx_a, idx_b = list(range(0, n_a)), list(range(n_a, n_a + len(traces_b)))
+    base_op_a = [1.0 if t.opacity is None else float(t.opacity) for t in traces_a]
+    base_op_b = [1.0 if t.opacity is None else float(t.opacity) for t in traces_b]
 
     steps = []
     for i in range(n_steps):
@@ -372,41 +496,393 @@ def build_opacity_slider_map(fig_a, fig_b, label_a="Historical Baseline (1961–
         steps.append(dict(
             method="restyle",
             args=[{"opacity": opac_a + opac_b}, idx_a + idx_b],
-            label=f"{int(round(frac * 100))}%",
+            label=f"{int(round(frac * 100))}% {label_b}",
         ))
 
-    fig.update_layout(
-        sliders=[dict(
-            active=0,
-            x=0.08, y=0.02, len=0.84,
-            pad=dict(t=6, b=6),
-            currentvalue=dict(
-                prefix=f"{label_a} \u2192 {label_b}: ",
-                suffix="%",
-                visible=True,
-                xanchor="center",
-                font=dict(size=12),
-            ),
-            steps=steps,
-        )],
-    )
-    # Initial render must match slider step 0 (100% historical, 0% recent).
+    fig.update_layout(sliders=[_plotly_compare_slider(
+        active=0,
+        prefix=f"{label_a} → {label_b}: ",
+        steps=steps,
+    )])
     for t, op in zip(fig.data[:n_a], base_op_a):
         t.opacity = op
-    for t, op in zip(fig.data[n_a:], base_op_b):
+    for t in fig.data[n_a:]:
         t.opacity = 0.0
     return fig
 
+
+def render_swipe_compare_map(fig_a, fig_b) -> None:
+    """One map, two Plotly.js instances drawn inside a single self-owned
+    iframe, with the top layer clipped by a CSS custom property.
+
+    This does NOT rely on Streamlit's outer DOM/class structure at all
+    (nesting `st.container(key=...)` blocks proved unreliable for absolute
+    overlay positioning across Streamlit versions). Both figures, the
+    slider, and the drag handler live in one `components.html` document
+    that we fully control, so the swipe updates a CSS variable only —
+    no Streamlit rerun, no Plotly redraw, zero added latency.
+    """
+    fig_bottom = go.Figure(fig_a)
+    fig_top = go.Figure(fig_b)
+    fig_top.update_layout(annotations=[])
+    for t in fig_top.data:
+        if getattr(t, "showscale", None):
+            t.showscale = False
+    for fig in (fig_bottom, fig_top):
+        for t in fig.data:
+            # Since Schritt B, build_baseline_map already sets zsmooth=False
+            # on every map heatmap it creates, so this is now a no-op belt-
+            # and-suspenders line. Kept explicit: zsmooth='best' would
+            # interpolate each cell against its OWN neighbours, and two
+            # independently smoothed grids, hard-clipped together at the
+            # swipe line, blend differently right at that seam — visible as
+            # a jagged strip of "wrong" pixels that belong to neither
+            # dataset. Flat per-cell colour on both sides makes the seam
+            # land exactly on a real data boundary instead of an
+            # interpolation artifact.
+            if getattr(t, "type", None) == "heatmap":
+                t.zsmooth = False
+
+    common_layout = dict(
+        **plotly_typography(),
+        uirevision="map_sync_state",
+        autosize=True,
+        title=None,
+        margin=dict(t=0, l=0, r=0, b=0),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        # Box-zoom drag would otherwise fight the swipe-divider drag on the
+        # very same pointer gesture (Plotly reads the mousedown too and
+        # draws a zoom rectangle), silently re-ranging the axes away from
+        # EUROPE_BBOX. Modebar zoom buttons (fixed-step) still work.
+        dragmode=False,
+    )
+    fig_bottom.update_layout(**common_layout)
+    fig_top.update_layout(**common_layout)
+    # Belt-and-suspenders: explicit ranges must win regardless of dragmode.
+    # Critically, `constrain="domain"` is forced on BOTH axes here (the
+    # shared `_map_yaxis_kwargs()` only sets it on X; Y falls back to
+    # Plotly's default `constrain="range"` for a scaleanchor'd axis). In
+    # every other map the CSS box is pixel-perfect to the 70:42 ratio, so
+    # that default never bites. Here the box size comes from a JS-measured
+    # iframe width and is only ever approximately 70:42 — with the old
+    # X-only constrain, any sub-pixel mismatch made Plotly silently CROP
+    # the latitude range (chopping off southern Europe) to preserve the
+    # 1:1 scaleanchor ratio. Constraining both axes' domains instead means
+    # any leftover mismatch just adds a thin blank margin — the data range
+    # itself (and therefore the zoom level) can never be cropped.
+    fig_bottom.update_xaxes(range=list(MAP_VIEW_LON), autorange=False, constrain="domain")
+    fig_bottom.update_yaxes(range=list(MAP_VIEW_LAT), autorange=False, constrain="domain")
+    fig_top.update_xaxes(range=list(MAP_VIEW_LON), autorange=False, constrain="domain")
+    fig_top.update_yaxes(range=list(MAP_VIEW_LAT), autorange=False, constrain="domain")
+
+    st.markdown(
+        "<p class='atmopulse-map-title'>Swipe Compare: Historical (left) | Recent (right)</p>",
+        unsafe_allow_html=True,
+    )
+
+    primary = ATMOPULSE_BRAND["primary"]
+    json_a = fig_bottom.to_json()
+    json_b = fig_top.to_json()
+
+    lon_span, lat_span = (MAP_VIEW_LON[1] - MAP_VIEW_LON[0]), (MAP_VIEW_LAT[1] - MAP_VIEW_LAT[0])
+    aspect = lat_span / lon_span  # height / width, e.g. 42/70
+
+    html = f"""
+<div id="swipe-stack">
+  <div id="swipe-a"></div>
+  <div id="swipe-b"></div>
+  <div id="swipe-line"></div>
+  <div id="swipe-tooltip"></div>
+</div>
+<div class="atmopulse-swipe-ctrl">
+  <span>1961&ndash;1990</span>
+  <input id="atmopulse-swipe-range" type="range" min="0" max="100" value="50" step="0.1">
+  <span>1996&ndash;2025</span>
+</div>
+<style>
+  html, body {{ margin: 0; overflow: hidden; background: transparent; }}
+  #swipe-stack {{
+    position: relative;
+    width: 100%;
+    overflow: hidden;
+    --swipe: 50%;
+  }}
+  #swipe-a, #swipe-b {{ position: absolute; inset: 0; width: 100%; height: 100%; }}
+  #swipe-b {{ z-index: 2; clip-path: inset(0 0 0 var(--swipe)); }}
+  /* The native Plotly hover box lives inside the SAME clipped div as the
+     map, so any tooltip triggered close to the swipe line gets sliced
+     off by clip-path along with the hidden half of the data. It's hidden
+     here and replaced by #swipe-tooltip below, a sibling that is never
+     clipped and is JS-clamped to stay fully inside the visible box. */
+  #swipe-a .hoverlayer, #swipe-b .hoverlayer {{ display: none !important; }}
+  #swipe-line {{
+    position: absolute; top: 0; bottom: 0; left: var(--swipe);
+    width: 2px; background: {primary}; z-index: 3; pointer-events: none;
+  }}
+  #swipe-tooltip {{
+    position: absolute; z-index: 4; pointer-events: none; display: none;
+    max-width: 260px; padding: 6px 9px; border-radius: 6px;
+    background: rgba(20, 24, 30, 0.92); color: #fff;
+    font-family: {ATMOPULSE_FONTS["sora_css"]}; font-size: 12px; line-height: 1.35;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+  }}
+  .atmopulse-swipe-ctrl {{
+    display: flex; align-items: center; gap: 10px;
+    font-family: {ATMOPULSE_FONTS["outfit_css"]};
+    font-size: 13px; color: #000; padding: 6px 2px 0 2px;
+  }}
+  .atmopulse-swipe-ctrl span {{ white-space: nowrap; }}
+  .atmopulse-swipe-ctrl input[type=range] {{ flex: 1; accent-color: {primary}; }}
+</style>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<script>
+(function() {{
+  // The EUROPE_BBOX aspect ratio (height/width), computed in Python from
+  // MAP_VIEW_LON/MAP_VIEW_LAT so it always matches the other maps exactly.
+  var ASPECT = {aspect!r};
+  var SLIDER_H = 46;
+
+  var figA = {json_a};
+  var figB = {json_b};
+  var cfgA = {{displayModeBar: true, displaylogo: false, responsive: true,
+               modeBarButtonsToRemove: ["autoScale2d", "select2d", "lasso2d"], scrollZoom: false}};
+  var cfgB = {{displayModeBar: false, responsive: true, scrollZoom: false}};
+
+  var stack = document.getElementById("swipe-stack");
+  var slider = document.getElementById("atmopulse-swipe-range");
+  var plotted = false;
+
+  function apply(pct) {{
+    var v = Math.max(0, Math.min(100, Number(pct)));
+    stack.style.setProperty("--swipe", v + "%");
+    if (String(slider.value) !== String(v)) slider.value = v;
+  }}
+
+  // Height is derived from WIDTH (known immediately, independent of the
+  // iframe's own height) instead of measuring the box's rendered height
+  // and feeding that back — that read-back loop is what kept producing a
+  // wrong/cropped zoom, because it raced against Streamlit's own iframe
+  // sizing. Width -> explicit pixel height is a one-way, race-free
+  // calculation that always reproduces the exact EUROPE_BBOX ratio.
+  function layout() {{
+    var w = document.documentElement.clientWidth || document.body.clientWidth || stack.clientWidth;
+    if (!w) return;
+    var mapH = Math.round(w * ASPECT);
+    stack.style.height = mapH + "px";
+    window.parent.postMessage({{type: "streamlit:setFrameHeight", height: mapH + SLIDER_H}}, "*");
+    if (plotted) {{
+      // Plotly.relayout({{width, height}}) does NOT reliably recompute
+      // scaleanchor/constrain="domain" margins on an existing graph — it
+      // can leave the two independently-resized instances (A and B) with
+      // subtly different domain math, which is exactly what showed up as
+      // a mismatched/distorted map and a jagged seam where they meet.
+      // Plotly.Plots.resize() re-measures the (already CSS-sized) div and
+      // redoes the full autosize/constrain pass, so both instances always
+      // resolve to the identical EUROPE_BBOX geometry.
+      Plotly.Plots.resize("swipe-a");
+      Plotly.Plots.resize("swipe-b");
+    }}
+  }}
+
+  layout();
+  Promise.all([
+    Plotly.newPlot("swipe-a", figA.data, figA.layout, cfgA),
+    Plotly.newPlot("swipe-b", figB.data, figB.layout, cfgB),
+  ]).then(function(gds) {{
+    plotted = true;
+    layout();
+    setupTooltip(gds[0]);
+    setupTooltip(gds[1]);
+  }});
+
+  // Custom hover readout: Plotly still fires "plotly_hover" even though
+  // its own hover box is hidden via CSS above, so we render the same
+  // hovertext ourselves into #swipe-tooltip — a sibling of swipe-a/b that
+  // clip-path never touches — and clamp it inside the stack so it can
+  // never poke out past the visible edge either.
+  var tooltip = document.getElementById("swipe-tooltip");
+
+  // Schritt B: the heatmaps no longer carry a pre-rendered HTML string in
+  // `hovertext` (that was the ~10 MB-per-map hover grid). Hover content now
+  // comes from each trace's own `hovertemplate` + `text`/`x`/`y`/`customdata`,
+  // so the swipe overlay's custom tooltip (native Plotly hover box is CSS-
+  // hidden here, see #swipe-a/#swipe-b .hoverlayer above) has to render that
+  // template itself instead of just reading `pt.hovertext`. Only the small
+  // set of placeholders actually used by this codebase's map hovertemplates
+  // is supported (%{{text}}, %{{x:.2f}}, %{{y:.2f}}, %{{customdata[i]}},
+  // <extra></extra>) — sufficient since customdata values here are already
+  // pre-formatted short strings (no further numeric formatting needed).
+  function renderHoverTemplate(pt) {{
+    var tmpl = pt.data && pt.data.hovertemplate;
+    if (!tmpl) return pt.hovertext != null ? pt.hovertext : pt.text;
+    var out = tmpl.split("<extra></extra>").join("").split("<extra>%{{fullData.name}}</extra>").join("");
+    out = out.split("%{{x:.2f}}").join(Number(pt.x).toFixed(2));
+    out = out.split("%{{y:.2f}}").join(Number(pt.y).toFixed(2));
+    out = out.split("%{{text}}").join(pt.text != null ? pt.text : "");
+    if (Array.isArray(pt.customdata)) {{
+      for (var i = 0; i < pt.customdata.length; i++) {{
+        out = out.split("%{{customdata[" + i + "]}}").join(pt.customdata[i]);
+      }}
+    }}
+    return out;
+  }}
+
+  function showTooltip(gd, ev) {{
+    var pt = ev.points && ev.points[0];
+    if (!pt) return;
+    var text = renderHoverTemplate(pt);
+    if (text == null) return;
+    tooltip.innerHTML = String(text);
+    tooltip.style.display = "block";
+    var stackRect = stack.getBoundingClientRect();
+    var mouseX = (ev.event ? ev.event.clientX : stackRect.left) - stackRect.left;
+    var mouseY = (ev.event ? ev.event.clientY : stackRect.top) - stackRect.top;
+    var tw = tooltip.offsetWidth, th = tooltip.offsetHeight;
+    var x = mouseX + 14, y = mouseY + 14;
+    if (x + tw > stackRect.width) x = mouseX - tw - 14;
+    if (y + th > stackRect.height) y = mouseY - th - 14;
+    x = Math.max(2, Math.min(x, stackRect.width - tw - 2));
+    y = Math.max(2, Math.min(y, stackRect.height - th - 2));
+    tooltip.style.left = x + "px";
+    tooltip.style.top = y + "px";
+  }}
+  function setupTooltip(gd) {{
+    if (!gd) return;
+    gd.on("plotly_hover", function(ev) {{ showTooltip(gd, ev); }});
+    gd.on("plotly_unhover", function() {{ tooltip.style.display = "none"; }});
+  }}
+
+  slider.addEventListener("input", function() {{ apply(slider.value); }});
+
+  var dragging = false;
+  function pctFromEvent(ev) {{
+    var r = stack.getBoundingClientRect();
+    return ((ev.clientX - r.left) / r.width) * 100;
+  }}
+  stack.addEventListener("pointerdown", function(ev) {{
+    if (ev.target.closest(".modebar")) return;
+    dragging = true;
+    stack.setPointerCapture(ev.pointerId);
+    apply(pctFromEvent(ev));
+  }});
+  stack.addEventListener("pointermove", function(ev) {{ if (dragging) apply(pctFromEvent(ev)); }});
+  stack.addEventListener("pointerup", function() {{ dragging = false; }});
+  stack.addEventListener("pointercancel", function() {{ dragging = false; }});
+
+  window.addEventListener("resize", layout);
+  if (window.ResizeObserver) {{
+    new ResizeObserver(layout).observe(document.body);
+  }}
+  [50, 150, 300, 600, 1000].forEach(function(t) {{ setTimeout(layout, t); }});
+}})();
+</script>
+"""
+    components.html(html, height=int(700 * aspect) + 46, scrolling=False)
+    st.caption("Drag the map or the slider: left is 1961–1990, right is 1996–2025.")
+
 # --- METEOGRAM CORE TRACES (For Subplots) ---
-def get_meteogram_traces(df_live, ref_clim, lat, lon, target_date, epoch, show_air, show_app, meteo_env, meteo_var="TG", current_condition=None):
+def _densify_at_level_crossings(x, y, *levels):
+    """Insert vertices where ``y`` crosses any climatology level.
+
+    Daily samples are piecewise-linear. Capped fill series (min(t, P90), …)
+    interpolate those caps between days, so the colour polygons drift off
+    the black temperature line on steep peaks. Extra crossing vertices keep
+    every linear segment inside one severity tier, so the stacked fills
+    clip exactly to the line.
+    """
+    x = pd.to_datetime(np.asarray(x)).to_numpy(dtype="datetime64[ns]")
+    y = np.asarray(y, dtype=np.float64)
+    lev = [np.asarray(L, dtype=np.float64) for L in levels]
+    n = y.size
+    if n < 2:
+        return (x, y, *lev)
+
+    x_ns = x.astype(np.int64)
+    xs = [x_ns[0]]
+    ys = [y[0]]
+    ls = [[L[0] for L in lev]]
+
+    for i in range(n - 1):
+        y0, y1 = y[i], y[i + 1]
+        x0, x1 = x_ns[i], x_ns[i + 1]
+        if not (np.isfinite(y0) and np.isfinite(y1)):
+            xs.append(x1)
+            ys.append(y1)
+            ls.append([L[i + 1] for L in lev])
+            continue
+        fracs = []
+        for L in lev:
+            L0, L1 = L[i], L[i + 1]
+            if not (np.isfinite(L0) and np.isfinite(L1)):
+                continue
+            denom = (y1 - y0) - (L1 - L0)
+            if abs(denom) < 1e-12:
+                continue
+            # Sign change of (y - L) on this segment.
+            if (y0 - L0) * (y1 - L1) < 0:
+                f = (L0 - y0) / denom
+                if 0.0 < f < 1.0:
+                    fracs.append(f)
+        for f in sorted(set(np.round(fracs, 10))):
+            xs.append(int(x0 + f * (x1 - x0)))
+            y_ins = y0 + f * (y1 - y0)
+            L_ins = [L[i] + f * (L[i + 1] - L[i]) for L in lev]
+            for Lv in L_ins:
+                if np.isfinite(Lv) and abs(y_ins - Lv) < 1e-9:
+                    y_ins = Lv
+                    break
+            ys.append(y_ins)
+            ls.append(L_ins)
+        xs.append(x1)
+        ys.append(y1)
+        ls.append([L[i + 1] for L in lev])
+
+    x_out = np.array(xs, dtype="datetime64[ns]")
+    y_out = np.asarray(ys, dtype=np.float64)
+    lev_out = [np.asarray(col, dtype=np.float64) for col in zip(*ls)]
+    return (x_out, y_out, *lev_out)
+
+
+def _meteogram_class_labels(t, c_base, p75, p90, p95, rec_w, p25, p10, p5, rec_c):
+    """Per-day hover class matching the meteogram colour ladder."""
+    t = np.asarray(t, dtype=np.float64)
+    conds = [
+        t >= rec_w,
+        t >= p95,
+        t >= p90,
+        t > p75,
+        t > c_base,
+        t <= rec_c,
+        t <= p5,
+        t <= p10,
+        t < p25,
+        t < c_base,
+    ]
+    choices = [
+        "warm record",
+        "warm extreme",
+        "warm strong",
+        "warm moderate",
+        "Above average",
+        "cold record",
+        "cold extreme",
+        "cold strong",
+        "cold moderate",
+        "Below average",
+    ]
+    return np.select(conds, choices, default="normal")
+
+
+def get_meteogram_traces(df_live, ref_clim, lat, lon, target_date, epoch, meteo_env, meteo_var="TG", current_condition=None):
     """
     `current_condition`: optional ("tier", "direction") from classify_point_severity
     for THIS epoch's active-day classification; currently unused by the chart
-    (kept for call-site compatibility / future use) now that "Normal" is
-    represented by the "Typical Range" fill (P25-P75) rather than a marker.
+    (kept for call-site compatibility / future use). The median-to-P75 / P25
+    band is the first warm/cold colour (above/below average), not a separate
+    "Typical Range" fill.
     """
     traces = []
-    sh = True if epoch == "A" else False  # Draw each legend entry only once (epoch A pass)
     pt_clim = ref_clim.sel(latitude=lat, longitude=lon, method='nearest')
     df_live['Date'] = pd.to_datetime(df_live['Date']).dt.tz_localize(None)
     tgt_dt_norm = pd.to_datetime(target_date).tz_localize(None)
@@ -416,21 +892,28 @@ def get_meteogram_traces(df_live, ref_clim, lat, lon, target_date, epoch, show_a
     doys = etccdi_doy_365(df_live['Date']) - 1
     
     dates = df_live['Date']
-    
-    if meteo_var == "Mean Temp (TG)":
-        c_base = (pt_clim[f'tx_p75_doy_{epoch}'].values[doys] + pt_clim[f'tn_p25_doy_{epoch}'].values[doys]) / 2.0
-    elif meteo_var == "Max Temp (TX)":
-        c_base = (pt_clim[f'tx_p75_doy_{epoch}'].values[doys] + pt_clim[f'tx_p25_doy_{epoch}'].values[doys]) / 2.0
-    else:
-        c_base = (pt_clim[f'tn_p75_doy_{epoch}'].values[doys] + pt_clim[f'tn_p25_doy_{epoch}'].values[doys]) / 2.0
+
+    col_target = 'TG' if meteo_var == "Mean Temp (TG)" else ('TX' if meteo_var == "Max Temp (TX)" else 'TN')
+    t_hist = df_live.loc[dates <= tgt_dt_norm, col_target].values if col_target in df_live.columns else ((df_live.loc[dates <= tgt_dt_norm, 'TX'].values + df_live.loc[dates <= tgt_dt_norm, 'TN'].values) / 2.0)
+    d_hist = dates[dates <= tgt_dt_norm]
+    t_full = df_live[col_target].values if col_target in df_live.columns else ((df_live['TX'].values + df_live['TN'].values) / 2.0)
+
+    c_base, p75_daily, p90_daily, p95_daily, rec_w_daily, p25_daily, p10_daily, p5_daily, rec_c_daily = (
+        point_clim_ladder(pt_clim, doys, meteo_var, epoch)
+    )
         
-    env_map = {"Moderate": ("p75", "p25"), "Strong": ("p90", "p10"), "Extreme": ("p95", "p5"), "All-Time": ("max_val", "min_val")}
-    el_up, el_dn = env_map.get(meteo_env, ("p90", "p10"))
-    p_up_key = f'tx_{el_up}_doy_{epoch}' if el_up != "max_val" else 'tx_max_val'
-    p_dn_key = f'tn_{el_dn}_doy_{epoch}' if el_dn != "min_val" else 'tn_min_val'
-    
-    env_upper = pt_clim[p_up_key].values[doys] if p_up_key in pt_clim.variables else np.full(len(doys), np.nan)
-    env_lower = pt_clim[p_dn_key].values[doys] if p_dn_key in pt_clim.variables else np.full(len(doys), np.nan)
+    env_upper = {
+        "Moderate": p75_daily,
+        "Strong": p90_daily,
+        "Extreme": p95_daily,
+        "All-Time": rec_w_daily,
+    }.get(meteo_env, p90_daily)
+    env_lower = {
+        "Moderate": p25_daily,
+        "Strong": p10_daily,
+        "Extreme": p5_daily,
+        "All-Time": rec_c_daily,
+    }.get(meteo_env, p10_daily)
     
     # TASK 4: upper boundary trace stays showlegend=False (it is only the
     # invisible fill anchor) so "Reference Value Envelope" appears exactly
@@ -438,144 +921,107 @@ def get_meteogram_traces(df_live, ref_clim, lat, lon, target_date, epoch, show_a
     traces.append(go.Scatter(x=dates, y=env_upper, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
     traces.append(go.Scatter(x=dates, y=env_lower, mode='lines', fill='tonexty', fillcolor='rgba(220,220,220,0.5)', line=dict(width=0), name='Reference Value Envelope', legendgroup='env', showlegend=False, hoverinfo='skip'))
 
-    col_target = 'TG' if meteo_var == "Mean Temp (TG)" else ('TX' if meteo_var == "Max Temp (TX)" else 'TN')
-    t_hist = df_live.loc[dates <= tgt_dt_norm, col_target].values if col_target in df_live.columns else ((df_live.loc[dates <= tgt_dt_norm, 'TX'].values + df_live.loc[dates <= tgt_dt_norm, 'TN'].values) / 2.0)
+    fill_x, t_fill, c_base_f, p75_full, p90_full, p95_full, rec_w_full, p25_full, p10_full, p5_full, rec_c_full = (
+        _densify_at_level_crossings(
+            dates, t_full,
+            c_base, p75_daily, p90_daily, p95_daily, rec_w_daily,
+            p25_daily, p10_daily, p5_daily, rec_c_daily,
+        )
+    )
 
-    d_hist = dates[dates <= tgt_dt_norm]
+    # Warm: above average (median→P75) + Moderate/Strong/Extreme/Record
+    y_above = np.where(t_fill > c_base_f, np.minimum(t_fill, p75_full), c_base_f)
+    y_w1 = np.where(t_fill > p75_full, np.minimum(t_fill, p90_full), p75_full)
+    y_w2 = np.where(t_fill > p90_full, np.minimum(t_fill, p95_full), y_w1)
+    y_w3 = np.where(t_fill > p95_full, np.minimum(t_fill, rec_w_full), y_w2)
+    y_w4 = np.where(t_fill > rec_w_full, t_fill, y_w3)
 
-    # TASK 2: colored anomaly bands (y_w1..y_w4 / y_c1..y_c4) now span the FULL
-    # `dates` axis (history + forecast) instead of stopping at d_hist/t_hist —
-    # otherwise the forecast tail rendered with no shading at all, visually
-    # implying "normal" even for an extreme forecasted temperature.
-    t_full = df_live[col_target].values if col_target in df_live.columns else ((df_live['TX'].values + df_live['TN'].values) / 2.0)
+    # Cold: below average (median→P25) + Moderate/Strong/Extreme/Record
+    y_below = np.where(t_fill < c_base_f, np.maximum(t_fill, p25_full), c_base_f)
+    y_c1 = np.where(t_fill < p25_full, np.maximum(t_fill, p10_full), p25_full)
+    y_c2 = np.where(t_fill < p10_full, np.maximum(t_fill, p5_full), y_c1)
+    y_c3 = np.where(t_fill < p5_full, np.maximum(t_fill, rec_c_full), y_c2)
+    y_c4 = np.where(t_fill < rec_c_full, t_fill, y_c3)
 
-    # Record thresholds resolved here (not just inside `if show_air:`) so the
-    # "Record" fill tier below has a genuine all-time boundary instead of
-    # being an uncapped catch-all merged with "Extreme".
-    if meteo_var == "Max Temp (TX)":
-        _rec_w_key, _rec_c_key = "tx_max_val", "tx_min_val"
-    elif meteo_var == "Min Temp (TN)":
-        _rec_w_key, _rec_c_key = "tn_max_val", "tn_min_val"
-    else:
-        _rec_w_key = "tg_max_val" if "tg_max_val" in pt_clim.variables else "tx_max_val"
-        _rec_c_key = "tg_min_val" if "tg_min_val" in pt_clim.variables else "tn_min_val"
-    rec_w_full = pt_clim[_rec_w_key].values[doys] if _rec_w_key in pt_clim.variables else np.full(len(doys), np.inf)
-    rec_c_full = pt_clim[_rec_c_key].values[doys] if _rec_c_key in pt_clim.variables else np.full(len(doys), -np.inf)
+    _fill_line = dict(width=0, shape="linear")
+    # Five warm + five cold fills; HTML badge legend in page_meteogram.py.
+    traces.append(go.Scatter(x=fill_x, y=c_base_f, mode='lines', line=_fill_line, showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=fill_x, y=y_above, mode='lines', fill='tonexty', fillcolor=warm_rgba('above'), line=_fill_line, name='Warm Above average', legendgroup='wa', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=fill_x, y=p75_full, mode='lines', line=_fill_line, showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=fill_x, y=y_w1, mode='lines', fill='tonexty', fillcolor=warm_rgba('moderate'), line=_fill_line, name='Warm Moderate', legendgroup='wm', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=fill_x, y=y_w2, mode='lines', fill='tonexty', fillcolor=warm_rgba('strong'), line=_fill_line, name='Warm Strong', legendgroup='ws', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=fill_x, y=y_w3, mode='lines', fill='tonexty', fillcolor=warm_rgba('extreme'), line=_fill_line, name='Warm Extreme', legendgroup='we', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=fill_x, y=y_w4, mode='lines', fill='tonexty', fillcolor=warm_rgba('record'), line=_fill_line, name='Warm Record', legendgroup='wr', showlegend=False, hoverinfo='skip'))
 
-    # Warm Anomalies
-    p75_full = pt_clim[f'tx_p75_doy_{epoch}'].values[doys] if f'tx_p75_doy_{epoch}' in pt_clim else c_base
-    p90_full = pt_clim[f'tx_p90_doy_{epoch}'].values[doys] if f'tx_p90_doy_{epoch}' in pt_clim else c_base
-    p95_full = pt_clim[f'tx_p95_doy_{epoch}'].values[doys] if f'tx_p95_doy_{epoch}' in pt_clim else c_base
-    # TASK 3: the median-to-P75 zone is climatologically "Normal" (see
-    # classify_point_severity), not "Moderate" — Moderate now starts exactly
-    # at P75, matching the text classification tier-for-tier.
-    y_normal_warm = np.where(t_full > c_base, np.minimum(t_full, p75_full), c_base)
-    y_w1 = np.where(t_full > p75_full, np.minimum(t_full, p90_full), p75_full)
-    y_w2 = np.where(t_full > p90_full, np.minimum(t_full, p95_full), y_w1)
-    y_w3 = np.where(t_full > p95_full, np.minimum(t_full, rec_w_full), y_w2)
-    y_w4 = np.where(t_full > rec_w_full, t_full, y_w3)
+    traces.append(go.Scatter(x=fill_x, y=c_base_f, mode='lines', line=_fill_line, showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=fill_x, y=y_below, mode='lines', fill='tonexty', fillcolor=cold_rgba('below'), line=_fill_line, name='Cold Below average', legendgroup='cb', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=fill_x, y=p25_full, mode='lines', line=_fill_line, showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=fill_x, y=y_c1, mode='lines', fill='tonexty', fillcolor=cold_rgba('moderate'), line=_fill_line, name='Cold Moderate', legendgroup='cm', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=fill_x, y=y_c2, mode='lines', fill='tonexty', fillcolor=cold_rgba('strong'), line=_fill_line, name='Cold Strong', legendgroup='cs', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=fill_x, y=y_c3, mode='lines', fill='tonexty', fillcolor=cold_rgba('extreme'), line=_fill_line, name='Cold Extreme', legendgroup='ce', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=fill_x, y=y_c4, mode='lines', fill='tonexty', fillcolor=cold_rgba('record'), line=_fill_line, name='Cold Record', legendgroup='cr', showlegend=False, hoverinfo='skip'))
 
-    # Cold Anomalies
-    p25_full = pt_clim[f'tn_p25_doy_{epoch}'].values[doys] if f'tn_p25_doy_{epoch}' in pt_clim else c_base
-    p10_full = pt_clim[f'tn_p10_doy_{epoch}'].values[doys] if f'tn_p10_doy_{epoch}' in pt_clim else c_base
-    p5_full  = pt_clim[f'tn_p5_doy_{epoch}'].values[doys] if f'tn_p5_doy_{epoch}' in pt_clim else c_base
-    y_normal_cold = np.where(t_full < c_base, np.maximum(t_full, p25_full), c_base)
-    y_c1 = np.where(t_full < p25_full, np.maximum(t_full, p10_full), p25_full)
-    y_c2 = np.where(t_full < p10_full, np.maximum(t_full, p5_full), y_c1)
-    y_c3 = np.where(t_full < p5_full, np.maximum(t_full, rec_c_full), y_c2)
-    y_c4 = np.where(t_full < rec_c_full, t_full, y_c3)
-
-    # TASK 2: the 8 warm/cold severity tiers are represented by the compact
-    # HTML badge legend (rendered above the chart, Map-Tracker style) instead
-    # of cluttering Plotly's own legend — so all 8 stay showlegend=False here.
-    # Warm side: median -> Typical Range (grey) -> P75 -> Moderate/Strong/Extreme/Record
-    traces.append(go.Scatter(x=dates, y=c_base, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-    traces.append(go.Scatter(x=dates, y=y_normal_warm, mode='lines', fill='tonexty', fillcolor='rgba(180,180,180,0.4)', line=dict(width=0), name='Typical Range', legendgroup='normal', showlegend=False, hoverinfo='skip'))
-    traces.append(go.Scatter(x=dates, y=p75_full, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-    traces.append(go.Scatter(x=dates, y=y_w1, mode='lines', fill='tonexty', fillcolor=warm_rgba('moderate'), line=dict(width=0), name='Warm Moderate', legendgroup='wm', showlegend=False, hoverinfo='skip'))
-    traces.append(go.Scatter(x=dates, y=y_w2, mode='lines', fill='tonexty', fillcolor=warm_rgba('strong'), line=dict(width=0), name='Warm Strong', legendgroup='ws', showlegend=False, hoverinfo='skip'))
-    traces.append(go.Scatter(x=dates, y=y_w3, mode='lines', fill='tonexty', fillcolor=warm_rgba('extreme'), line=dict(width=0), name='Warm Extreme', legendgroup='we', showlegend=False, hoverinfo='skip'))
-    traces.append(go.Scatter(x=dates, y=y_w4, mode='lines', fill='tonexty', fillcolor=warm_rgba('record'), line=dict(width=0), name='Warm Record', legendgroup='wr', showlegend=False, hoverinfo='skip'))
-
-    # Cold side: median -> Typical Range (grey, legend already shown on warm side) -> P25 -> Moderate/Strong/Extreme/Record
-    traces.append(go.Scatter(x=dates, y=c_base, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-    traces.append(go.Scatter(x=dates, y=y_normal_cold, mode='lines', fill='tonexty', fillcolor='rgba(180,180,180,0.4)', line=dict(width=0), name='Typical Range', legendgroup='normal', showlegend=False, hoverinfo='skip'))
-    traces.append(go.Scatter(x=dates, y=p25_full, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-    traces.append(go.Scatter(x=dates, y=y_c1, mode='lines', fill='tonexty', fillcolor=cold_rgba('moderate'), line=dict(width=0), name='Cold Moderate', legendgroup='cm', showlegend=False, hoverinfo='skip'))
-    traces.append(go.Scatter(x=dates, y=y_c2, mode='lines', fill='tonexty', fillcolor=cold_rgba('strong'), line=dict(width=0), name='Cold Strong', legendgroup='cs', showlegend=False, hoverinfo='skip'))
-    traces.append(go.Scatter(x=dates, y=y_c3, mode='lines', fill='tonexty', fillcolor=cold_rgba('extreme'), line=dict(width=0), name='Cold Extreme', legendgroup='ce', showlegend=False, hoverinfo='skip'))
-    traces.append(go.Scatter(x=dates, y=y_c4, mode='lines', fill='tonexty', fillcolor=cold_rgba('record'), line=dict(width=0), name='Cold Record', legendgroup='cr', showlegend=False, hoverinfo='skip'))
-
-    traces.append(go.Scatter(x=dates, y=c_base, mode='lines', line=dict(color='black', width=2), name='Reference Value', legendgroup='base', showlegend=False, hoverinfo='skip'))
+    traces.append(go.Scatter(x=dates, y=c_base, mode='lines', line=dict(color='black', width=2, shape='linear'), name='Reference Value', legendgroup='base', showlegend=False, hoverinfo='skip'))
 
     # Visual split only: solid through the selected day, dotted after it (join day
     # included on the dotted line so the stroke is continuous). Hover is a SINGLE
     # full-series trace — splitting hover across hist/forecast lets Plotly's
     # unified hover (hoverdistance ~20px ≈ a week on a 365-day axis) pull in the
     # neighbouring day as a second "Current Value" block.
-    hist_mask = dates <= tgt_dt_norm
     fcst_line_mask = dates >= tgt_dt_norm
     y_all = df_live[col_target].values if col_target in df_live.columns else ((df_live['TX'].values + df_live['TN'].values) / 2.0)
 
-    if show_app:
-        col_app = 'AT_Max' if meteo_var == "Max Temp (TX)" else ('AT_Min' if meteo_var == "Min Temp (TN)" else 'AT_Mean')
-        if col_app in df_live.columns:
-            traces.append(go.Scatter(x=d_hist, y=df_live.loc[hist_mask, col_app], mode='lines', name='Apparent Temperature', legendgroup='app', showlegend=sh, line=dict(color=ATMOPULSE_OVERLAY['apparent_temp'], width=1.5), hoverinfo='skip'))
-            traces.append(go.Scatter(x=dates[fcst_line_mask], y=df_live.loc[fcst_line_mask, col_app], mode='lines', line=dict(color=ATMOPULSE_OVERLAY['apparent_temp'], width=1.5, dash='dot'), legendgroup='app', showlegend=False, hoverinfo='skip'))
-            traces.append(go.Scatter(
-                x=dates, y=df_live[col_app], mode='lines',
-                line=dict(width=0, color='rgba(0,0,0,0)'), legendgroup='app', showlegend=False,
-                hovertemplate="Apparent Temperature: %{y:.1f}°C<extra></extra>",
-            ))
+    if meteo_var == "Max Temp (TX)":
+        rec_wd_key, rec_cd_key = "tx_max_date", "tx_min_date"
+    elif meteo_var == "Min Temp (TN)":
+        rec_wd_key, rec_cd_key = "tn_max_date", "tn_min_date"
+    else:
+        rec_wd_key = "tg_max_date" if "tg_max_date" in pt_clim.variables else "tx_max_date"
+        rec_cd_key = "tg_min_date" if "tg_min_date" in pt_clim.variables else "tn_min_date"
 
-    if show_air:
-        if meteo_var == "Max Temp (TX)":
-            rec_wd_key, rec_cd_key = "tx_max_date", "tx_min_date"
-        elif meteo_var == "Min Temp (TN)":
-            rec_wd_key, rec_cd_key = "tn_max_date", "tn_min_date"
-        else:
-            rec_wd_key = "tg_max_date" if "tg_max_date" in pt_clim.variables else "tx_max_date"
-            rec_cd_key = "tg_min_date" if "tg_min_date" in pt_clim.variables else "tn_min_date"
+    rec_wd = pt_clim[rec_wd_key].values[doys] if rec_wd_key in pt_clim.variables else np.full(len(doys), np.nan)
+    rec_cd = pt_clim[rec_cd_key].values[doys] if rec_cd_key in pt_clim.variables else np.full(len(doys), np.nan)
 
-        # Reuse the record thresholds already resolved above for the "Record"
-        # fill tier, rather than re-reading them from pt_clim a second time.
-        rec_wd = pt_clim[rec_wd_key].values[doys] if rec_wd_key in pt_clim.variables else np.full(len(doys), np.nan)
-        rec_cd = pt_clim[rec_cd_key].values[doys] if rec_cd_key in pt_clim.variables else np.full(len(doys), np.nan)
+    class_labels = _meteogram_class_labels(
+        y_all, c_base, p75_daily, p90_daily, p95_daily, rec_w_daily,
+        p25_daily, p10_daily, p5_daily, rec_c_daily,
+    )
+    date_labels = pd.to_datetime(dates).dt.strftime("%d.%m.%Y")
+    hover_head = np.array([f"{d}: {lab}" for d, lab in zip(date_labels, class_labels)], dtype=object)
 
-        c_data_all = np.empty((len(dates), 5), dtype=object)
-        c_data_all[:, 0] = np.round(c_base, 1)
-        c_data_all[:, 1] = np.round(rec_w_full, 1)
-        c_data_all[:, 2] = np.round(rec_c_full, 1)
-        c_data_all[:, 3] = _yyyymmdd_dot_date_arr(rec_wd)
-        c_data_all[:, 4] = _yyyymmdd_dot_date_arr(rec_cd)
+    c_data_all = np.empty((len(dates), 6), dtype=object)
+    c_data_all[:, 0] = np.round(c_base, 1)
+    c_data_all[:, 1] = np.round(rec_w_daily, 1)
+    c_data_all[:, 2] = np.round(rec_c_daily, 1)
+    c_data_all[:, 3] = _yyyymmdd_dot_date_arr(rec_wd)
+    c_data_all[:, 4] = _yyyymmdd_dot_date_arr(rec_cd)
+    c_data_all[:, 5] = hover_head
 
-        hover_current = (
-            "Current Value: %{y:.1f}°C<br>"
-            "Reference Value: %{customdata[0]:.1f}°C<br>"
-            "Maximum: %{customdata[1]:.1f}°C%{customdata[3]}<br>"
-            "Minimum: %{customdata[2]:.1f}°C%{customdata[4]}"
-            "<extra></extra>"
-        )
+    hover_current = (
+        "<b>%{customdata[5]}</b><br>"
+        "Current Value: %{y:.1f}°C<br>"
+        "Reference Value: %{customdata[0]:.1f}°C<br>"
+        "Maximum: %{customdata[1]:.1f}°C%{customdata[3]}<br>"
+        "Minimum: %{customdata[2]:.1f}°C%{customdata[4]}"
+        "<extra></extra>"
+    )
 
-        # TASK 4: this is the trace that actually shows in the Plotly legend
-        # for the temperature line (the hover-carrying trace below stays
-        # showlegend=False) — renamed "Air Temperature" -> "Current Value".
-        traces.append(go.Scatter(
-            x=d_hist, y=t_hist, mode='lines',
-            name='Current Value', legendgroup='air', showlegend=False,
-            line=dict(color='rgba(0,0,0,0.7)', width=1.5), hoverinfo='skip',
-        ))
-        traces.append(go.Scatter(
-            x=dates[fcst_line_mask], y=y_all[fcst_line_mask.values],
-            mode='lines', name='Current Value (Forecast)', legendgroup='air', showlegend=False,
-            line=dict(color='gray', width=2.5, dash='dot'), hoverinfo='skip',
-        ))
-        traces.append(go.Scatter(
-            x=dates, y=y_all, mode='lines',
-            line=dict(width=0, color='rgba(0,0,0,0)'),
-            customdata=c_data_all, name='Current Value',
-            legendgroup='air', showlegend=False, hovertemplate=hover_current,
-        ))
+    traces.append(go.Scatter(
+        x=d_hist, y=t_hist, mode='lines',
+        name='Current Value', legendgroup='air', showlegend=False,
+        line=dict(color='rgba(0,0,0,0.7)', width=1.5, shape='linear'), hoverinfo='skip',
+    ))
+    traces.append(go.Scatter(
+        x=dates[fcst_line_mask], y=y_all[fcst_line_mask.values],
+        mode='lines', name='Current Value (Forecast)', legendgroup='air', showlegend=False,
+        line=dict(color='gray', width=2.5, dash='dot'), hoverinfo='skip',
+    ))
+    traces.append(go.Scatter(
+        x=dates, y=y_all, mode='lines',
+        line=dict(width=0, color='rgba(0,0,0,0)'),
+        customdata=c_data_all, name='Current Value',
+        legendgroup='air', showlegend=False, hovertemplate=hover_current,
+    ))
 
     return traces
 
@@ -611,17 +1057,66 @@ def build_yearly_extremes_chart(lat, lon, epoch, is_warm, _ref_clim=None, _load_
     cols_to_sum = ['year', 'p75', 'p90', 'p95', 'rec'] if is_warm else ['year', 'p25', 'p10', 'p5', 'rec']
     res = df[cols_to_sum].groupby('year').sum()
     
+    cols_mod, cols_str, cols_ext, cols_rec = (
+        ("p75", "p90", "p95", "rec") if is_warm else ("p25", "p10", "p5", "rec")
+    )
+    hover_cd = np.column_stack([
+        res[cols_mod].to_numpy(dtype=int),
+        res[cols_str].to_numpy(dtype=int),
+        res[cols_ext].to_numpy(dtype=int),
+        res[cols_rec].to_numpy(dtype=int),
+    ])
+    hover_tmpl = (
+        "<b>%{x}</b><br>"
+        "Moderate: %{customdata[0]}<br>"
+        "Strong: %{customdata[1]}<br>"
+        "Extreme: %{customdata[2]}<br>"
+        "Records: %{customdata[3]}"
+        "<extra></extra>"
+    )
+    bar_kw = dict(hoverinfo="skip", hovertemplate=None)
     fig = go.Figure()
     if is_warm:
-        fig.add_trace(go.Bar(x=res.index, y=res['p75'], name='Moderate', marker_color=ATMOPULSE_WARM['p75']))
-        fig.add_trace(go.Bar(x=res.index, y=res['p90'], name='Strong', marker_color=ATMOPULSE_WARM['p90']))
-        fig.add_trace(go.Bar(x=res.index, y=res['p95'], name='Extreme', marker_color=ATMOPULSE_WARM['p95']))
-        fig.add_trace(go.Bar(x=res.index, y=res['rec'], name='Records', marker_color=ATMOPULSE_WARM['rec']))
+        fig.add_trace(go.Bar(x=res.index, y=res['p75'], name='Moderate', marker_color=ATMOPULSE_WARM['p75'], **bar_kw))
+        fig.add_trace(go.Bar(x=res.index, y=res['p90'], name='Strong', marker_color=ATMOPULSE_WARM['p90'], **bar_kw))
+        fig.add_trace(go.Bar(x=res.index, y=res['p95'], name='Extreme', marker_color=ATMOPULSE_WARM['p95'], **bar_kw))
+        fig.add_trace(go.Bar(x=res.index, y=res['rec'], name='Records', marker_color=ATMOPULSE_WARM['rec'], **bar_kw))
     else:
-        fig.add_trace(go.Bar(x=res.index, y=res['p25'], name='Moderate', marker_color=ATMOPULSE_COLD['p25']))
-        fig.add_trace(go.Bar(x=res.index, y=res['p10'], name='Strong', marker_color=ATMOPULSE_COLD['p10']))
-        fig.add_trace(go.Bar(x=res.index, y=res['p5'],  name='Extreme', marker_color=ATMOPULSE_COLD['p5']))
-        fig.add_trace(go.Bar(x=res.index, y=res['rec'], name='Records', marker_color=ATMOPULSE_COLD['rec']))
+        fig.add_trace(go.Bar(x=res.index, y=res['p25'], name='Moderate', marker_color=ATMOPULSE_COLD['p25'], **bar_kw))
+        fig.add_trace(go.Bar(x=res.index, y=res['p10'], name='Strong', marker_color=ATMOPULSE_COLD['p10'], **bar_kw))
+        fig.add_trace(go.Bar(x=res.index, y=res['p5'],  name='Extreme', marker_color=ATMOPULSE_COLD['p5'], **bar_kw))
+        fig.add_trace(go.Bar(x=res.index, y=res['rec'], name='Records', marker_color=ATMOPULSE_COLD['rec'], **bar_kw))
 
-    fig.update_layout(**plotly_typography(), barmode='stack', title=f"Days exceeding thresholds | {'1961–1990' if epoch=='A' else '1996–2025'}", height=300, margin=dict(t=30, b=10), template="plotly_white", legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5), yaxis=dict(rangemode="tozero"))
+    y_top = res[cols_mod] + res[cols_str] + res[cols_ext] + res[cols_rec]
+    fig.add_trace(go.Scatter(
+        x=res.index, y=y_top,
+        mode="markers",
+        marker=dict(size=1, opacity=0),
+        customdata=hover_cd,
+        hovertemplate=hover_tmpl,
+        hoverlabel=dict(align="left"),
+        showlegend=False,
+        name="year-hover",
+    ))
+
+    fig.update_layout(
+        **plotly_typography(),
+        barmode="stack",
+        hovermode="x",
+        title=f"Days exceeding thresholds | {'1961–1990' if epoch=='A' else '1996–2025'}",
+        height=340,
+        margin=dict(t=40, b=88, l=50, r=20),
+        template="plotly_white",
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.28,
+            xanchor="center",
+            x=0.5,
+            bgcolor="rgba(0,0,0,0)",
+            traceorder="normal",
+        ),
+        yaxis=dict(rangemode="tozero"),
+        xaxis=dict(automargin=True),
+    )
     return fig

@@ -23,6 +23,8 @@ import pandas as pd
 from pathlib import Path
 import streamlit as st
 
+from config import MAP_VIEW_PERSISTENCE
+
 DATA_DIR = Path("ERA5_ClimateTool/Master_Batches")
 LIVE_DIR = Path("ERA5_ClimateTool/Live_Forecasts")
 
@@ -456,13 +458,61 @@ def _to_celsius(da: xr.DataArray) -> xr.DataArray:
     return da
 
 
+# Order is stable so needed_vars tuples remain comparable cache keys.
+ALL_SYNOPTIC_FIELDS = (
+    "mslp", "z500", "tx", "tn", "tg", "t850", "u850", "v850", "u300", "v300",
+)
+
+
+def synoptic_vars_for_map(
+    map_var: str,
+    toggles: dict | None = None,
+    view_mode: str | None = None,
+) -> tuple[str, ...]:
+    """Hashable field list for the current Map Tracker view (no u/v/t850)."""
+    toggles = toggles or {}
+    code = str(map_var or "TG").upper()
+    wanted: list[str] = []
+    if code == "TX":
+        wanted.append("tx")
+    elif code == "TN":
+        wanted.append("tn")
+    else:
+        wanted.extend(("tg", "tx", "tn"))
+    if toggles.get("mslp"):
+        wanted.append("mslp")
+    if toggles.get("z500"):
+        wanted.append("z500")
+    if toggles.get("hatching") or view_mode == MAP_VIEW_PERSISTENCE:
+        wanted.extend(("tx", "tn"))
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in wanted:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return tuple(out)
+
+
+def _requested_synoptic_fields(needed_vars) -> list[str]:
+    if not needed_vars:
+        return list(ALL_SYNOPTIC_FIELDS)
+    allowed = set(ALL_SYNOPTIC_FIELDS)
+    return [v for v in needed_vars if v in allowed]
+
+
 def get_synoptic_map_data(
     date_str: str, anchor_date_str: str = None, pad_past: int = None, pad_future: int = None,
     forecast_model: str = "IFS (Physics-based)",
+    needed_vars: tuple[str, ...] | None = None,
 ) -> dict:
     """
-    Retrieves, standardizes, and applies physical masking to synoptic arrays 
+    Retrieves, standardizes, and applies physical masking to synoptic arrays
     for a given date, seamlessly transitioning between ERA5 and the selected live forecast.
+
+    `needed_vars` limits which data variables are materialized (``.load()``).
+    Time selection uses ``valid_time``, never ``time``. ``needed_vars=None``
+    keeps the historical all-fields path.
     """
     forecast_model = _forecast_model_key(forecast_model)
     target_dt = pd.to_datetime(date_str)
@@ -493,14 +543,15 @@ def get_synoptic_map_data(
         "actual_time": pd.Timestamp(actual_time).normalize() if actual_time is not None else None,
     }
 
-    field_names = ["mslp", "z500", "tx", "tn", "tg", "t850", "u850", "v850", "u300", "v300"]
-    if t_idx is None:
-        slice_ds = xr.Dataset({v: _empty_field_like(ds, v) for v in field_names if v in ds.data_vars})
+    field_names = _requested_synoptic_fields(needed_vars)
+    available = [v for v in field_names if v in ds.data_vars]
+
+    if t_idx is None or not available:
+        slice_ds = xr.Dataset({v: _empty_field_like(ds, v) for v in available})
     else:
-        # .load() alone can still leave a slice backed by a shared chunk/cache
-        # buffer on lazily-opened datasets; .copy(deep=True) forces an
-        # independent in-memory array per timestep before it reaches Plotly.
-        slice_ds = ds.isel(valid_time=t_idx).load().copy(deep=True)
+        # List indexing keeps a Dataset even for one variable (ds["tx"] is a DataArray).
+        # Subset before .load() so NetCDF only materializes requested fields.
+        slice_ds = ds[available].isel(valid_time=t_idx).load().copy(deep=True)
 
     clean_slices = {"_meta": meta}
     for name in field_names:

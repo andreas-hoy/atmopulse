@@ -23,8 +23,10 @@ import pandas as pd
 import numpy as np
 import threading
 from pathlib import Path
-from geopy.geocoders import Nominatim
 from datetime import datetime
+
+from geopy.exc import GeocoderServiceError, GeocoderTimedOut, GeocoderUnavailable
+from geopy.geocoders import Nominatim
 
 from backend_maps import etccdi_doy_365
 from backend_waves import get_wave_historical_rank
@@ -74,6 +76,20 @@ st.set_page_config(page_title="AtmoPulse", layout="wide", page_icon="assets/favi
 st.markdown(f"<style>{atmopulse_streamlit_css(ATMOPULSE_BRAND)}</style>", unsafe_allow_html=True)
 
 geolocator = Nominatim(user_agent="atmopulse_extremes_tracker_2026")
+
+
+def _safe_geocode(query, **kwargs):
+    """Nominatim lookup that must not crash the app when DNS/network is down."""
+    kwargs.setdefault("timeout", 10)
+    try:
+        return geolocator.geocode(query, **kwargs)
+    except (GeocoderUnavailable, GeocoderTimedOut, GeocoderServiceError):
+        st.warning(
+            "Location search is temporarily unavailable "
+            "(OpenStreetMap Nominatim could not be reached). "
+            "Check the internet connection and try again."
+        )
+        return None
 
 if "nc_lock" not in st.session_state: st.session_state.nc_lock = threading.Lock()
 if "search_history" not in st.session_state: st.session_state.search_history = ["Berlin", "Tallinn", "Budapest"]
@@ -383,12 +399,6 @@ with st.sidebar:
                     meteo_env = st.selectbox("Background Envelope:", ["Moderate", "Strong", "Extreme", "All-Time"], index=1, help=HELP["meteogram_envelope"])
                 else:
                     meteo_env = STANDARD_DEFAULTS["meteo_env"]
-                st.markdown("<br>", unsafe_allow_html=True)
-                show_air_temp = st.checkbox("Show Air Temperature Colors", value=STANDARD_DEFAULTS["show_air_temp"], help=HELP["meteogram_air_temp_colors"])
-                if show_expert("apparent_temp"):
-                    show_app_temp = st.checkbox("Show Apparent Temperature", value=STANDARD_DEFAULTS["show_app_temp"], help=HELP["meteogram_apparent_temp"])
-                else:
-                    show_app_temp = STANDARD_DEFAULTS["show_app_temp"]
             
             if nav_selection == NAV_WAVE:
                 wave_focus = st.radio("Wave Event Type:", ("Heatwaves", "Coldwaves"), index=default_wave_idx, help=HELP["wave_event_type"])
@@ -463,12 +473,12 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
         and st.session_state.get("loc_source") == "history"
     )
     if use_history:
-        location = geolocator.geocode(loc_history_sel, timeout=10)
+        location = _safe_geocode(loc_history_sel)
     elif new_loc_input:
         if new_loc_input != st.session_state.get("last_query"):
             st.session_state.last_query = new_loc_input
             with st.spinner("Searching..."):
-                results = geolocator.geocode(new_loc_input, exactly_one=False, limit=5)
+                results = _safe_geocode(new_loc_input, exactly_one=False, limit=5)
                 st.session_state.geocode_results = results
         results = st.session_state.get("geocode_results")
         if results:
@@ -483,7 +493,7 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
         else: 
             st.warning("No results found.")
     elif loc_history_sel != "Select...":
-        location = geolocator.geocode(loc_history_sel, timeout=10)
+        location = _safe_geocode(loc_history_sel)
 
     lat_target, lon_target = 52.52, 13.40 
     if location:
@@ -492,12 +502,17 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
             st.warning(f"📍 Location {location.address} is outside the Europe domain.")
             location = None
         else: 
-            st.success(f"📍 **Location Matrix Active:** {location.address} | **{lat_target}°N, {lon_target}°E**")
+            st.markdown(
+                f"<div class='atmopulse-location-banner'>"
+                f"📍 <b>Location Matrix Active:</b> {location.address} | "
+                f"<b>{lat_target}°N, {lon_target}°E</b></div>",
+                unsafe_allow_html=True,
+            )
 
     if location:
         render_grid_cell_profile(location.address, lat_target, lon_target)
         if nav_selection == NAV_METEO:
-            render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, show_air_temp, show_app_temp, target_date)
+            render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, target_date)
 
         elif nav_selection == NAV_WAVE:
             if show_expert("flicker_layout"):

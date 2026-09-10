@@ -504,15 +504,71 @@ def _array_has_finite(val) -> bool:
     return bool(np.isfinite(arr).any())
 
 
+def synoptic_source_mtime(date_str, forecast_model=FORECAST_MODEL_IFS) -> float:
+    """Latest mtime among the on-disk files that actually feed the Map
+    Tracker synoptic fields for `date_str`: the newest matching live-forecast
+    file (ifs_daily_forecast_*.nc / aifs_daily_forecast_*.nc, or the legacy
+    live_forecast_*.nc bridge files for IFS) plus era5_master_daily_{year}.nc
+    for the target year.
+
+    Schritt C: used as an explicit, hashable @st.cache_resource /
+    @st.cache_data key component (`source_mtime=`) so a freshly-downloaded
+    forecast run — same filename, replaced on disk, so its own mtime is the
+    only thing that changes — actually invalidates fetch_cached_synoptic_data
+    and the map-tracker analytics that key off it, instead of silently
+    serving a stale in-memory result for the same date_str/toggles. Returns
+    0.0 (never crashes, never blocks) when nothing is found — callers treat
+    that as "no fresher file known", not as an error.
+    """
+    live_dir = DATA_ROOT / "Live_Forecasts"
+    is_aifs = "AIFS" in str(forecast_model)
+    pattern = "aifs_daily_forecast_*.nc" if is_aifs else "ifs_daily_forecast_*.nc"
+    mtimes = [p.stat().st_mtime for p in live_dir.glob(pattern) if p.exists()]
+    if not is_aifs:
+        # Legacy IFS bridge files (see backend_maps._open_live_forecast_ds).
+        for name in ("live_forecast_mslp.nc", "live_forecast_z500.nc", "live_forecast_txtn.nc"):
+            p = live_dir / name
+            if p.exists():
+                mtimes.append(p.stat().st_mtime)
+    try:
+        year = pd.to_datetime(date_str).year
+    except Exception:
+        year = None
+    if year is not None:
+        master_path = DATA_ROOT / "Master_Batches" / f"era5_master_daily_{year}.nc"
+        if master_path.exists():
+            mtimes.append(master_path.stat().st_mtime)
+    return max(mtimes) if mtimes else 0.0
+
+
 @st.cache_resource(show_spinner=False, max_entries=10)
-def fetch_cached_synoptic_data(date_str, anchor_date_str=None, forecast_model=FORECAST_MODEL_IFS, _loader_version=9):
+def fetch_cached_synoptic_data(
+    date_str, anchor_date_str=None, forecast_model=FORECAST_MODEL_IFS,
+    needed_vars=None, source_mtime=0.0, _loader_version=10,
+):
+    """
+    `source_mtime` (Schritt C): hashable cache-key component, see
+    `synoptic_source_mtime()`. @st.cache_resource is kept (not swapped to
+    cache_data) precisely BECAUSE mtime is now in the key: a new forecast
+    file gets its own cache entry instead of the old one going stale, so the
+    "no defensive copy on every read" performance property cache_resource
+    gives this large dict-of-ndarrays return value is preserved. `max_entries
+    =10` bounds memory the same way it always did; entries keyed to a
+    superseded mtime simply age out via the existing LRU eviction.
+    """
+    if needed_vars is not None:
+        needed_vars = tuple(needed_vars)
     with st.session_state.nc_lock:
         if anchor_date_str is not None:
             set_synoptic_anchor(anchor_date_str, SLIDER_PAD_PAST, SLIDER_PAD_FUTURE, forecast_model=forecast_model)
-        data = get_synoptic_map_data(date_str, forecast_model=forecast_model)
+        data = get_synoptic_map_data(
+            date_str, forecast_model=forecast_model, needed_vars=needed_vars,
+        )
         meta = data.pop("_meta", {})
         packed = {}
-        sample = next((data[k] for k in ("mslp", "tg", "tx") if k in data), None)
+        sample = next((data[k] for k in ("mslp", "tg", "tx", "tn", "z500") if k in data), None)
+        if sample is None:
+            sample = next((v for v in data.values() if hasattr(v, "longitude")), None)
         if sample is not None and hasattr(sample, "longitude"):
             packed["_lons"] = np.asarray(sample.longitude.values)
             packed["_lats"] = np.asarray(sample.latitude.values)
@@ -659,40 +715,73 @@ def get_map_historical_records_bundle(target_doys: tuple, cutoff_year: int):
 
 
 # --- METEOGRAM CORE DATA ---
+def _clim_doy_arr(pt_clim, key, doys):
+    doys = np.asarray(doys, dtype=np.int64)
+    if key not in pt_clim.variables:
+        return np.full(doys.shape, np.nan, dtype=np.float64)
+    return np.asarray(pt_clim[key].values, dtype=np.float64)[doys]
+
+
+def point_clim_ladder(pt_clim, doys, meteo_var, epoch):
+    """Warm/cold percentile ladder + reference value for one meteogram variable.
+
+    Same definitions as ``compute_point_thresholds`` (the scalar form used by
+    the narrative), so text, hover, and colour fills cannot disagree:
+
+    * TX — TX percentiles / records
+    * TN — TN percentiles / records
+    * TG — mean of the TX and TN ladders (same proxy the Map Tracker uses);
+      ``tg_max_val`` / ``tg_min_val`` when present, else mean of TX+TN records
+
+    ``c_base`` is the midpoint of that variable's Moderate-warm and
+    Moderate-cold bounds (the "average" the Above/Below-avg fills sit on).
+    """
+    doys = np.asarray(doys, dtype=np.int64)
+    ep = epoch
+
+    def a(key):
+        return _clim_doy_arr(pt_clim, key, doys)
+
+    def avg(k1, k2):
+        return (a(k1) + a(k2)) / 2.0
+
+    if meteo_var == "Max Temp (TX)":
+        p75, p90, p95 = a(f"tx_p75_doy_{ep}"), a(f"tx_p90_doy_{ep}"), a(f"tx_p95_doy_{ep}")
+        rec_w = a("tx_max_val")
+        p25, p10, p5 = a(f"tx_p25_doy_{ep}"), a(f"tx_p10_doy_{ep}"), a(f"tx_p5_doy_{ep}")
+        rec_c = a("tx_min_val")
+    elif meteo_var == "Min Temp (TN)":
+        p75, p90, p95 = a(f"tn_p75_doy_{ep}"), a(f"tn_p90_doy_{ep}"), a(f"tn_p95_doy_{ep}")
+        rec_w = a("tn_max_val")
+        p25, p10, p5 = a(f"tn_p25_doy_{ep}"), a(f"tn_p10_doy_{ep}"), a(f"tn_p5_doy_{ep}")
+        rec_c = a("tn_min_val")
+    else:
+        p75 = avg(f"tx_p75_doy_{ep}", f"tn_p75_doy_{ep}")
+        p90 = avg(f"tx_p90_doy_{ep}", f"tn_p90_doy_{ep}")
+        p95 = avg(f"tx_p95_doy_{ep}", f"tn_p95_doy_{ep}")
+        rec_w = a("tg_max_val") if "tg_max_val" in pt_clim.variables else avg("tx_max_val", "tn_max_val")
+        p25 = avg(f"tx_p25_doy_{ep}", f"tn_p25_doy_{ep}")
+        p10 = avg(f"tx_p10_doy_{ep}", f"tn_p10_doy_{ep}")
+        p5 = avg(f"tx_p5_doy_{ep}", f"tn_p5_doy_{ep}")
+        rec_c = a("tg_min_val") if "tg_min_val" in pt_clim.variables else avg("tx_min_val", "tn_min_val")
+    c_base = (p75 + p25) / 2.0
+    return c_base, p75, p90, p95, rec_w, p25, p10, p5, rec_c
+
+
 def compute_point_thresholds(ref_clim, lat, lon, target_date, meteo_var, epoch):
     """
     ETCCDI percentile + all-time-record thresholds for one coordinate/day,
     shaped as (p_warm, p_cold) for backend_narrative.classify_point_severity().
-    Uses the same 365-day ETCCDI calendar mapping as
-    frontend_plots.get_meteogram_traces() so the Point Meteogram narrative
-    always matches the chart's climate boundaries envelope.
+    Uses the same ladder as frontend_plots.get_meteogram_traces() so the
+    Point Meteogram narrative always matches the chart colour fills.
     """
-    pt_clim = ref_clim.sel(latitude=lat, longitude=lon, method='nearest')
-    ts = pd.Timestamp(target_date)
-    doy = etccdi_doy_365(ts) - 1
-
-    def g(key):
-        return float(pt_clim[key].values[doy]) if key in pt_clim.variables else np.nan
-
-    if meteo_var == "Max Temp (TX)":
-        p_warm = {"p75": g(f'tx_p75_doy_{epoch}'), "p90": g(f'tx_p90_doy_{epoch}'), "p95": g(f'tx_p95_doy_{epoch}'), "rec": g('tx_max_val')}
-        p_cold = {"p25": g(f'tx_p25_doy_{epoch}'), "p10": g(f'tx_p10_doy_{epoch}'), "p5": g(f'tx_p5_doy_{epoch}'), "rec": g('tx_min_val')}
-    elif meteo_var == "Min Temp (TN)":
-        p_warm = {"p75": g(f'tn_p75_doy_{epoch}'), "p90": g(f'tn_p90_doy_{epoch}'), "p95": g(f'tn_p95_doy_{epoch}'), "rec": g('tn_max_val')}
-        p_cold = {"p25": g(f'tn_p25_doy_{epoch}'), "p10": g(f'tn_p10_doy_{epoch}'), "p5": g(f'tn_p5_doy_{epoch}'), "rec": g('tn_min_val')}
-    else:
-        p_warm = {
-            "p75": (g(f'tx_p75_doy_{epoch}') + g(f'tn_p75_doy_{epoch}')) / 2,
-            "p90": (g(f'tx_p90_doy_{epoch}') + g(f'tn_p90_doy_{epoch}')) / 2,
-            "p95": (g(f'tx_p95_doy_{epoch}') + g(f'tn_p95_doy_{epoch}')) / 2,
-            "rec": (g('tx_max_val') + g('tn_max_val')) / 2,
-        }
-        p_cold = {
-            "p25": (g(f'tx_p25_doy_{epoch}') + g(f'tn_p25_doy_{epoch}')) / 2,
-            "p10": (g(f'tx_p10_doy_{epoch}') + g(f'tn_p10_doy_{epoch}')) / 2,
-            "p5": (g(f'tx_p5_doy_{epoch}') + g(f'tn_p5_doy_{epoch}')) / 2,
-            "rec": (g('tx_min_val') + g('tn_min_val')) / 2,
-        }
+    pt_clim = ref_clim.sel(latitude=lat, longitude=lon, method="nearest")
+    doys = np.atleast_1d(etccdi_doy_365(pd.Timestamp(target_date)) - 1)
+    _c_base, p75, p90, p95, rec_w, p25, p10, p5, rec_c = point_clim_ladder(
+        pt_clim, doys, meteo_var, epoch
+    )
+    p_warm = {"p75": float(p75[0]), "p90": float(p90[0]), "p95": float(p95[0]), "rec": float(rec_w[0])}
+    p_cold = {"p25": float(p25[0]), "p10": float(p10[0]), "p5": float(p5[0]), "rec": float(rec_c[0])}
     return p_warm, p_cold
 
 
