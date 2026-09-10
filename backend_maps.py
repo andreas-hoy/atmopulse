@@ -56,6 +56,17 @@ MASTER_GLOB = "era5_master_daily_*.nc"
 _LIVE_VAR_RENAME = {"msl": "mslp", "z": "z500", "mx2t": "tx", "mn2t": "tn"}
 
 
+def _synoptic_array(field):
+    """Coerce an xarray DataArray/scalar/ndarray field to a plain numpy array
+    (or None). Shared by backend_io.py and backend_analytics.py — lives here
+    (a leaf module) so neither has to import the other to get it."""
+    if field is None:
+        return None
+    if isinstance(field, np.ndarray):
+        return field
+    return np.asarray(getattr(field, "values", field))
+
+
 def _normalize_longitude(da: xr.DataArray) -> xr.DataArray:
     """
     Forces a -180..180 longitude convention. Ensures grids from different sources

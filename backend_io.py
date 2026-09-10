@@ -36,28 +36,25 @@ try:
 except ImportError:
     _FOLIUM_AVAILABLE = False
 
-from backend_analytics import _synoptic_array
 from backend_maps import (
     LIVE_OVERLAY_PAST_DAYS,
     _open_synoptic_range,
+    _synoptic_array,
     drop_era5t_aux,
     etccdi_doy_365,
     get_synoptic_map_data,
     set_synoptic_anchor,
 )
-from backend_waves import get_kiesely_waves_figs
-from config import DATA_ROOT, FORECAST_MODEL_IFS, SLIDER_PAD_FUTURE, SLIDER_PAD_PAST
+from config import (
+    DATA_ROOT,
+    FORECAST_MODEL_IFS,
+    SLIDER_PAD_FUTURE,
+    SLIDER_PAD_PAST,
+    ZARR_MASTER_TIME_SERIES,
+)
 
 LIVE_TXTN = DATA_ROOT / "Live_Forecasts/live_forecast_txtn.nc"
 QDM_TRANSFER_FILE = DATA_ROOT / "Reference_Climatology/qdm_transfer_functions.nc"
-
-# Point-extraction-optimal Zarr mirror of the master archive (see
-# batch_convert_netcdf_to_zarr.py). Temporally-contiguous, small lat/lon
-# tile chunking turns the 10-25s NetCDF point read below into a
-# millisecond-scale read. Built offline/on a schedule, not at request time —
-# `_load_point_archive_series` falls back to the legacy NetCDF path
-# untouched whenever this store hasn't been built yet.
-ZARR_MASTER_TIME_SERIES = DATA_ROOT / "Zarr_Archive" / "era5_master_time_series.zarr"
 
 
 # --- REFERENCE CLIMATOLOGY & INVARIANTS ---
@@ -891,14 +888,3 @@ def _load_point_archive_series(lat, lon, is_warm, _archive_version=4):
     return _series_frame_from_point(pt_series)
 
 
-# Threshold-occurrence diagram ("Days exceeding thresholds") below the main
-# meteogram: returns a complex Plotly Figure that is never mutated by its
-# callers after return, so @st.cache_resource avoids the deep-copy cost
-# @st.cache_data would otherwise pay on every rerun, while still keying on
-# (lat, lon, epoch, is_warm). The heavy I/O now lives in
-# `_load_point_archive_series` above, so this function only re-runs the cheap
-# epoch-specific percentile classification + figure build on a cache miss.
-# --- WAVE CACHE WRAPPER ---
-@st.cache_data(show_spinner=False)
-def fetch_wave_figs(lat_target, lon_target, param_code, selected_epoch, wave_thresh, wave_stat_metric, _axis_version=4):
-    return get_kiesely_waves_figs(lat_target, lon_target, parameter=param_code, selected_epoch=selected_epoch, threshold_level=wave_thresh, stat_metric=wave_stat_metric)

@@ -29,7 +29,8 @@ from geopy.exc import GeocoderServiceError, GeocoderTimedOut, GeocoderUnavailabl
 from geopy.geocoders import Nominatim
 
 from backend_maps import etccdi_doy_365
-from backend_waves import get_wave_historical_rank
+from backend_waves import compute_kysely_waves_data, get_wave_historical_rank
+from frontend_plots import build_kysely_wave_figs
 from labels import HELP
 from atmopulse_theme import (
     ATMOPULSE_BRAND,
@@ -66,10 +67,27 @@ from config import (
     show_expert,
     is_daily_map_view,
 )
-from backend_io import fetch_wave_figs
 from frontend_widgets import render_grid_cell_profile
 from page_map_tracker import render_map_tracker
 from page_meteogram import render_meteogram
+
+
+# --- WAVE CACHE WRAPPER ---
+# `compute_kysely_waves_data` (backend_waves.py, compute-only: pandas/numpy/
+# xarray) is cached on the hashable (lat, lon, param_code, selected_epoch,
+# wave_thresh, wave_stat_metric) inputs. `build_kysely_wave_figs`
+# (frontend_plots.py) then turns that payload into the two Plotly Figures —
+# kept OUT of the cached function so Streamlit never has to hash/pickle
+# go.Figure objects. Owned by app.py (not backend_io.py) so backend_io never
+# has to import backend_waves, and backend_waves never has to import Plotly.
+@st.cache_data(show_spinner=False)
+def _compute_wave_payload(lat_target, lon_target, param_code, selected_epoch, wave_thresh, wave_stat_metric, _axis_version=4):
+    return compute_kysely_waves_data(lat_target, lon_target, parameter=param_code, selected_epoch=selected_epoch, threshold_level=wave_thresh, stat_metric=wave_stat_metric)
+
+
+def fetch_wave_figs(lat_target, lon_target, param_code, selected_epoch, wave_thresh, wave_stat_metric, _axis_version=4):
+    payload = _compute_wave_payload(lat_target, lon_target, param_code, selected_epoch, wave_thresh, wave_stat_metric, _axis_version=_axis_version)
+    return build_kysely_wave_figs(payload)
 
 # --- UI & CSS: TOP NAVIGATION BAR ---
 st.set_page_config(page_title="AtmoPulse", layout="wide", page_icon="assets/favicon.svg", initial_sidebar_state="expanded")

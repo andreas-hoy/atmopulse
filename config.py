@@ -19,6 +19,14 @@ MASTER_BATCHES_DIR = DATA_ROOT / "Master_Batches"
 LIVE_FORECASTS_DIR = DATA_ROOT / "Live_Forecasts"
 REFERENCE_CLIMATOLOGY_DIR = DATA_ROOT / "Reference_Climatology"
 
+# Point-extraction-optimal Zarr mirror of the master archive (see
+# batch_convert_netcdf_to_zarr.py). Temporally-contiguous, small lat/lon
+# tile chunking turns a 10-25s NetCDF point read into a millisecond-scale
+# read. Built offline/on a schedule, not at request time. Lives in config.py
+# (rather than backend_io.py) so backend_io and backend_waves can both import
+# this path without importing each other.
+ZARR_MASTER_TIME_SERIES = DATA_ROOT / "Zarr_Archive" / "era5_master_time_series.zarr"
+
 # --- Audience mode (Standard vs Expert) is independent of map *view* ---
 # (daily snapshot vs persistence duration).
 UI_MODE_STANDARD = "standard"

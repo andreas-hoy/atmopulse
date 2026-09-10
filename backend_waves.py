@@ -1,9 +1,12 @@
 ﻿"""
-AtmoPulse Wave Detection & Ridge-Plot Analytics (backend_waves.py)
+AtmoPulse Wave Detection Analytics (backend_waves.py)
 
-This module handles the extraction, dynamic thresholding, and visualization of 
-synoptic extreme events (summer heatwaves and winter coldwaves) using an adapted 
-Kyselý definition. 
+This module handles the extraction and dynamic thresholding of synoptic
+extreme events (summer heatwaves and winter coldwaves) using an adapted
+Kyselý definition. Compute-only: pandas/numpy/xarray, no Plotly, no
+atmopulse_theme. The Point Wavogram's Plotly ridge-plots and annual
+intensity bar charts are built by `frontend_plots.build_kysely_wave_figs`
+from the dict returned by `compute_kysely_waves_data` below.
 
 Core functionalities:
 - Extracts point TX/TN exclusively from era5_master_daily_YYYY.nc (IFS/AIFS only for the last 6 days and the forecast).
@@ -11,8 +14,6 @@ Core functionalities:
   P5, P10, P25 for DJF) based on shifting reference periods (1961-1990 or 1996-2025).
 - Excises leap days (Feb 29th) to ensure statistical homoscedasticity per ETCCDI norms.
 - Identifies consecutive threshold exceedances and applies trailing tolerance drops.
-- Renders highly customized, interactive Plotly ridge-plots and annual intensity 
-  bar charts representing cumulative thermal stress (K·days).
 """
 
 import json
@@ -22,19 +23,11 @@ import sys
 import xarray as xr
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 from pathlib import Path
-from scipy.interpolate import make_interp_spline
 
 from backend_maps import drop_era5t_aux
-from atmopulse_theme import (
-    ATMOPULSE_COLD, 
-    ATMOPULSE_FONTS, 
-    ATMOPULSE_WARM, 
-    plotly_title_font, 
-    plotly_typography
-)
+from config import ZARR_MASTER_TIME_SERIES
 
 DATA_DIR = Path("ERA5_ClimateTool/Master_Batches")
 CLIM_FILE = Path("ERA5_ClimateTool/Reference_Climatology/climatology_reference_complete.nc")
@@ -59,63 +52,6 @@ def _param_var(parameter: str) -> str:
 
 def _param_is_warm(parameter: str) -> bool:
     return WAVE_PARAM_CONFIG.get(parameter, {"is_warm": True})["is_warm"]
-
-# --- Ridge-plot layout (tune wave shape / break aesthetics here) ---
-WAVE_RIDGE_SPLINE_PTS = 100      # Smoothness of the ridge curve
-WAVE_RIDGE_SKEW_FACTOR = 2.5     # Horizontal bulge vs. intensity (0 = symmetric)
-WAVE_RIDGE_HEIGHT_SCALE = 20.0   # Vertical extent in axis-year units (÷ intensity)
-WAVE_BREAK_TAIL_LEN = 1.0        # X-axis length of the post-peak decay tail
-WAVE_BREAK_TAIL_STEPS = 30       # Number of points along the decay tail
-WAVE_BREAK_CTRL_X = -0.25        # Bezier ctrl-x (× tail_len); negative -> mid-fall bulges left
-WAVE_BREAK_CTRL_Y = 0.42         # Bezier ctrl-y (× peak height); shapes the curl
-WAVE_LINE_WIDTH = 1.0
-WAVE_FILL_ALPHA_BASE = 0.55      # Gradient fill opacity at ridge base
-WAVE_FILL_ALPHA_PEAK = 0.88      # Gradient fill opacity at ridge peak
-WAVE_LINE_ALPHA = 0.92
-WAVE_INTENSITY_CAP_TX = 100.0    # Intensity (K·days) mapped to full warm colour
-WAVE_INTENSITY_CAP_TN = 200.0    # Intensity (K·days) mapped to full cold colour
-
-
-def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
-    h = hex_color.lstrip("#")
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-
-
-def _lerp_hex(c0: str, c1: str, t: float) -> tuple[int, int, int]:
-    t = max(0.0, min(1.0, t))
-    r0, g0, b0 = _hex_to_rgb(c0)
-    r1, g1, b1 = _hex_to_rgb(c1)
-    return (
-        int(r0 + (r1 - r0) * t),
-        int(g0 + (g1 - g0) * t),
-        int(b0 + (b1 - b0) * t),
-    )
-
-
-def _wave_ridge_colors(parameter: str, norm_val: float) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    """AtmoPulse map palette: warm p75->rec / cold p25->rec by severity."""
-    if _param_is_warm(parameter):
-        base = _hex_to_rgb(ATMOPULSE_WARM["p75"])
-        peak = _lerp_hex(ATMOPULSE_WARM["p90"], ATMOPULSE_WARM["rec"], norm_val)
-    else:
-        base = _hex_to_rgb(ATMOPULSE_COLD["p25"])
-        peak = _lerp_hex(ATMOPULSE_COLD["p10"], ATMOPULSE_COLD["rec"], norm_val)
-    return base, peak
-
-
-def _wave_break_tail(x_end: float, y_peak: float) -> tuple[np.ndarray, np.ndarray]:
-    """Visual-only post-peak closure (Bezier); Kyselý data ends at the peak."""
-    if y_peak <= 0:
-        return np.array([x_end]), np.array([0.0])
-    
-    t = np.linspace(0, 1, WAVE_BREAK_TAIL_STEPS)
-    x_ctrl = x_end + WAVE_BREAK_TAIL_LEN * WAVE_BREAK_CTRL_X
-    y_ctrl = y_peak * WAVE_BREAK_CTRL_Y
-    x_out = x_end + WAVE_BREAK_TAIL_LEN
-    
-    x_break = (1 - t) ** 2 * x_end + 2 * (1 - t) * t * x_ctrl + t ** 2 * x_out
-    y_break = (1 - t) ** 2 * y_peak + 2 * (1 - t) * t * y_ctrl
-    return x_break, y_break
 
 
 _POINT_SERIES_EXTRACT_SCRIPT = r"""
@@ -197,8 +133,6 @@ def _era5_master_point_series_from_zarr(lat: float, lon: float) -> pd.DataFrame:
     empty DataFrame on ANY problem (missing store, missing variables,
     corrupt/partial write, ...) so the caller falls back to the legacy
     year-by-year NetCDF loop unconditionally."""
-    from backend_io import ZARR_MASTER_TIME_SERIES
-
     if not ZARR_MASTER_TIME_SERIES.exists():
         return pd.DataFrame()
     try:
@@ -280,7 +214,7 @@ def _era5_master_point_series(lat: float, lon: float, _archive_version=7) -> pd.
     """Full 1940–present TX/TN/TG/T850 at one grid cell.
 
     Fast path: reads the point-extraction-optimal Zarr mirror of the master
-    archive (see batch_convert_netcdf_to_zarr.py / backend_io.ZARR_MASTER_TIME_SERIES)
+    archive (see batch_convert_netcdf_to_zarr.py / config.ZARR_MASTER_TIME_SERIES)
     — millisecond reads instead of the old year-by-year NetCDF loop. Falls
     back to that legacy loop whenever the Zarr store doesn't exist yet or
     fails to read for any reason, so wave charts never break before/without
@@ -412,7 +346,7 @@ def _prepare_wave_season_df(lat, lon, parameter="TX") -> tuple[pd.DataFrame, str
     Kelvin normalization, Feb-29 excision, true-24h daily resampling and
     seasonal windowing (May-Sep for heatwaves, Nov-Mar for coldwaves).
 
-    Factored out of `get_kiesely_waves_figs` so the ridge-plot renderer and
+    Factored out so `compute_kysely_waves_data` (ridge-plot data) and
     the historical-rank lookup (`get_wave_historical_rank`) run the exact
     same season/day construction and can never silently drift apart.
 
@@ -625,20 +559,40 @@ def get_wave_historical_rank(
     }
 
 
-def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", threshold_level="Strong (P90/10)", stat_metric="Cumulative Annual Wave Intensity"):
-    empty_fig = go.Figure().add_annotation(text="Data Missing or Processing.", x=0.5, y=0.5, showarrow=False, font=dict(size=16, color="red", family=ATMOPULSE_FONTS["sora_css"]))
-    empty_fig.update_layout(**plotly_typography())
+@st.cache_data(show_spinner=False)
+def compute_kysely_waves_data(lat, lon, parameter="TX", selected_epoch="B", threshold_level="Strong (P90/10)", stat_metric="Cumulative Annual Wave Intensity"):
+    """
+    Compute-only payload for the Point Wavogram (ridge-plot + stats panel).
+    Pure pandas/numpy/xarray — no Plotly, no theme, no drawing-only spline
+    smoothing (that lives in `frontend_plots.build_kysely_wave_figs`, along
+    with the WAVE_RIDGE_*/WAVE_BREAK_* aesthetic constants). Cached on the
+    hashable (lat, lon, parameter, selected_epoch, threshold_level,
+    stat_metric) inputs; the two rendered Figures are built from this
+    unhashed payload separately so they never have to be pickled/hashed by
+    Streamlit's cache.
+
+    `empty=True` means "the caller should render the placeholder figure" —
+    same trigger conditions (missing archive, missing thresholds, empty
+    season data, NaN thresholds) as the previous `get_kiesely_waves_figs`.
+    """
+    suffix = "A" if selected_epoch == "A" else "B"
+    base = {
+        "empty": True,
+        "parameter": parameter,
+        "epoch": suffix,
+        "threshold_level": threshold_level,
+        "stat_metric": stat_metric,
+    }
 
     ds_archive = _load_waves_archive_ds()
     if ds_archive is None:
-        return empty_fig, empty_fig
+        return base
 
-    suffix = "A" if selected_epoch == "A" else "B"
     var_key = _param_var(parameter)
     is_warm = _param_is_warm(parameter)
     thr = _wave_season_thresholds(lat, lon, suffix, parameter)
     if not thr:
-        return empty_fig, empty_fig
+        return base
 
     if is_warm:
         p_t_ext, p_d_ext = thr[f"{var_key}_p95"], thr[f"{var_key}_p90"]
@@ -648,22 +602,12 @@ def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", thresho
         p_t_str, p_d_str = thr[f"{var_key}_p10"], thr[f"{var_key}_p25"]
 
     p_thresh, p_drop = (p_t_ext, p_d_ext) if "Extreme" in threshold_level else (p_t_str, p_d_str)
-    
-    if np.isnan(p_thresh) or np.isnan(p_drop): 
-        return empty_fig, empty_fig
+    if np.isnan(p_thresh) or np.isnan(p_drop):
+        return base
 
     df_season, group_key, diagnostics = _prepare_wave_season_df(lat, lon, parameter)
     if df_season.empty:
-        return empty_fig, empty_fig
-
-    if is_warm:
-        tick_vals, tick_text = [16, 46, 77, 107, 138], ["MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER"]
-        start_plot_x, end_plot_x = 1, 153
-        grid_lines = [1, 32, 62, 93, 124, 154]
-    else:
-        tick_vals, tick_text = [16, 46, 77, 107, 136], ["NOV", "DEC", "JAN", "FEB", "MAR"]
-        start_plot_x, end_plot_x = 1, 152
-        grid_lines = [1, 31, 62, 93, 121, 152]
+        return base
 
     # SUMMER-BUG FIX: _detect_kysely_waves() reindexes each season group onto
     # a full native Pandas date range internally, forcing clean date/day counting.
@@ -688,102 +632,42 @@ def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", thresho
         "n_waves_detected": int(len(waves_data)),
     }
 
-    fig_main = go.Figure()
+    payload = {
+        "empty": False,
+        "parameter": parameter,
+        "epoch": suffix,
+        "threshold_level": threshold_level,
+        "stat_metric": stat_metric,
+        "is_warm": is_warm,
+        "var_key": var_key,
+        # Wave table / ridge series: one dict per detected event (year, xs,
+        # temps, intensity, start_date, end_date, duration_days).
+        "waves_data": waves_data,
+        "group_key": group_key,
+        "p_thresh": p_thresh,
+        "p_drop": p_drop,
+        "p_t_ext": p_t_ext, "p_d_ext": p_d_ext,
+        "p_t_str": p_t_str, "p_d_str": p_d_str,
+        "epoch_years": thr["epoch_years"],
+        "debug_info": debug_info,
+    }
+
     start_year, end_year = 1940, 2026
-    y_ticks_vals = list(range(start_year, end_year + 1))
-    y_ticks_text = [str(y) if is_warm else f"{y-1}/{str(y)[2:]}" for y in y_ticks_vals]
-    
-    t_suff = "Heatwaves" if is_warm else "Coldwaves"
-    lvl_text = "Extreme Level (P95/5)" if "Extreme" in threshold_level else "Strong Level (P90/10)"
-    
-    fig_main.update_layout(
-        **plotly_typography(),
-        title=dict(
-            text=f"Duration and Intensity of Local {parameter} {t_suff} (1940–2026) | {lvl_text}<br><span style='font-size:11px;color:gray;'>Reference Period {'1961–1990' if suffix=='A' else '1996–2025'}</span>",
-            font=plotly_title_font(size=13),
-        ),
-        xaxis=dict(tickmode='array', tickvals=tick_vals, ticktext=tick_text, range=[start_plot_x, end_plot_x], showgrid=False, zeroline=False),
-        yaxis=dict(tickmode='array', tickvals=y_ticks_vals[::5], ticktext=y_ticks_text[::5], range=[2026.5, start_year - (5.0 if is_warm else 15.0)], showgrid=False, zeroline=False, showline=False),
-        height=750, plot_bgcolor='white', paper_bgcolor='white', margin=dict(l=55, r=20, t=50, b=40),
-        meta=debug_info,
-    )
-    
-    for gl in grid_lines: 
-        fig_main.add_vline(x=gl, line_width=1.2, line_color="rgba(30,30,30,0.6)", layer="below")
-    for yr in range(start_year, end_year + 1, 5): 
-        fig_main.add_hline(y=yr, line_width=0.7, line_color="rgba(100,100,100,0.4)", layer="below")
-        
-    if waves_data:
-        for w in waves_data:
-            y_base, w_xs, w_ts = w['year'], np.array(w['xs']), np.array(w['temps'])
-            cum_sum = np.cumsum(np.maximum(0, w_ts - p_thresh) if is_warm else np.maximum(0, p_thresh - w_ts))
-            
-            w_df = pd.DataFrame({'x': w_xs, 'y': cum_sum}).drop_duplicates(subset=['x']).sort_values('x')
-            w_xs, cum_sum = w_df['x'].values, w_df['y'].values
-            
-            if len(w_xs) >= 3:
-                x_fine = np.linspace(w_xs[0], w_xs[-1], WAVE_RIDGE_SPLINE_PTS)
-                y_fine = np.clip(make_interp_spline(w_xs, cum_sum, k=2)(x_fine), 0, None)
-                x_skewed = x_fine + (y_fine / (max(y_fine) if max(y_fine) > 0 else 1)) * WAVE_RIDGE_SKEW_FACTOR
-            else:
-                x_skewed, y_fine = w_xs, cum_sum
-
-            break_x, y_break = _wave_break_tail(x_skewed[-1], y_fine[-1])
-
-            x_full = np.concatenate(([x_skewed[0]], x_skewed, break_x, [break_x[-1]]))
-            y_full = np.concatenate(([0.0], y_fine, y_break, [0.0]))
-            y_coords = y_base - (y_full / WAVE_RIDGE_HEIGHT_SCALE)
-
-            cap = WAVE_INTENSITY_CAP_TX if is_warm else WAVE_INTENSITY_CAP_TN
-            norm_val = min(w['intensity'] / cap, 1.0)
-            (r_b, g_b, b_b), (r, g, b) = _wave_ridge_colors(parameter, norm_val)
-
-            sd_str, ed_str = pd.to_datetime(w['start_date']).strftime('%d.%m.'), pd.to_datetime(w['end_date']).strftime('%d.%m.%Y')
-            
-            fig_main.add_trace(go.Scatter(
-                x=x_full, y=y_coords, mode='lines',
-                line=dict(color=f"rgba({r},{g},{b},{WAVE_LINE_ALPHA})", width=WAVE_LINE_WIDTH, shape='spline'),
-                fill='toself',
-                fillgradient=dict(type='vertical', colorscale=[
-                    [0, f"rgba({r_b},{g_b},{b_b},{WAVE_FILL_ALPHA_BASE})"],
-                    [1, f"rgba({r},{g},{b},{WAVE_FILL_ALPHA_PEAK})"],
-                ]),
-                hoverinfo='text',
-                text=f"<b>Duration: {sd_str}–{ed_str}</b><br>Length: {len(w_xs)} days<br>Severity: {w['intensity']:.1f} K",
-                showlegend=False,
-            ))
-    else: 
-        fig_main.add_annotation(text="No wave events detected.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False, font=dict(size=16, color="gray", family=ATMOPULSE_FONTS["sora_css"]))
 
     if stat_metric == "Annual Cycle Frequency":
+        df_season = df_season.copy()
         df_season['is_str'] = (df_season['Temp'] >= p_t_str) if is_warm else (df_season['Temp'] <= p_t_str)
         df_season['is_ext'] = (df_season['Temp'] >= p_t_ext) if is_warm else (df_season['Temp'] <= p_t_ext)
         f_str = (df_season.groupby('plot_x')['is_str'].mean() * 100).rolling(5, center=True, min_periods=1).mean()
         f_ext = (df_season.groupby('plot_x')['is_ext'].mean() * 100).rolling(5, center=True, min_periods=1).mean()
-        
-        fig_stats = go.Figure()
-        if is_warm:
-            c_str, c_ext = ATMOPULSE_WARM["p90"], ATMOPULSE_WARM["p95"]
-        else:
-            c_str, c_ext = ATMOPULSE_COLD["p10"], ATMOPULSE_COLD["p5"]
-            
-        fig_stats.add_trace(go.Scatter(x=f_str.index, y=f_str.values, mode='lines', line=dict(color=c_str, width=2), name="Strong", hovertemplate='%{y:.1f}%<extra></extra>'))
-        fig_stats.add_trace(go.Scatter(x=f_ext.index, y=f_ext.values, mode='lines', line=dict(color=c_ext, width=2), name="Extreme", hovertemplate='%{y:.1f}%<extra></extra>'))
-        
-        fig_stats.update_layout(
-            **plotly_typography(), 
-            title=f"Annual Cycle Frequency (5-Day Smoothing) | Reference {'1961–1990' if suffix=='A' else '1996–2025'}", 
-            xaxis=dict(tickmode='array', tickvals=tick_vals, ticktext=tick_text, showgrid=True), 
-            yaxis_title="Relative Frequency (%)", 
-            height=350, template="plotly_white", 
-            margin=dict(t=40, b=10, l=10, r=10), 
-            legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5)
-        )
-        return fig_main, fig_stats
+        # Annual stats table (bar/trend panel) — mutually exclusive with the
+        # frequency series above, mirroring the original single-branch logic.
+        payload["freq_series"] = {"f_str": f_str, "f_ext": f_ext}
+        return payload
 
     stats = pd.DataFrame(index=np.arange(start_year, end_year + 1))
     stats['max_int'], stats['sum_int'], stats['total_heat'] = 0.0, 0.0, 0.0
-    
+
     for yr in stats.index:
         y_waves = [w for w in waves_data if w['year'] == yr]
         if y_waves:
@@ -792,47 +676,5 @@ def get_kiesely_waves_figs(lat, lon, parameter="TX", selected_epoch="B", thresho
         y_df = df_season[df_season[group_key] == yr]
         stats.loc[yr, 'total_heat'] = sum(t - p_thresh for t in y_df['Temp'] if t >= p_thresh) if is_warm else sum(p_thresh - t for t in y_df['Temp'] if t <= p_thresh)
 
-    col_map = {"Cumulative Annual Wave Intensity": 'sum_int', "Maximum Annual Wave Intensity": 'max_int', "Cumulative Heat/Cold Intensity": 'total_heat'}
-    sel_col = col_map.get(stat_metric, 'sum_int')
-    y_titles = {
-        'sum_int': 'Σ wave intensity (K·days)',
-        'max_int': 'Max wave intensity (K·days)',
-        'total_heat': f'Σ excess vs. threshold (K·days)',
-    }
-
-    fig_stats = go.Figure()
-    if is_warm:
-        bar_color, mean_color = "#E8A8A0", ATMOPULSE_WARM["p95"]
-    else:
-        bar_color, mean_color = "#9EC5E8", ATMOPULSE_COLD["p5"]
-
-    fig_stats.add_trace(go.Bar(
-        x=stats.index, y=stats[sel_col], marker_color=bar_color, name="Intensity",
-        hovertemplate='Year: %{x}<br>Value: %{y:.1f} K<extra></extra>',
-    ))
-    fig_stats.add_trace(go.Scatter(
-        x=stats.index, y=stats[sel_col].rolling(11, center=True).mean(), mode='lines',
-        line=dict(color=mean_color, width=2.5), name="11-yr Mean",
-        hovertemplate='Year: %{x}<br>11-year mean: %{y:.1f} K<extra></extra>',
-    ))
-
-    valid = stats[sel_col].dropna()
-    if len(valid) > 2:
-        z = np.polyfit(valid.index, valid.values, 1)
-        fig_stats.add_trace(go.Scatter(
-            x=valid.index, y=np.poly1d(z)(valid.index), mode='lines',
-            line=dict(color=mean_color, width=1.5, dash='dot'), name="Trend", hoverinfo='skip',
-        ))
-
-    fig_stats.update_layout(
-        **plotly_typography(),
-        title=f"{stat_metric} | Reference Period {'1961–1990' if suffix=='A' else '1996–2025'}",
-        height=350, template="plotly_white",
-        margin=dict(t=40, b=10, l=55, r=10),
-        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
-        xaxis=dict(showgrid=True, gridcolor="rgba(180,180,180,0.35)", gridwidth=1, dtick=10, zeroline=False),
-        yaxis=dict(title=y_titles.get(sel_col, "Intensity (K·days)"), showgrid=True, gridcolor="rgba(180,180,180,0.35)", gridwidth=1, zeroline=False),
-        bargap=0.15,
-    )
-
-    return fig_main, fig_stats
+    payload["annual_stats"] = stats
+    return payload

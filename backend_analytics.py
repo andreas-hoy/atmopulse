@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from backend_maps import etccdi_doy_365
+from backend_maps import _synoptic_array, etccdi_doy_365
 from backend_narrative import spatial_extreme_footprint
 from config import DATA_ROOT, TOP10_MASK_VERSION, TOP10_MIN_PCT, is_daily_map_view, selected_forecast_model
 
@@ -34,14 +34,6 @@ PRECOMPUTED_ANALYTICS_DIR: Path = DATA_ROOT / "Precomputed_Analytics"
 # with the Top-10 files. Any of the four is equally valid on read; this is
 # just the fixed one the lazy-loading wrapper below looks for.
 _FOOTPRINT_CACHE_THRESHOLD = "Strong"
-
-
-def _synoptic_array(field):
-    if field is None:
-        return None
-    if isinstance(field, np.ndarray):
-        return field
-    return np.asarray(getattr(field, "values", field))
 
 
 def _synoptic_temp_pair(map_phys_data):
