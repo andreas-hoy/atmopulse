@@ -13,7 +13,9 @@ Core functionalities:
 - Dynamically calculates seasonal climatological thresholds (P95, P90, P75 for JJA; 
   P5, P10, P25 for DJF) based on shifting reference periods (1961-1990 or 1996-2025).
 - Excises leap days (Feb 29th) to ensure statistical homoscedasticity per ETCCDI norms.
-- Identifies consecutive threshold exceedances and applies trailing tolerance drops.
+- Identifies consecutive threshold exceedances year-round (calendar year for
+  heatwaves, July–June for coldwaves) and applies trailing tolerance drops.
+  The ridge plot may crop the x-axis to a core season; that is display-only.
 """
 
 import json
@@ -142,6 +144,23 @@ WAVE_SYNOPTIC_VARS = ("z500",)
 # Wave-mean Z500 anomaly (dam) that counts as a supporting ridge (heat)
 # or trough (cold). Two map-tracker anomaly isolines (8 dam), not one.
 WAVE_Z500_RIDGE_DAM = 8.0
+# Detection windows (thresholds stay JJA / DJF). Display may crop to a
+# shorter core season in frontend_plots — that must not truncate events.
+WAVE_PLOT_X_MAX = 366
+
+
+def _wave_season_origin(yr: int, is_warm: bool) -> pd.Timestamp:
+    yr = int(yr)
+    if is_warm:
+        return pd.Timestamp(year=yr, month=1, day=1)
+    return pd.Timestamp(year=yr, month=7, day=1)
+
+
+def _wave_season_end(yr: int, is_warm: bool) -> pd.Timestamp:
+    yr = int(yr)
+    if is_warm:
+        return pd.Timestamp(year=yr, month=12, day=31)
+    return pd.Timestamp(year=yr + 1, month=6, day=30)
 
 
 def _decode_point_var(name: str, values) -> np.ndarray:
@@ -380,7 +399,8 @@ def _prepare_wave_season_df(lat, lon, parameter="TX", is_warm=None) -> tuple[pd.
     """
     Shared data-prep pipeline for Kyselý wave analytics: point extraction,
     Kelvin normalization, Feb-29 excision, true-24h daily resampling and
-    seasonal windowing (May-Sep for heatwaves, Nov-Mar for coldwaves).
+    year grouping (calendar year for heatwaves, July–June for coldwaves).
+    Detection is year-round; JJA/DJF percentiles stay the thresholds.
 
     Factored out so `compute_kysely_waves_data` (ridge-plot data) and
     the historical-rank lookup (`get_wave_historical_rank`) run the exact
@@ -420,15 +440,18 @@ def _prepare_wave_season_df(lat, lon, parameter="TX", is_warm=None) -> tuple[pd.
     df = df[df.index <= max_valid_date]
     df['year'], df['month'], df['date'] = df.index.year, df.index.month, df.index.normalize()
 
+    df_season = df.copy()
     if is_warm:
-        df_season = df[df['month'].isin([5, 6, 7, 8, 9])].copy()
         group_key = 'year'
-        df_season['plot_x'] = (df_season['date'] - pd.to_datetime(df_season['year'].astype(str) + '-05-01')).dt.days + 1
+        origins = pd.to_datetime(df_season['year'].astype(str) + '-01-01')
+        df_season['plot_x'] = (df_season['date'] - origins).dt.days + 1
     else:
-        df_season = df[df['month'].isin([11, 12, 1, 2, 3])].copy()
-        df_season['winter_year'] = np.where(df_season['month'] <= 3, df_season['year'] - 1, df_season['year'])
+        df_season['winter_year'] = np.where(
+            df_season['month'] >= 7, df_season['year'], df_season['year'] - 1,
+        )
         group_key = 'winter_year'
-        df_season['plot_x'] = (df_season['date'] - pd.to_datetime(df_season['winter_year'].astype(str) + '-11-01')).dt.days + 1
+        origins = pd.to_datetime(df_season['winter_year'].astype(str) + '-07-01')
+        df_season['plot_x'] = (df_season['date'] - origins).dt.days + 1
 
     diagnostics = {
         "var_key": var_key,
@@ -460,10 +483,9 @@ def _detect_kysely_waves(df_season: pd.DataFrame, group_key: str, p_thresh: floa
     for yr, group in df_season.groupby(group_key):
         group = group.drop_duplicates(subset=['date'], keep='first')
 
-        if is_warm:
-            full_dates = pd.date_range(f"{int(yr)}-05-01", f"{int(yr)}-09-30")
-        else:
-            full_dates = pd.date_range(f"{int(yr)}-11-01", f"{int(yr)+1}-03-31")
+        full_dates = pd.date_range(
+            _wave_season_origin(yr, is_warm), _wave_season_end(yr, is_warm),
+        )
 
         # 29 Feb stays on this index as a real calendar day (live rendering);
         # a coldwave streak crossing it is one continuous run, not a gap.
@@ -502,6 +524,13 @@ def _detect_kysely_waves(df_season: pd.DataFrame, group_key: str, p_thresh: floa
                 intensity = sum(abs(t - p_thresh) for t in cand_temps if ((t >= p_thresh) if is_warm else (t <= p_thresh)))
 
                 if intensity > 0 and len(cand_temps) >= 3:
+                    # Stable identity for the drill-down UI: (start, end) as
+                    # ISO date strings, not the trace/list index (which shifts
+                    # whenever the epoch, threshold or variable changes).
+                    event_id = (
+                        f"{pd.Timestamp(cand_dates[0]).date().isoformat()}_"
+                        f"{pd.Timestamp(cand_dates[-1]).date().isoformat()}"
+                    )
                     waves_data.append({
                         'year': yr,
                         'xs': cand_xs,
@@ -510,6 +539,7 @@ def _detect_kysely_waves(df_season: pd.DataFrame, group_key: str, p_thresh: floa
                         'start_date': cand_dates[0],
                         'end_date': cand_dates[-1],
                         'duration_days': len(cand_temps),
+                        'event_id': event_id,
                     })
                 i = j if j > i else i + 1
             else:
@@ -609,6 +639,36 @@ def _wave_day_frequency(waves_data, df_season, group_key, n_plot_x) -> pd.Series
         else:
             pct.append(100.0 * counts.get(x, 0) / n)
     return pd.Series(pct, index=idx).rolling(5, center=True, min_periods=1).mean()
+
+
+def rank_waves_by_metric(waves_data: list[dict], metric: str = "Intensity") -> list[dict]:
+    """Sorted copy of `waves_data` for the Point Wavogram drill-down: same
+    metric as the annual intensity-stack switch (Intensity = Kyselý K·days
+    excess, Days = duration_days), descending, ties broken by longer
+    duration then earlier start_date. Adds a 1-based 'rank' (over the full
+    list, not just the returned slice) to each copied dict.
+
+    Read-only w.r.t. `waves_data` / detection — this only reorders the
+    already-detected events for display, it does not call
+    `_detect_kysely_waves` again or change thresholds.
+    """
+    use_days = str(metric).lower().startswith("day")
+    key_field = "duration_days" if use_days else "intensity"
+
+    def _sort_key(w):
+        return (
+            -float(w.get(key_field, 0) or 0),
+            -float(w.get("duration_days", 0) or 0),
+            pd.Timestamp(w["start_date"]),
+        )
+
+    ordered = sorted(waves_data or [], key=_sort_key)
+    ranked = []
+    for i, w in enumerate(ordered, start=1):
+        w2 = dict(w)
+        w2["rank"] = i
+        ranked.append(w2)
+    return ranked
 
 
 def get_wave_historical_rank(
@@ -768,8 +828,17 @@ def compute_kysely_waves_data(lat, lon, parameter="TX", selected_epoch="B", thre
         "is_warm": is_warm,
         "var_key": var_key,
         # Wave table / ridge series: one dict per detected event (year, xs,
-        # temps, intensity, start_date, end_date, duration_days).
+        # temps, intensity, start_date, end_date, duration_days, event_id).
         "waves_data": waves_data,
+        # Raw daily series (indexed by calendar date, epoch-independent) for
+        # the drill-down mini-charts — lets them draw the +/-3 display days
+        # around an event without re-deriving season groups. Same 'Temp'
+        # column _detect_kysely_waves works from, just not reindexed/split
+        # into season blocks.
+        "daily_series": (
+            df_season.drop_duplicates(subset=["date"], keep="first")
+            .set_index("date")["Temp"]
+        ),
         "z500_ridge_dam": WAVE_Z500_RIDGE_DAM,
         "group_key": group_key,
         "p_thresh": p_thresh,
@@ -782,7 +851,7 @@ def compute_kysely_waves_data(lat, lon, parameter="TX", selected_epoch="B", thre
 
     start_year, end_year = 1940, 2026
 
-    n_plot_x = 153 if is_warm else 152
+    n_plot_x = WAVE_PLOT_X_MAX
     payload["freq_series"] = {
         "f_str": _wave_day_frequency(waves_str, df_season, group_key, n_plot_x),
         "f_ext": _wave_day_frequency(waves_ext, df_season, group_key, n_plot_x),

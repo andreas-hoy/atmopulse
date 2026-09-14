@@ -496,6 +496,10 @@ def synoptic_vars_for_map(
         wanted.append("mslp")
     if toggles.get("z500") or toggles.get("z500_anom"):
         wanted.append("z500")
+    if toggles.get("jet"):
+        # 300 hPa wind quiver overlay (Expert only, default off) -- both
+        # components are needed together or not at all.
+        wanted.extend(("u300", "v300"))
     if toggles.get("hatching") or view_mode == MAP_VIEW_PERSISTENCE:
         if code == "T850":
             wanted.append("t850")

@@ -62,7 +62,8 @@ NAV_ITEMS = (NAV_WELCOME, NAV_MAP, NAV_METEO, NAV_WAVE, NAV_METHODS, NAV_LEGAL)
 NAV_ANALYTICS = (NAV_MAP, NAV_METEO, NAV_WAVE)
 
 # Expert-only controls. Standard uses the defaults in STANDARD_DEFAULTS.
-# t850 / jet / utci are catalogued here and wired in a later step.
+# t850 / utci are catalogued here and wired in a later step. "jet" (300 hPa
+# wind quiver overlay, Map Tracker only) is wired.
 EXPERT_FEATURES = frozenset({
     "map_tx_tn",
     "persistence_view",
@@ -78,6 +79,7 @@ EXPERT_FEATURES = frozenset({
     "flicker_layout",
     "forecast_model",
     "meteo_wsdi_csdi",
+    "wave_annual_cycle",
 })
 
 SPELL_OFF = "Off"
@@ -106,6 +108,7 @@ STANDARD_DEFAULTS = {
     "spell_days": 6,
     "mslp": True,
     "z500": False,
+    "jet": False,
     "mslp_anom": False,
     "z500_anom": False,
     "meteo_var": "Mean Temp (TG)",

@@ -106,6 +106,17 @@ HELP: dict[str, str] = {
         "nearly vanish at the absolute-field step). Solid = ridge relative to that baseline, "
         "dashed = trough."
     ),
+    "jet_wind": (
+        "The jet core at 300 hPa (about 9 km height), from ERA5 (u/v) or the selected forecast "
+        "(IFS/AIFS) — not the full upper-level wind field. Shown as a shaded band wherever wind "
+        "speed reaches about 40 m/s, with thin numbered isolines at 40, 50, 60 m/s (and 70/80/90 "
+        "where the core is that fast) for the exact speed, plus a handful of short arrows inside "
+        "the band showing the flow direction only (their length is fixed, not a speed reading — "
+        "use the isolines for that). A weak, diffluent summer flow (e.g. over southern Europe) "
+        "can show no band, isolines or arrows at all — that is the correct reading, not missing "
+        "data. The jet marks the upper-level flow that steers surface highs/lows and can support "
+        "persistent heat or cold spells."
+    ),
     "top10_table": "Excludes territories under 3000 km² and countries located completely outside of Europe",
     "europe_share_table": (
         "Share of Europe at each cumulative severity level. "
@@ -135,13 +146,15 @@ HELP: dict[str, str] = {
 
     # --- Point Wavogram ---
     "wave_event_type": (
-        "Heatwaves: May–September events using the selected variable (default: daily maximum TX). "
+        "Heatwaves: detected year-round (1 Jan–31 Dec) using the selected variable (default: daily maximum TX). "
         "Triggered when the value exceeds the local summer (June–August) threshold for at least 3 consecutive days. "
         "The wave continues as long as the average remains above this threshold, and terminates immediately if a "
-        "single day drops below a secondary, lower tolerance threshold.\n\n"
-        "Coldwaves: November–March events using the selected variable (default: daily minimum TN). "
+        "single day drops below a secondary, lower tolerance threshold. "
+        "The ridge plot focuses on May–September and widens only when an event falls outside those months.\n\n"
+        "Coldwaves: detected from 1 July to 30 June using the selected variable (default: daily minimum TN). "
         "Triggered when the value falls below the local winter (December–February) threshold for at least 3 consecutive days. "
-        "It continues while the average remains below this threshold, and ends if a single day rises above the upper tolerance limit."
+        "It continues while the average remains below this threshold, and ends if a single day rises above the upper tolerance limit. "
+        "The ridge plot focuses on November–March and widens only when an event falls outside those months."
     ),
     "wave_variable": (
         "Temperature field used for Kyselý detection. Heatwaves default to daily maximum (TX); "
@@ -170,5 +183,23 @@ HELP: dict[str, str] = {
         "Optional purple outline on events whose mean 500 hPa height anomaly over the wave days is at least "
         "+8 dam (heat, Ridge) or −8 dam (cold, Trough) versus the same reference period used for the "
         "temperature thresholds."
+    ),
+    "wave_drilldown": (
+        "The five strongest events by the metric selected above (Intensity or Days), ranked over the full "
+        "detected record for the reference period chosen below. Each mini-chart shows the daily ERA5 values "
+        "around that event (±3 display days) with the two active percentile thresholds (main trigger: solid, "
+        "bold; drop tolerance: dotted, faded — same colour) and the detected event window shaded up to its "
+        "last in-wave day. Swap a slot below, or click a wave on the ridge plot above (best-effort — the "
+        "dropdown always works)."
+    ),
+    "wave_drilldown_epoch": (
+        "Which reference period's detected events are ranked and shown below — independent of which ridge/"
+        "intensity column you're looking at. Switching this resets all five slots to that period's new Top 5, "
+        "unless you've changed a slot manually."
+    ),
+    "wave_drilldown_slot": (
+        "Pick which detected event fills each mini-chart slot — labels show Rank, Start–End, Duration and "
+        "Intensity for every detected event. Switching Intensity ↔ Days resets all five slots to the new "
+        "Top 5, unless you've changed a slot manually — then your picks are kept and just re-ranked."
     ),
 }

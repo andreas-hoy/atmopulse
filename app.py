@@ -28,7 +28,7 @@ from geopy.exc import GeocoderServiceError, GeocoderTimedOut, GeocoderUnavailabl
 from geopy.geocoders import Nominatim
 
 from backend_maps import etccdi_doy_365
-from backend_waves import compute_kysely_waves_data, get_wave_historical_rank
+from backend_waves import compute_kysely_waves_data, rank_waves_by_metric
 from labels import HELP
 from atmopulse_theme import (
     ATMOPULSE_BRAND,
@@ -76,7 +76,12 @@ from config import (
 from frontend_widgets import render_grid_cell_profile
 from page_map_tracker import render_map_tracker
 from page_meteogram import render_meteogram
-from frontend_plots import st_plotly_press, align_wave_stats_yranges
+from frontend_plots import (
+    st_plotly_press,
+    align_wave_stats_yranges,
+    build_wave_event_mini_fig,
+    render_press_export,
+)
 
 
 # --- WAVE CACHE WRAPPER ---
@@ -95,13 +100,243 @@ def _compute_wave_payload(lat_target, lon_target, param_code, selected_epoch, wa
     )
 
 
-def fetch_wave_figs(lat_target, lon_target, param_code, selected_epoch, wave_thresh, is_warm=True, z500_outline=False, stack_metric="Intensity", z500_ctx=5):
+def fetch_wave_figs(lat_target, lon_target, param_code, selected_epoch, wave_thresh, is_warm=True, z500_outline=False, stack_metric="Intensity", z500_ctx=5, x_range=None):
     from frontend_plots import build_kysely_wave_figs
     payload = _compute_wave_payload(
         lat_target, lon_target, param_code, selected_epoch, wave_thresh,
         is_warm=is_warm, z500_ctx=z500_ctx,
     )
-    return build_kysely_wave_figs(payload, z500_outline=z500_outline, stack_metric=stack_metric)
+    return build_kysely_wave_figs(
+        payload, z500_outline=z500_outline, stack_metric=stack_metric, x_range=x_range,
+    )
+
+
+def fetch_aligned_wave_figs(
+    lat_target, lon_target, param_code, wave_thresh, is_warm=True,
+    z500_outline=False, stack_metric="Intensity", z500_ctx=5,
+):
+    """Build A/B wavograms on a shared x-window (core season, or expanded
+    when either baseline has a shoulder-month event)."""
+    from frontend_plots import build_kysely_wave_figs, union_wave_xrange
+    payload_a = _compute_wave_payload(
+        lat_target, lon_target, param_code, "A", wave_thresh,
+        is_warm=is_warm, z500_ctx=z500_ctx,
+    )
+    payload_b = _compute_wave_payload(
+        lat_target, lon_target, param_code, "B", wave_thresh,
+        is_warm=is_warm, z500_ctx=z500_ctx,
+    )
+    x_range = union_wave_xrange(payload_a, payload_b)
+    return (
+        build_kysely_wave_figs(
+            payload_a, z500_outline=z500_outline, stack_metric=stack_metric, x_range=x_range,
+        ),
+        build_kysely_wave_figs(
+            payload_b, z500_outline=z500_outline, stack_metric=stack_metric, x_range=x_range,
+        ),
+    )
+
+
+# --- Point Wavogram: Event Drill-down ---
+# Five swappable mini-charts under the ridge plot, above the intensity
+# stack. The swap dropdown's labels double as the event list (Rank, Start,
+# End, Duration, Intensity) — no separate table. Ranking/selection state
+# lives here (app.py); reads only the already-detected `waves_data` from
+# one of the A/B payloads — user-selectable via the in-block Reference
+# toggle (default: epoch "B") — no Kyselý-detection change, no
+# ridge-geometry change, no second stats chart.
+def _wave_event_label(w: dict) -> str:
+    # Rank, Start, End, Duration, Intensity — the compact event table used to
+    # show these as columns; now folded into the dropdown label itself since
+    # it duplicated the same information (user feedback).
+    sd = pd.Timestamp(w["start_date"]).strftime("%d.%m.%Y")
+    ed = pd.Timestamp(w["end_date"]).strftime("%d.%m.%Y")
+    rank = w.get("rank")
+    prefix = f"#{rank} \u00b7 " if rank else ""
+    return f"{prefix}{sd}\u2013{ed} \u00b7 {int(w['duration_days'])} d \u00b7 {float(w['intensity']):.1f} K"
+
+
+def _wave_section_spacer(px: int = 28) -> None:
+    # Purely visual breathing room between the stacked wave sections
+    # (ridge -> drill-down -> intensity -> frequency) — no divider line,
+    # just vertical margin, so the sections read as distinct blocks.
+    st.markdown(f"<div style='margin-top:{px}px'></div>", unsafe_allow_html=True)
+
+
+def _render_wave_drilldown(payload_a, payload_b, stack_metric, ctx_key, click_events=()):
+    payloads = {"A": payload_a, "B": payload_b}
+    avail_epochs = [
+        ep for ep in ("A", "B")
+        if payloads.get(ep) and not payloads[ep].get("empty") and payloads[ep].get("waves_data")
+    ]
+    if not avail_epochs:
+        return  # no waves in either reference period: the existing empty-state elsewhere already covers this
+    _wave_section_spacer()
+
+    # Which reference period's events get ranked/shown here — independent of
+    # the ridge/intensity column layout (both A and B are always visible in
+    # Side-by-Side); defaults to B (Recent) to match the old fixed behaviour.
+    ep_key = "wave_drill_epoch"
+    default_epoch = "B" if "B" in avail_epochs else avail_epochs[0]
+    epoch = st.session_state.get(ep_key, default_epoch)
+    if epoch not in avail_epochs:
+        epoch = default_epoch
+
+    head_col, toggle_col = st.columns([3, 2])
+    with head_col:
+        st.markdown(
+            f"**Event Drill-down** \u00b7 Reference: {epoch_period_label(epoch)}",
+            help=HELP["wave_drilldown"],
+        )
+    if len(avail_epochs) > 1:
+        with toggle_col:
+            ep_labels = [epoch_period_label(ep) for ep in avail_epochs]
+            chosen_label = st.radio(
+                "Ranking basis:", ep_labels, index=avail_epochs.index(epoch),
+                horizontal=True, key=f"{ep_key}_radio", label_visibility="collapsed",
+                help=HELP["wave_drilldown_epoch"],
+            )
+            epoch = avail_epochs[ep_labels.index(chosen_label)]
+    st.session_state[ep_key] = epoch
+    payload_b = payloads[epoch]  # reuse the name below — rest of the function is unchanged
+
+    ranked = rank_waves_by_metric(payload_b["waves_data"], stack_metric)
+    id_lookup = {w["event_id"]: w for w in ranked}
+    n_total = len(ranked)
+    top_ids = [w["event_id"] for w in ranked[:5]]
+
+    ms_key = "wave_drill_ms"
+    # The reference-period toggle is folded into the reset context, same as
+    # location/warm-cold/threshold: switching it means a different set of
+    # detected events, so manual slot picks from the other period don't
+    # carry over as stale event_ids.
+    full_ctx = (ctx_key, epoch)
+    prev_ctx = st.session_state.get("wave_drill_ctx")
+    prev_metric = st.session_state.get("wave_drill_metric")
+    manual = bool(st.session_state.get("wave_drill_manual", False))
+
+    def _set_selection(ids):
+        st.session_state[ms_key] = [_wave_event_label(id_lookup[i]) for i in ids if i in id_lookup]
+
+    # Location / Heat<->Cold / Strong<->Extreme / Reference period (baked
+    # into full_ctx) always reset to Top 5. Intensity<->Days only resets
+    # Top 5 if the user hasn't touched a slot yet; otherwise the picks are
+    # kept, just re-ranked.
+    if prev_ctx != full_ctx:
+        manual = False
+        _set_selection(top_ids)
+    elif prev_metric != stack_metric and not manual:
+        _set_selection(top_ids)
+
+    # Best-effort click-to-swap from the ridge plot(s): replaces the
+    # currently-weakest slot unless the clicked event is already selected.
+    # Wrapped defensively — an empty/odd selection payload must never crash
+    # the page; the dropdown below always works regardless.
+    #
+    # IMPORTANT: a Plotly `on_select="rerun"` selection is sticky — it stays
+    # in session_state and gets returned again on every later, unrelated
+    # rerun (e.g. a dropdown pick), not just the run where the user actually
+    # clicked. Without the per-widget "last seen" signature below, that
+    # stale click would be reprocessed on every rerun and silently overwrite
+    # whatever the user had just picked in the dropdown.
+    try:
+        current_ids = [
+            i for i in st.session_state.get("wave_drill_ids", top_ids) if i in id_lookup
+        ] or top_ids
+        for click_key, ev in click_events:
+            pts = None
+            if isinstance(ev, dict):
+                pts = (ev.get("selection") or {}).get("points")
+            elif ev is not None:
+                pts = getattr(getattr(ev, "selection", None), "points", None)
+            if not pts:
+                continue
+            clicked_id = (pts[0] or {}).get("customdata") if isinstance(pts[0], dict) else getattr(pts[0], "customdata", None)
+            if isinstance(clicked_id, (list, tuple)):
+                clicked_id = clicked_id[0] if clicked_id else None
+            seen_key = f"_wave_click_seen_{click_key}"
+            if clicked_id == st.session_state.get(seen_key):
+                continue  # same click as last time we looked — already handled, not a new interaction
+            st.session_state[seen_key] = clicked_id
+            if not clicked_id or clicked_id not in id_lookup or clicked_id in current_ids:
+                continue
+            if len(current_ids) < 5:
+                current_ids = current_ids + [clicked_id]
+            else:
+                weakest = max(current_ids, key=lambda i: id_lookup[i]["rank"])
+                current_ids = [clicked_id if i == weakest else i for i in current_ids]
+            _set_selection(current_ids)
+            manual = True
+            break
+    except Exception:
+        pass
+
+    st.session_state.wave_drill_ctx = full_ctx
+    st.session_state.wave_drill_metric = stack_metric
+
+    all_labels = [_wave_event_label(w) for w in ranked]
+    label_to_id = {_wave_event_label(w): w["event_id"] for w in ranked}
+    selected_labels = st.multiselect(
+        "Swap slots:", all_labels, max_selections=5,
+        key=ms_key, help=HELP["wave_drilldown_slot"],
+    )
+    selected_ids = [label_to_id[lbl] for lbl in selected_labels if lbl in label_to_id]
+    if not selected_ids:
+        selected_ids = top_ids
+    st.session_state.wave_drill_ids = selected_ids
+    st.session_state.wave_drill_manual = manual or (set(selected_ids) != set(top_ids))
+
+    selected_waves = sorted(
+        (id_lookup[i] for i in selected_ids if i in id_lookup),
+        key=lambda w: w["rank"],
+    )
+    if selected_waves:
+        # Shared y-scale across the displayed mini-charts (union of their
+        # padded daily windows + the two threshold lines), so severity is
+        # visually comparable slot-to-slot instead of each auto-scaling.
+        daily = payload_b.get("daily_series")
+        y_vals = []
+        if daily is not None and len(daily):
+            for w in selected_waves:
+                pad_start = pd.Timestamp(w["start_date"]).normalize() - pd.Timedelta(days=3)
+                pad_end = pd.Timestamp(w["end_date"]).normalize() + pd.Timedelta(days=3)
+                window = daily[(daily.index >= pad_start) & (daily.index <= pad_end)]
+                if len(window):
+                    finite = window.values[np.isfinite(window.values)]
+                    if finite.size:
+                        y_vals.extend([float(np.min(finite)), float(np.max(finite))])
+        for v in (payload_b.get("p_thresh"), payload_b.get("p_drop")):
+            if v is not None and np.isfinite(v):
+                y_vals.append(float(v))
+        y_range = None
+        if y_vals:
+            y_min, y_max = min(y_vals), max(y_vals)
+            pad = max(1.0, (y_max - y_min) * 0.08)
+            y_range = (y_min - pad, y_max + pad)
+
+        mini_cols = st.columns(len(selected_waves))
+        for col, w in zip(mini_cols, selected_waves):
+            with col:
+                mini_fig = build_wave_event_mini_fig(payload_b, w, n_total, y_range=y_range)
+                st.plotly_chart(
+                    mini_fig, use_container_width=True, key=f"wave_mini_{w['event_id']}",
+                )
+                # Same compact SVG/PDF/CSV row as every other AtmoPulse
+                # figure, per event — not one combined export for all 5
+                # (different date ranges per slot don't share one CSV/SVG).
+                csv_text = None
+                daily = payload_b.get("daily_series")
+                if daily is not None and len(daily):
+                    pad_start = pd.Timestamp(w["start_date"]).normalize() - pd.Timedelta(days=3)
+                    pad_end = pd.Timestamp(w["end_date"]).normalize() + pd.Timedelta(days=3)
+                    window = daily[(daily.index >= pad_start) & (daily.index <= pad_end)]
+                    if len(window):
+                        csv_text = pd.DataFrame({
+                            "date": window.index.strftime("%Y-%m-%d"),
+                            "value": window.values,
+                        }).to_csv(index=False)
+                render_press_export(mini_fig, f"wavogram_event_{w['event_id']}", csv_text=csv_text)
+    _wave_section_spacer()
 
 # --- UI & CSS: TOP NAVIGATION BAR ---
 st.set_page_config(page_title="AtmoPulse", layout="wide", page_icon="assets/favicon.svg", initial_sidebar_state="expanded")
@@ -441,6 +676,18 @@ with st.sidebar:
                     )
                 else:
                     toggles["z500"] = STANDARD_DEFAULTS["z500"]
+                if show_expert("jet"):
+                    # Leading word-joiner: see the Z500 checkbox above --
+                    # otherwise Streamlit renders a label starting with a
+                    # digit as a numbered list item at a larger font size.
+                    toggles["jet"] = st.checkbox(
+                        "\u200b300 hPa jet",
+                        value=STANDARD_DEFAULTS["jet"],
+                        help=HELP["jet_wind"],
+                        key="map_overlay_jet",
+                    )
+                else:
+                    toggles["jet"] = STANDARD_DEFAULTS["jet"]
                 if show_expert("synoptic_anomalies"):
                     toggles["mslp_anom"] = st.checkbox(
                         "Sea-level pressure anomaly",
@@ -539,9 +786,9 @@ if nav_selection == NAV_WELCOME:
     In the **Map Tracker** tab, you can visualize this through the **Persistence duration** layer, showing how many consecutive days an extreme has lasted (unbroken run back from the map date, up to 100 days). Daily maps can optionally show a **warm/cold spell** overlay for 6, 15 or 30 consecutive days (off by default; enable it in the sidebar). 6 days matches the WSDI/CSDI definition.
     <br><br>
     #### Local Wave Definitions
-    In the **Point Wavogram** tab, {atmopulse_wordmark_html()} uses a sophisticated definition (adapted from Kyselý) to track seasonally-bound heatwaves and coldwaves:
-    * **Heatwaves:** Triggered when the daily maximum temperature (TX) exceeds the local summer (June–August) threshold for at least 3 consecutive days. 
-    * **Coldwaves:** Triggered when the daily minimum temperature (TN) falls below the local winter (December–February) threshold for at least 3 consecutive days.
+    In the **Point Wavogram** tab, {atmopulse_wordmark_html()} uses a sophisticated definition (adapted from Kyselý) to track heatwaves and coldwaves:
+    * **Heatwaves:** Detected year-round. Triggered when the daily maximum temperature (TX) exceeds the local summer (June–August) threshold for at least 3 consecutive days. The ridge focuses on May–September and widens if an event falls outside those months.
+    * **Coldwaves:** Detected from 1 July to 30 June. Triggered when the daily minimum temperature (TN) falls below the local winter (December–February) threshold for at least 3 consecutive days. The ridge focuses on November–March and widens if an event falls outside those months.
     """, unsafe_allow_html=True)
     
     img_col1, img_col2 = st.columns(2)
@@ -639,31 +886,27 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
             else:
                 with st.spinner("Generating Historical Waves..."):
                     param_code = meteo_var_code(wave_var)
-                    fig_m_a, fig_s_a, fig_f_a = fetch_wave_figs(
-                        lat_target, lon_target, param_code, "A", wave_thresh,
+                    (fig_m_a, fig_s_a, fig_f_a), (fig_m_b, fig_s_b, fig_f_b) = fetch_aligned_wave_figs(
+                        lat_target, lon_target, param_code, wave_thresh,
                         is_warm=is_warm, z500_outline=wave_z500_outline,
                         stack_metric=wave_stack_metric,
                     )
-                    fig_m_b, fig_s_b, fig_f_b = fetch_wave_figs(
-                        lat_target, lon_target, param_code, "B", wave_thresh,
-                        is_warm=is_warm, z500_outline=wave_z500_outline,
-                        stack_metric=wave_stack_metric,
+                    # A/B payloads for the Event Drill-down ranking/mini-charts
+                    # (user can toggle which reference period is ranked). Same
+                    # cached `_compute_wave_payload` fetch_aligned_wave_figs
+                    # already calls above, so these are cache hits, not extra
+                    # compute.
+                    wave_payload_a = _compute_wave_payload(
+                        lat_target, lon_target, param_code, "A", wave_thresh, is_warm=is_warm,
                     )
+                    wave_payload_b = _compute_wave_payload(
+                        lat_target, lon_target, param_code, "B", wave_thresh, is_warm=is_warm,
+                    )
+                    wave_drill_ctx = (lat_target, lon_target, is_warm, param_code, wave_thresh)
 
-                # STATIC vs. UI overlay state: always ranks against the full 1940-present
-                # ERA5 record, independent of the Side-by-Side / Flicker layout selected above.
-                wave_rank_info = get_wave_historical_rank(
-                    lat_target, lon_target, parameter=param_code,
-                    selected_epoch="B", threshold_level=wave_thresh,
-                    is_warm=is_warm,
-                )
-                if wave_rank_info is not None:
-                    wave_rank_text = (
-                        f"The area of {location.address} is currently experiencing its "
-                        f"{wave_rank_info['rank_ordinal']} longest {wave_rank_info['severity']} "
-                        f"{wave_rank_info['wave_type']} since the start of the ERA5 record in 1940."
-                    )
-                    st.markdown(f"**{wave_rank_text}**")
+                # The old "Nth longest wave since 1940" rank banner was removed:
+                # the Event Drill-down table below already shows Rank, Start,
+                # End, Duration and Intensity for every detected event.
 
                 if fig_s_a.data and fig_s_b.data:
                     align_wave_stats_yranges(fig_s_a, fig_s_b, fig_f_a, fig_f_b)
@@ -677,29 +920,59 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                 if map_layout == LAYOUT_SIDE_BY_SIDE:
                     w_col1, w_col2 = st.columns(2)
                     with w_col1:
-                        st_plotly_press(fig_m_a, "wavogram_ridge_historical")
+                        click_a = st_plotly_press(
+                            fig_m_a, "wavogram_ridge_historical",
+                            on_select="rerun", selection_mode=("points",), key="wave_ridge_click_a",
+                        )
+                    with w_col2:
+                        click_b = st_plotly_press(
+                            fig_m_b, "wavogram_ridge_recent",
+                            on_select="rerun", selection_mode=("points",), key="wave_ridge_click_b",
+                        )
+                    # One Event Drill-down block under both ridges, not a
+                    # 5+5 split — a Reference-period toggle inside picks
+                    # which epoch's events are ranked/shown (default: B).
+                    _render_wave_drilldown(
+                        wave_payload_a, wave_payload_b, wave_stack_metric, wave_drill_ctx,
+                        click_events=(
+                            ("wave_ridge_click_a", click_a),
+                            ("wave_ridge_click_b", click_b),
+                        ),
+                    )
+                    # Fresh column pair for the stack row: reusing w_col1/
+                    # w_col2 here would silently push the drill-down block
+                    # (written above, outside those columns) below BOTH
+                    # column blocks — Streamlit renders everything ever
+                    # written into a given `st.columns()` pair as one
+                    # contiguous row wherever that pair was first created,
+                    # so it can't be interleaved with content in between.
+                    st_col1, st_col2 = st.columns(2)
+                    with st_col1:
                         st.markdown(
                             f"**{stack_heading} | {epoch_period_label('A')}**",
                             help=HELP["wave_annual_stack"],
                         )
                         st_plotly_press(fig_s_a, "wavogram_stats_historical")
-                        st.markdown(
-                            f"**Frequency [%] | {epoch_period_label('A')}**",
-                            help=HELP["wave_annual_cycle"],
-                        )
-                        st_plotly_press(fig_f_a, "wavogram_freq_historical")
-                    with w_col2:
-                        st_plotly_press(fig_m_b, "wavogram_ridge_recent")
+                        if show_expert("wave_annual_cycle"):
+                            _wave_section_spacer()
+                            st.markdown(
+                                f"**Frequency [%] | {epoch_period_label('A')}**",
+                                help=HELP["wave_annual_cycle"],
+                            )
+                            st_plotly_press(fig_f_a, "wavogram_freq_historical")
+                    with st_col2:
                         st.markdown(
                             f"**{stack_heading} | {epoch_period_label('B')}**",
                             help=HELP["wave_annual_stack"],
                         )
                         st_plotly_press(fig_s_b, "wavogram_stats_recent")
-                        st.markdown(
-                            f"**Frequency [%] | {epoch_period_label('B')}**",
-                            help=HELP["wave_annual_cycle"],
-                        )
-                        st_plotly_press(fig_f_b, "wavogram_freq_recent")
+                        if show_expert("wave_annual_cycle"):
+                            _wave_section_spacer()
+                            st.markdown(
+                                f"**Frequency [%] | {epoch_period_label('B')}**",
+                                help=HELP["wave_annual_cycle"],
+                            )
+                            st_plotly_press(fig_f_b, "wavogram_freq_recent")
                 else:
                     flicker_epoch = st.radio(
                         "Select Reference Period:",
@@ -708,17 +981,26 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                     )
                     use_a = epoch_from_label(flicker_epoch) == "A"
                     ep = "A" if use_a else "B"
-                    st_plotly_press(fig_m_a if use_a else fig_m_b, f"wavogram_ridge_{ep}")
+                    click_ep = st_plotly_press(
+                        fig_m_a if use_a else fig_m_b, f"wavogram_ridge_{ep}",
+                        on_select="rerun", selection_mode=("points",), key=f"wave_ridge_click_{ep}",
+                    )
+                    _render_wave_drilldown(
+                        wave_payload_a, wave_payload_b, wave_stack_metric, wave_drill_ctx,
+                        click_events=((f"wave_ridge_click_{ep}", click_ep),),
+                    )
                     st.markdown(
                         f"**{stack_heading} | {epoch_period_label(ep)}**",
                         help=HELP["wave_annual_stack"],
                     )
                     st_plotly_press(fig_s_a if use_a else fig_s_b, f"wavogram_stats_{ep}")
-                    st.markdown(
-                        f"**Frequency [%] | {epoch_period_label(ep)}**",
-                        help=HELP["wave_annual_cycle"],
-                    )
-                    st_plotly_press(fig_f_a if use_a else fig_f_b, f"wavogram_freq_{ep}")
+                    if show_expert("wave_annual_cycle"):
+                        _wave_section_spacer()
+                        st.markdown(
+                            f"**Frequency [%] | {epoch_period_label(ep)}**",
+                            help=HELP["wave_annual_cycle"],
+                        )
+                        st_plotly_press(fig_f_a if use_a else fig_f_b, f"wavogram_freq_{ep}")
 
                 if show_expert("z500") and wave_z500_outline:
                     st.caption(HELP["wave_z500_outline"])
