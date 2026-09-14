@@ -120,6 +120,16 @@ def _harmonize_master_batch(ds: xr.Dataset) -> xr.Dataset:
     ds = drop_era5t_aux(ds)
     if "pressure_level" in ds.dims and ds.sizes.get("pressure_level", 0) == 1:
         ds = ds.squeeze("pressure_level", drop=True)
+    # Some era5_master_daily_{year}.nc batches (older generations of the
+    # download script) still carry the raw GRIB short names instead of the
+    # harmonized tx/tn — backend_io.py's point-series readers already
+    # compensate for this (see its own mx2t/mn2t rename), but this map-grid
+    # loader did not, which silently produced an all-missing TX/TN map for
+    # those years while TG/T850 (never renamed) loaded fine.
+    if "mx2t" in ds.data_vars and "tx" not in ds.data_vars:
+        ds = ds.rename({"mx2t": "tx"})
+    if "mn2t" in ds.data_vars and "tn" not in ds.data_vars:
+        ds = ds.rename({"mn2t": "tn"})
     return ds
 
 
@@ -299,6 +309,24 @@ def _drop_duplicates_time(ds: xr.Dataset, keep: str = "last") -> xr.Dataset:
 # today through the forecast. Historical maps/meteograms/wavograms stay on
 # era5_master_daily_YYYY.nc.
 LIVE_OVERLAY_PAST_DAYS = 6
+
+
+def latest_era5_archive_date() -> pd.Timestamp:
+    """Latest calendar day the Map Tracker's Archive date picker may offer.
+
+    Kept comfortably clear of the IFS/AIFS live-forecast overlay window
+    (LIVE_OVERLAY_PAST_DAYS, but never less than 10 days back from today) so
+    an "Archive" pick never lands inside the hybrid live window, and capped
+    to a day that actually falls inside an on-disk era5_master_daily_{year}.nc
+    (steps back to 31 Dec of the closest earlier year that has one otherwise).
+    Best-effort only: get_synoptic_map_data()'s own "no data" warning is the
+    real safety net if this day still turns out to be missing/incomplete.
+    """
+    cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=max(LIVE_OVERLAY_PAST_DAYS, 10))
+    for year in range(cutoff.year, 1939, -1):
+        if (DATA_DIR / f"era5_master_daily_{year}.nc").exists():
+            return cutoff if year == cutoff.year else pd.Timestamp(year=year, month=12, day=31)
+    return cutoff
 
 
 def etccdi_is_feb29(dates) -> np.ndarray:

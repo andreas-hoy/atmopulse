@@ -27,7 +27,7 @@ from datetime import datetime
 from geopy.exc import GeocoderServiceError, GeocoderTimedOut, GeocoderUnavailable
 from geopy.geocoders import Nominatim
 
-from backend_maps import etccdi_doy_365
+from backend_maps import etccdi_doy_365, latest_era5_archive_date
 from backend_waves import compute_kysely_waves_data, rank_waves_by_metric
 from labels import HELP
 from atmopulse_theme import (
@@ -444,6 +444,21 @@ def sub_day():
     if st.session_state.offset_slider > FORECAST_OFFSET_MIN:
         st.session_state.offset_slider -= 1
 
+def _shift_map_archive_date(days: int):
+    current = st.session_state.get("map_archive_date")
+    if current is None:
+        return
+    min_d = pd.Timestamp(1940, 1, 1).date()
+    max_d = latest_era5_archive_date().date()
+    new_d = (pd.Timestamp(current) + pd.Timedelta(days=days)).date()
+    st.session_state.map_archive_date = min(max(new_d, min_d), max_d)
+
+def map_archive_prev_day():
+    _shift_map_archive_date(-1)
+
+def map_archive_next_day():
+    _shift_map_archive_date(1)
+
 def toggle_warm_state():
     current = any(st.session_state.toggles_warm.values())
     for k in st.session_state.toggles_warm: 
@@ -520,12 +535,55 @@ with st.sidebar:
     )
     if nav_selection in NAV_ANALYTICS:
         st.header("Control Panel")
+
+        # --- Map Tracker only: Live vs. a single historical ERA5 calendar
+        # day ("Archive"). Map-local state (map_archive_mode / map_archive_date
+        # widget keys below) — independent of the Meteogram Archive Year
+        # (met_archive_year, untouched) and of the Forecast Offset slider:
+        # picking an Archive date here never writes offset_slider, and the
+        # Wavogram/Meteogram never see this block (nav_selection-gated).
+        map_is_archive = False
+        if nav_selection == NAV_MAP:
+            st.radio(
+                "Map date:",
+                ("Live", "Date"),
+                horizontal=True,
+                key="map_archive_mode",
+                help=HELP["map_archive_date"],
+            )
+            map_is_archive = st.session_state.get("map_archive_mode") == "Date"
+            if map_is_archive:
+                _max_archive = latest_era5_archive_date().date()
+                _default_archive = min(st.session_state.get("map_archive_date", _max_archive), _max_archive)
+                st.date_input(
+                    "Archive date:",
+                    value=_default_archive,
+                    min_value=pd.Timestamp(1940, 1, 1).date(),
+                    max_value=_max_archive,
+                    key="map_archive_date",
+                )
+                _arch_col1, _arch_col2 = st.columns(2)
+                with _arch_col1:
+                    st.button(
+                        "← Prev Day", key="map_archive_prev_btn",
+                        on_click=map_archive_prev_day, use_container_width=True,
+                        disabled=st.session_state.map_archive_date <= pd.Timestamp(1940, 1, 1).date(),
+                    )
+                with _arch_col2:
+                    st.button(
+                        "Next Day →", key="map_archive_next_btn",
+                        on_click=map_archive_next_day, use_container_width=True,
+                        disabled=st.session_state.map_archive_date >= _max_archive,
+                    )
+            st.markdown("---")
+
         if show_expert("forecast_model"):
             st.radio(
                 "Forecast Model",
                 FORECAST_MODEL_OPTIONS,
                 key="forecast_model",
                 help=HELP["forecast_model"],
+                disabled=map_is_archive,
             )
         else:
             st.session_state.forecast_model = FORECAST_MODEL_IFS
@@ -537,27 +595,38 @@ with st.sidebar:
             help=HELP["data_vintage"],
         )
 
-        st.slider("Forecast Offset (Days):", FORECAST_OFFSET_MIN, FORECAST_OFFSET_MAX, key="offset_slider", help=HELP["forecast_offset"])
-        # Native -7 / +3 tick labels are forced permanently visible via CSS
-        # (.st-key-offset_slider in atmopulse_theme.py); we just add the
-        # missing midpoint here, styled identically (0 sits at 70% of -7..3).
-        _zero_pct = (0 - FORECAST_OFFSET_MIN) / (FORECAST_OFFSET_MAX - FORECAST_OFFSET_MIN) * 100
-        st.markdown(
-            f"""
-            <div style='position: relative; width: 100%; height: 16px; margin-top: -20px; margin-bottom: 6px;'>
-                <span class='atmopulse-slider-zero' style='position: absolute; left: {_zero_pct}%; transform: translateX(-50%);'>0</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        btn_col1, btn_col2 = st.columns(2)
-        with btn_col1: 
-            st.button("← Prev Day", on_click=sub_day, use_container_width=True)
-        with btn_col2: 
-            st.button("Next Day →", on_click=add_day, use_container_width=True)
-        
-        target_date = default_date + pd.Timedelta(days=st.session_state.offset_slider)
-        st.info(f"Target Date: **{target_date.strftime('%d.%m.%Y')}**")
+        # Forecast Offset / Prev-Next-Day step the LIVE target date only.
+        # An active Map Archive date ignores the offset entirely (chosen
+        # variant: offset controls disabled rather than re-purposed to step
+        # the archive date, so the Live slider is never silently bent).
+        if map_is_archive:
+            st.caption("Forecast Offset is inactive while a Map Archive date is selected above.")
+        else:
+            st.slider("Forecast Offset (Days):", FORECAST_OFFSET_MIN, FORECAST_OFFSET_MAX, key="offset_slider", help=HELP["forecast_offset"])
+            # Native -7 / +3 tick labels are forced permanently visible via CSS
+            # (.st-key-offset_slider in atmopulse_theme.py); we just add the
+            # missing midpoint here, styled identically (0 sits at 70% of -7..3).
+            _zero_pct = (0 - FORECAST_OFFSET_MIN) / (FORECAST_OFFSET_MAX - FORECAST_OFFSET_MIN) * 100
+            st.markdown(
+                f"""
+                <div style='position: relative; width: 100%; height: 16px; margin-top: -20px; margin-bottom: 6px;'>
+                    <span class='atmopulse-slider-zero' style='position: absolute; left: {_zero_pct}%; transform: translateX(-50%);'>0</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            btn_col1, btn_col2 = st.columns(2)
+            with btn_col1: 
+                st.button("← Prev Day", on_click=sub_day, use_container_width=True)
+            with btn_col2: 
+                st.button("Next Day →", on_click=add_day, use_container_width=True)
+
+        if map_is_archive:
+            target_date = pd.Timestamp(st.session_state.map_archive_date)
+            st.info(f"Archive Date: **{target_date.strftime('%d.%m.%Y')}** (ERA5 master)")
+        else:
+            target_date = default_date + pd.Timedelta(days=st.session_state.offset_slider)
+            st.info(f"Target Date: **{target_date.strftime('%d.%m.%Y')}**")
         
         toggles = {}
         
@@ -806,7 +875,11 @@ if nav_selection == NAV_WELCOME:
             st.caption("Cold example image not found in Documents/.")
 
 elif nav_selection == NAV_MAP:
-    render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold, toggles, target_date, default_date)
+    render_map_tracker(
+        map_var_code, view_mode, persist_metric, top10_threshold, toggles, target_date, default_date,
+        map_is_archive=map_is_archive,
+        map_anchor_date=(target_date if map_is_archive else default_date),
+    )
 
 elif nav_selection in (NAV_METEO, NAV_WAVE):
     st.subheader("🏙️ Target Location")

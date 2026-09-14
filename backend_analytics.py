@@ -37,23 +37,43 @@ _FOOTPRINT_CACHE_THRESHOLD = "Strong"
 
 
 def _synoptic_temp_pair(map_phys_data):
-    """TX/TN arrays for the map renderer; fall back to TG when extremes are absent (AIFS)."""
+    """TX/TN arrays for the map renderer, resolved INDEPENDENTLY.
+
+    The Map Tracker's per-variable data fetch (`synoptic_vars_for_map`)
+    only loads the field(s) an actual view needs — a TX-only view fetches
+    "tx" alone, never "tn" — so requiring both to be present together (the
+    previous behaviour) wrongly blanked single-variable TX/TN views
+    whenever the other, unrequested field wasn't in `map_phys_data`.
+
+    Each side now falls back to TG only for ITSELF when missing (AIFS has
+    no native diurnal extremes, so this only ever substitutes for an
+    IFS/ERA5 gap), and is `None` only when neither that side nor TG is
+    available at all — no other fabricated substitute. Callers must check
+    only the specific side(s) their `map_var` actually needs, via
+    `_temp_pair_missing()`, not assume both are always populated together.
+    """
     tx = map_phys_data.get("tx")
     tn = map_phys_data.get("tn")
-    if tx is not None and tn is not None:
-        return _synoptic_array(tx), _synoptic_array(tn)
     tg = map_phys_data.get("tg")
-    if tg is not None:
-        arr = _synoptic_array(tg)
-        return arr, arr
-    sample = next(
-        (map_phys_data[k] for k in ("mslp", "z500", "t850", "tg", "tx") if k in map_phys_data),
-        None,
-    )
-    if sample is None:
-        return None, None
-    nan = np.full(np.asarray(getattr(sample, "values", sample)).shape, np.nan)
-    return nan, nan
+    tg_arr = _synoptic_array(tg) if tg is not None else None
+    tx_arr = _synoptic_array(tx) if tx is not None else tg_arr
+    tn_arr = _synoptic_array(tn) if tn is not None else tg_arr
+    return tx_arr, tn_arr
+
+
+def _temp_pair_missing(map_var: str, tx_curr, tn_curr) -> bool:
+    """True when the side(s) of `_synoptic_temp_pair()`'s result that
+    `map_var` actually needs are absent. TX only needs `tx_curr`, TN only
+    needs `tn_curr` (see `_synoptic_temp_pair`'s docstring for why); TG
+    needs both (its own value only falls back to `(tx+tn)/2` when "tg"
+    itself is missing). T850 never uses this pair — callers already gate
+    that case separately (`map_var != "T850"`) before calling this.
+    """
+    if map_var == "TX":
+        return tx_curr is None
+    if map_var == "TN":
+        return tn_curr is None
+    return tx_curr is None or tn_curr is None
 
 
 def _synoptic_lonlat(map_phys_data):
@@ -276,7 +296,7 @@ def _calc_compute_map_footprint_raw(_ref_data, _map_phys_data, target_date_str, 
     lons, lats = _synoptic_lonlat(_map_phys_data)
     if lons is None or lats is None:
         return None
-    if map_var != "T850" and (tx_curr is None or tn_curr is None):
+    if map_var != "T850" and _temp_pair_missing(map_var, tx_curr, tn_curr):
         return None
     daily_ref = _ref_data.sel(dayofyear=doy).reindex(latitude=lats, longitude=lons, method="nearest")
     shape = tx_curr.shape if tx_curr is not None else (len(lats), len(lons))
@@ -361,7 +381,7 @@ def _calc_calculate_top10_raw(
     suffix, doy = ("A" if baseline_type == "A" else "B"), etccdi_doy_365(target_date)
     lons, lats = _synoptic_lonlat(_map_phys_data)
     tx, tn = _synoptic_temp_pair(_map_phys_data)
-    if map_var != "T850" and (tx is None or tn is None):
+    if map_var != "T850" and _temp_pair_missing(map_var, tx, tn):
         return pd.DataFrame(), pd.DataFrame()
     if lons is None or lats is None:
         return pd.DataFrame(), pd.DataFrame()

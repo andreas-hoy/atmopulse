@@ -48,6 +48,13 @@ HELP: dict[str, str] = {
     ),
 
     # --- Map Tracker ---
+    "map_archive_date": (
+        "Live (default): unchanged Forecast Offset (-7...+3) with the IFS/AIFS overlay. "
+        "Date: a single historical calendar day, read straight from that year's ERA5 "
+        "archive batch only — no forecast model involved, and the Forecast Offset "
+        "below is inactive. Available from 1 Jan 1940 through the most recent "
+        "settled ERA5 day."
+    ),
     "map_variable": (
         "Mean Temperature (TG): 24-hour mean (0–0 UTC) of air temperature at 2 m.\n\n"
         "Maximum Temperature (TX): Highest daily air temperature (0–0 UTC).\n\n"
@@ -131,6 +138,11 @@ HELP: dict[str, str] = {
         "Uses the 75th (warm) and 25th (cold) percentile for moderate, 90th (warm) and 10th (cold) for strong "
         "and 95th (warm) and 5th (cold) for extreme conditions within the reference period. "
         "All-time records are given for the full period (starting 1940) prior to the current year."
+    ),
+    "meteo_archive_year": (
+        "Live (default): rolling ~375-day window with the current IFS/AIFS forecast overlay. "
+        "A calendar year: closed 1 Jan-31 Dec ERA5/ERA5T series at this point only — no "
+        "forecast, and the Forecast Model choice is ignored."
     ),
     "meteo_z500_panel": (
         "500 hPa height anomaly at this grid cell versus the 5-day day-of-year mean of the "

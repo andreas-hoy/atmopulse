@@ -34,6 +34,7 @@ from backend_analytics import (
     _map_var_threshold_arrays,
     _synoptic_lonlat,
     _synoptic_temp_pair,
+    _temp_pair_missing,
     _yyyymmdd_dot_date_arr,
 )
 from backend_maps import _synoptic_array, etccdi_doy_365
@@ -206,7 +207,11 @@ _JET_FILL_COLORSCALE = [
 # the levels the field actually reaches, so a calm map with no 70+ m/s
 # core simply doesn't get a 70/80/90 line -- nothing is forced.
 _JET_ISOTACH_START_MS = _JET_FILL_THRESHOLD_MS  # 40
-_JET_ISOTACH_END_MS = _JET_FILL_MAX_MS          # 90
+# Extends past the fill's colour ceiling (_JET_FILL_MAX_MS = 90) so an
+# exceptionally strong core still gets labelled 100/110/... lines -- the
+# shared contour helper only draws levels the field actually reaches, so
+# this is just a bound, never a forced/fabricated line.
+_JET_ISOTACH_END_MS = 150.0
 _JET_ISOTACH_STEP_MS = 10.0
 _JET_ISOTACH_LINE_WIDTH = 1.0  # < MAP_CONTOUR_LINE_WIDTH (Z500's 1.35)
 
@@ -215,25 +220,26 @@ _JET_ISOTACH_LINE_WIDTH = 1.0  # < MAP_CONTOUR_LINE_WIDTH (Z500's 1.35)
 # field is at/above the threshold. A coarse subsample of the core, sorted
 # west->east and capped, gives a handful of arrows spread along the jet
 # instead of one per grid cell.
-_JET_ARROW_SEED_STEP_LAT = 6
-_JET_ARROW_SEED_STEP_LON = 10
-_JET_ARROW_MAX_COUNT = 10
+_JET_ARROW_SEED_STEP_LAT = 4
+_JET_ARROW_SEED_STEP_LON = 7
+_JET_ARROW_TRACK_POSITIONS = 10  # along-track (west->east) sample positions
+_JET_ARROW_WIDE_ROW_COUNT = 3    # sampled rows crossing the core at one position -> "wide" there -> 2 arrows (edges) instead of 1
 _JET_ARROW_SHAFT_DEG = 1.5     # fixed shaft length -- the screenshot's arrows were ~15-25 deg
-_JET_ARROWHEAD_LEN_DEG = 0.45
+_JET_ARROWHEAD_LEN_DEG = 0.55
 _JET_ARROWHEAD_ANGLE_DEG = 26.0
 # White + thin dark halo so arrows read on the teal fill AND on the red/
 # blue extremes heatmap outside a fill cell's opacity.
 _JET_ARROW_COLOR = "#FFFFFF"
-_JET_ARROW_WIDTH = 1.8
+_JET_ARROW_WIDTH = 2.4
 _JET_ARROW_HALO_COLOR = "#0B332F"
-_JET_ARROW_HALO_WIDTH = 3.2
+_JET_ARROW_HALO_WIDTH = 4.2
 
 # Cache-key version for get_cached_baseline_map (see _MSLP_HL_VERSION):
 # bump this whenever _add_jet_overlay's drawing changes, so an old cached
 # figure (e.g. the previous long-streamline figure) is never served again
 # for the "jet" toggle just because date/toggles/source_mtime didn't
 # change.
-_JET_OVERLAY_VERSION = 4
+_JET_OVERLAY_VERSION = 6
 # Synoptic H/L: only label centres with a closed-system footprint
 # (neighbourhood span of at least one 5 hPa isoline) and keep glyphs apart.
 _MSLP_HL_SMOOTH_SIGMA = 2.5
@@ -280,28 +286,6 @@ _vfmt_num = np.vectorize(_fmt_hover_num, otypes=[object])
 _vfmt_diff = np.vectorize(_fmt_hover_diff, otypes=[object])
 _vfmt_year = np.vectorize(_fmt_hover_year, otypes=[object])
 _vfmt_days = np.vectorize(_fmt_hover_days, otypes=[object])
-
-def _build_standard_hovertext(labels, lat2d, lon2d, v_curr, v_rec_w, yr_w, diff_w, v_rec_c, yr_c, diff_c, var_label):
-    """DEAD CODE as of Schritt B (kept for reference / potential rollback).
-
-    This used to be handed to go.Heatmap as `hovertext=`, producing one full
-    HTML string per grid cell (~47k cells -> ~10 MB of duplicated markup:
-    "<b>", "Latitude:", city names, etc. repeated per cell). It is no longer
-    called anywhere; `_build_map_customdata` / `_build_persistence_customdata`
-    + a static `hovertemplate` replace it for both the Daily and Persistence
-    map heatmaps.
-    """
-    fmt1 = np.vectorize(_fmt_hover_num)
-    fmtd = np.vectorize(_fmt_hover_diff)
-    fyr = np.vectorize(_fmt_hover_year)
-    loc = labels.astype(str)
-    return (
-        "<b>" + loc + "</b><br>"
-        "Latitude: " + fmt1(lat2d) + ", Longitude: " + fmt1(lon2d) + "<br><br>"
-        + var_label + ": " + fmt1(v_curr) + " °C<br>"
-        "All-Time Warm: " + fmt1(v_rec_w) + " °C (Year " + fyr(yr_w) + "; " + fmtd(diff_w) + " °C diff)<br>"
-        "All-Time Cold: " + fmt1(v_rec_c) + " °C (Year " + fyr(yr_c) + "; " + fmtd(diff_c) + " °C diff)"
-    )
 
 def _build_map_customdata(v_curr, v_rec_w, yr_w, diff_w, v_rec_c, yr_c, diff_c):
     """customdata for the Daily map heatmap, shape (nlat, nlon, 7).
@@ -858,27 +842,50 @@ def _add_jet_isotachs(fig, lons, lats, field) -> None:
 
 
 def _select_jet_arrow_seeds(speed_smooth, lons, lats):
-    """A handful of grid-index seeds inside the jet core, spread WEST TO
-    EAST along the band (not whatever order a coarse-grid scan happens to
-    return, which can bunch several picks into one neighbourhood if the
-    core is a thin strip within a couple of subsampled rows). Returns
-    (iy, ix) index pairs -- arrows are drawn exactly ON these grid points
-    using the field's own u/v there, no interpolation needed.
+    """Along-track seed positions inside the jet core, spread WEST TO EAST.
+
+    Picking a single row per sampled longitude (the previous approach)
+    meant a MERIDIONALLY WIDE core only ever got one arrow, always at
+    whichever row a flat top-N pick happened to land on -- typically
+    leaving one whole edge (e.g. the northern half of a wide band) with no
+    arrow at all. Now each along-track position is checked for how many
+    sampled rows there actually cross the core: a narrow crossing still
+    gets exactly one arrow (its middle row); a WIDE crossing
+    (>= _JET_ARROW_WIDE_ROW_COUNT sampled rows) gets one arrow near EACH
+    edge of the core instead, so both sides of a broad jet are covered.
+
+    Returns (iy, ix) index pairs -- arrows are drawn exactly ON these grid
+    points using the field's own u/v there, no interpolation needed.
     """
     lat_idx = np.arange(0, len(lats), _JET_ARROW_SEED_STEP_LAT)
     lon_idx = np.arange(0, len(lons), _JET_ARROW_SEED_STEP_LON)
     if lat_idx.size == 0 or lon_idx.size == 0:
         return []
     sub = speed_smooth[np.ix_(lat_idx, lon_idx)]
-    core = np.argwhere(np.isfinite(sub) & (sub >= _JET_FILL_THRESHOLD_MS))
-    if core.size == 0:
+    core = np.isfinite(sub) & (sub >= _JET_FILL_THRESHOLD_MS)
+
+    cols_with_rows = [j for j in range(sub.shape[1]) if core[:, j].any()]
+    if not cols_with_rows:
         return []
-    lon_of = np.asarray(lons)[lon_idx[core[:, 1]]]
-    core = core[np.argsort(lon_of)]  # west -> east, so picks spread along-track
-    if len(core) > _JET_ARROW_MAX_COUNT:
-        pick = np.linspace(0, len(core) - 1, _JET_ARROW_MAX_COUNT).round().astype(int)
-        core = core[pick]
-    return [(int(lat_idx[iy]), int(lon_idx[ix])) for iy, ix in core]
+
+    # Downsample ALONG-TRACK POSITIONS west->east (lon_idx is ascending),
+    # independent of how many rows qualify at each one -- so a very wide
+    # stretch doesn't crowd out coverage of the rest of the track.
+    if len(cols_with_rows) > _JET_ARROW_TRACK_POSITIONS:
+        pick = np.linspace(0, len(cols_with_rows) - 1, _JET_ARROW_TRACK_POSITIONS)
+        pick = sorted(set(int(round(p)) for p in pick))
+        cols_with_rows = [cols_with_rows[p] for p in pick]
+
+    seeds = []
+    for j in cols_with_rows:
+        rows_j = np.flatnonzero(core[:, j])
+        if rows_j.size >= _JET_ARROW_WIDE_ROW_COUNT:
+            picks = (rows_j[0], rows_j[-1])  # one near each edge of the core
+        else:
+            picks = (rows_j[rows_j.size // 2],)  # narrow here: one, in the middle
+        for i in picks:
+            seeds.append((int(lat_idx[i]), int(lon_idx[j])))
+    return seeds
 
 
 def _add_jet_arrows(fig, lons, lats, u_full, v_full, speed_smooth) -> None:
@@ -986,7 +993,7 @@ def build_baseline_map(
     lons, lats = _synoptic_lonlat(map_phys_data)
     if lons is None or lats is None:
         return go.Figure()
-    if map_var != "T850" and (tx_curr is None or tn_curr is None):
+    if map_var != "T850" and _temp_pair_missing(map_var, tx_curr, tn_curr):
         return go.Figure()
     
     # Align the climatology grid to the live/archive field's actual lat/lon

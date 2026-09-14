@@ -24,6 +24,7 @@ from config import (
     LAYOUT_OPACITY,
     LAYOUT_SWIPE,
     AIFS_TXTN_WARNING,
+    FORECAST_MODEL_IFS,
     PERSISTENCE_LOOKBACK_PAD,
     PERSISTENCE_MAX_DAYS,
     TOP10_GRID_VERSION,
@@ -353,12 +354,24 @@ def _render_expert_severity(
         st.markdown(_severity_single_html(footprint_single, active_tier), unsafe_allow_html=True)
 
 
-def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold, toggles, target_date, default_date):
+def render_map_tracker(
+    map_var_code, view_mode, persist_metric, top10_threshold, toggles, target_date, default_date,
+    map_is_archive=False, map_anchor_date=None,
+):
     ref_clim = load_reference_climatology()
     if ref_clim is None:
         st.error("Reference Climatology missing or corrupted! Please rebuild.")
         st.stop()
     syn_clim = load_synoptic_climatology()
+
+    # Archive Date (map_is_archive=True): anchor is the archive day itself
+    # (short existing pad_past/pad_future window around it, not the live
+    # ~today window), and the Forecast Model choice is ignored — a
+    # historical day always reads era5_master_daily_{year}.nc only, the
+    # same way page_meteogram.py's Archive Year ignores it. Live keeps the
+    # exact previous behaviour (anchor = default_date/"today").
+    anchor_date = map_anchor_date if map_anchor_date is not None else default_date
+    forecast_model = FORECAST_MODEL_IFS if map_is_archive else selected_forecast_model()
     # get_europe_borders_trace() is now resolved INSIDE get_cached_baseline_map
     # (Schritt C: a Plotly trace can't be a cache-data key), so it is no
     # longer fetched here directly.
@@ -382,8 +395,8 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
         _, pers_meta = _load_persistence_daily_series(
             (target_date - pd.Timedelta(days=PERSISTENCE_MAX_DAYS + PERSISTENCE_LOOKBACK_PAD)).strftime('%Y-%m-%d'),
             target_date.strftime('%Y-%m-%d'),
-            default_date.strftime('%Y-%m-%d'),
-            forecast_model=selected_forecast_model(),
+            anchor_date.strftime('%Y-%m-%d'),
+            forecast_model=forecast_model,
         ) or (None, {})
         eff_end = pers_meta.get("effective_end")
         if pers_meta.get("uses_ifs") and eff_end is not None:
@@ -430,8 +443,12 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
     def render_top10_tables(df_h, df_c):
         render_top10_period(df_h, df_c)
 
-    aifs_txtn_blocked = is_aifs_model() and map_var_code in ("TX", "TN")
-    aifs_hatch_blocked = is_aifs_model() and bool(toggles.get("hatching"))
+    # AIFS restrictions only make sense for the live forecast path — an
+    # Archive Date always reads plain ERA5 (native TX/TN, no forecast model
+    # involved at all), so it is exempt here (forecast_model is already
+    # forced to IFS above for map_is_archive).
+    aifs_txtn_blocked = (not map_is_archive) and is_aifs_model() and map_var_code in ("TX", "TN")
+    aifs_hatch_blocked = (not map_is_archive) and is_aifs_model() and bool(toggles.get("hatching"))
     if aifs_txtn_blocked or aifs_hatch_blocked:
         st.warning(AIFS_TXTN_WARNING)
     if not aifs_txtn_blocked:
@@ -439,8 +456,7 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
             toggles = {**toggles, "hatching": False}
         try:
             target_date_str = target_date.strftime('%Y-%m-%d')
-            anchor_date_str = default_date.strftime('%Y-%m-%d')
-            forecast_model = selected_forecast_model()
+            anchor_date_str = anchor_date.strftime('%Y-%m-%d')
             # Schritt C: same mtime feeds fetch_cached_synoptic_data (the
             # data itself), compute_map_footprint/calculate_top10 (the
             # narrative/tables, which key on _map_phys_data being underscore-
@@ -456,10 +472,16 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
                     source_mtime=source_mtime,
                 )
             if not map_time_meta.get("available"):
-                st.warning(
-                    f"No synoptic data for **{target_date.strftime('%d.%m.%Y')}**. "
-                    "The IFS HRES forecast may not yet cover this date — try a lower Forecast Offset."
-                )
+                if map_is_archive:
+                    st.warning(
+                        f"No ERA5 archive data for **{target_date.strftime('%d.%m.%Y')}** "
+                        f"in era5_master_daily_{target_date.year}.nc — try another Archive date."
+                    )
+                else:
+                    st.warning(
+                        f"No synoptic data for **{target_date.strftime('%d.%m.%Y')}**. "
+                        "The IFS HRES forecast may not yet cover this date — try a lower Forecast Offset."
+                    )
             else:
                 if not map_time_meta.get("temps_available", True):
                     st.warning(
@@ -551,10 +573,10 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
                     with st.container(key="atmopulse_map_tables"):
                         mc1, mc2 = st.columns(2, gap="small")
                         with mc1:
-                            df_h_a, df_c_a = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "A", map_var_code, anchor_date=default_date, _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid, source_mtime=source_mtime)
+                            df_h_a, df_c_a = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "A", map_var_code, anchor_date=anchor_date, _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid, source_mtime=source_mtime)
                             render_top10_period(df_h_a, df_c_a)
                         with mc2:
-                            df_h_b, df_c_b = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "B", map_var_code, anchor_date=default_date, _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid, source_mtime=source_mtime)
+                            df_h_b, df_c_b = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "B", map_var_code, anchor_date=anchor_date, _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid, source_mtime=source_mtime)
                             render_top10_period(df_h_b, df_c_b)
                 elif map_layout in (LAYOUT_OPACITY, LAYOUT_SWIPE):
                     fig_a = _cached_map("A", full_width=True)
@@ -572,10 +594,10 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
                     with st.container(key="atmopulse_map_tables"):
                         map_col1, map_col2 = st.columns(2, gap="small")
                         with map_col1:
-                            df_h_a, df_c_a = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "A", map_var_code, anchor_date=default_date, _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid, source_mtime=source_mtime)
+                            df_h_a, df_c_a = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "A", map_var_code, anchor_date=anchor_date, _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid, source_mtime=source_mtime)
                             render_top10_period(df_h_a, df_c_a, epoch_period_label("A"))
                         with map_col2:
-                            df_h_b, df_c_b = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "B", map_var_code, anchor_date=default_date, _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid, source_mtime=source_mtime)
+                            df_h_b, df_c_b = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "B", map_var_code, anchor_date=anchor_date, _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid, source_mtime=source_mtime)
                             render_top10_period(df_h_b, df_c_b, epoch_period_label("B"))
                 else:
                     ep_sel = epoch_from_label(flicker_epoch)
@@ -589,7 +611,7 @@ def render_map_tracker(map_var_code, view_mode, persist_metric, top10_threshold,
                         ref_clim, map_phys_data, target_date,
                         st.session_state.toggles_warm, st.session_state.toggles_cold,
                         view_mode, persist_metric, top10_threshold,
-                        ep_sel, map_var_code, anchor_date=default_date,
+                        ep_sel, map_var_code, anchor_date=anchor_date,
                         _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid,
                         source_mtime=source_mtime,
                     )

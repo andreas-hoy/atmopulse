@@ -45,6 +45,8 @@ from backend_io import (
     load_reference_climatology,
     load_synoptic_climatology,
     get_live_point_series,
+    get_archive_year_options,
+    get_archive_year_point_series,
     compute_point_thresholds,
     _load_point_archive_series,
 )
@@ -82,6 +84,22 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
         st.error("Reference Climatology missing or corrupted! Please rebuild.")
         st.stop()
 
+    # Archive Year: "Live" (default, index 0) keeps the rolling ~375-day
+    # window + IFS/AIFS overlay exactly as before; any calendar year below
+    # switches to a closed 1 Jan-31 Dec ERA5/ERA5T series at this point,
+    # with no forecast involved. Session-state key is scoped to this page
+    # only (met_archive_year) — the Offset slider / Jahresbalken / other
+    # pages are untouched by this selection.
+    archive_years = get_archive_year_options(pd.Timestamp.utcnow().strftime("%Y-%m-%d"))
+    archive_choice = st.selectbox(
+        "Archive Year:",
+        ["Live"] + [str(y) for y in archive_years],
+        key="met_archive_year",
+        help=HELP["meteo_archive_year"],
+    )
+    is_archive = archive_choice != "Live"
+    archive_year = int(archive_choice) if is_archive else None
+
     if show_expert("flicker_layout"):
         map_layout = st.radio("Layout:", (LAYOUT_SIDE_BY_SIDE, LAYOUT_FLICKER), horizontal=True, key="met_layout")
     else:
@@ -94,103 +112,123 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
     # across the rerun, so reading it here is safe).
     if map_layout == LAYOUT_FLICKER:
         met_active_epoch = epoch_from_label(st.session_state.get("met_ep", epoch_period_label("B")))
-    if is_aifs_model() and meteo_var_code(meteo_var) in ("TX", "TN"):
+    if (not is_archive) and is_aifs_model() and meteo_var_code(meteo_var) in ("TX", "TN"):
+        # ERA5 (Archive Year) natively has TX/TN, so the AIFS warning only
+        # ever applies to the Live/forecast path.
         st.warning(AIFS_TXTN_WARNING)
     else:
-        with st.spinner("Fetching Meteogram data..."): 
-            df_live = get_live_point_series(lat_target, lon_target, selected_forecast_model())
-        if not df_live.empty:
+        with st.spinner("Fetching Meteogram data..."):
+            if is_archive:
+                df_live = get_archive_year_point_series(lat_target, lon_target, archive_year)
+            else:
+                df_live = get_live_point_series(lat_target, lon_target, selected_forecast_model())
+        if is_archive and df_live.empty:
+            st.error(f"No ERA5 archive data available for {archive_year} at this location.")
+        elif not df_live.empty:
             col_target = meteo_var_code(meteo_var)
 
-            # --- STRICT DATETIME INDEXING for "current conditions" ---
-            # Never .max()/.mean() over the series, and never a bare
-            # .iloc[0]/.iloc[-1] unless target_date genuinely falls
-            # outside the live window — the scalar MUST come from the
-            # exact calendar row matching the active target_date.
-            #
-            # `df_live` (get_live_point_series) is built entirely from calendar-day
-            # UTC aggregates — the ERA5 archive's daily valid_time and the IFS/AIFS
-            # forecast's own 00Z-00Z daily aggregation (ifs_ingestion.py) — so it is
-            # already on the same UTC calendar-day footing as `active_date` below.
-            df_indexed = df_live.copy()
-            df_indexed['Date'] = pd.to_datetime(df_indexed['Date']).dt.tz_localize(None).dt.normalize()
-            df_indexed = df_indexed.drop_duplicates(subset=['Date']).set_index('Date').sort_index()
-            active_date = (
-                pd.Timestamp.utcnow().tz_localize(None).floor('D')
-                + pd.Timedelta(days=st.session_state.offset_slider)
-            )
-
-            try:
-                current_row = df_indexed.loc[active_date]
-                current_row_date = active_date
-            except KeyError:
-                # Defensive-only safety net (e.g. offset_slider pushed past what
-                # the live series actually returned, or an upstream API gap) —
-                # NOT the primary alignment mechanism anymore. Nearest available
-                # calendar day, never the series' arbitrary last/forecast row.
-                nearest_pos = df_indexed.index.get_indexer([active_date], method='nearest')[0]
-                current_row = df_indexed.iloc[nearest_pos]
-                current_row_date = df_indexed.index[nearest_pos]
-
-            if col_target in df_indexed.columns:
-                value_now = float(current_row[col_target])
-            elif col_target != "T850" and 'TX' in df_indexed.columns and 'TN' in df_indexed.columns:
-                value_now = float((current_row['TX'] + current_row['TN']) / 2.0)
+            # Archive Year: the whole year is drawn solid, so the plotting
+            # target date is always 31 Dec of that year (no dotted forecast
+            # segment — get_meteogram_traces only dots dates >= target_date,
+            # and 31 Dec is the series' last day). The "currently ..." banner
+            # only makes sense for the live operational day, so it — and the
+            # current-conditions classification it depends on — is skipped
+            # entirely for an Archive Year.
+            if is_archive:
+                plot_target_date = pd.Timestamp(year=archive_year, month=12, day=31)
+                cat_a = dir_a = cat_b = dir_b = None
             else:
-                value_now = np.nan
+                plot_target_date = target_date
 
-            # Thresholds must be evaluated for THAT specific day (current_row_date),
-            # not the slider's nominal target_date, so a forecast-fallback row never
-            # gets scored against the wrong calendar day's P75/90/95 climatology.
-            #
-            # Baseline isolation: each epoch gets its OWN, freshly-built p_warm/p_cold
-            # dict from compute_point_thresholds — "A" and "B" thresholds are never
-            # assigned into the same variable, so there is no possibility of one
-            # baseline's percentiles silently overwriting the other's.
-            # Both baselines' thresholds are computed unconditionally (cheap — just
-            # ref_clim.sel()+array-index lookups, no I/O) so the debug readout below
-            # can always show both, regardless of which layout is active.
-            percentiles_a = compute_point_thresholds(ref_clim, lat_target, lon_target, current_row_date, meteo_var, "A")
-            percentiles_b = compute_point_thresholds(ref_clim, lat_target, lon_target, current_row_date, meteo_var, "B")
-            cat_a, dir_a = classify_point_severity(value_now, *percentiles_a)
-            cat_b, dir_b = classify_point_severity(value_now, *percentiles_b)
-            addr = html.escape(location.address)
+                # --- STRICT DATETIME INDEXING for "current conditions" ---
+                # Never .max()/.mean() over the series, and never a bare
+                # .iloc[0]/.iloc[-1] unless target_date genuinely falls
+                # outside the live window — the scalar MUST come from the
+                # exact calendar row matching the active target_date.
+                #
+                # `df_live` (get_live_point_series) is built entirely from calendar-day
+                # UTC aggregates — the ERA5 archive's daily valid_time and the IFS/AIFS
+                # forecast's own 00Z-00Z daily aggregation (ifs_ingestion.py) — so it is
+                # already on the same UTC calendar-day footing as `active_date` below.
+                df_indexed = df_live.copy()
+                df_indexed['Date'] = pd.to_datetime(df_indexed['Date']).dt.tz_localize(None).dt.normalize()
+                df_indexed = df_indexed.drop_duplicates(subset=['Date']).set_index('Date').sort_index()
+                active_date = (
+                    pd.Timestamp.utcnow().tz_localize(None).floor('D')
+                    + pd.Timedelta(days=st.session_state.offset_slider)
+                )
 
-            if map_layout == LAYOUT_FLICKER:
-                cat_x, dir_x = (cat_a, dir_a) if met_active_epoch == "A" else (cat_b, dir_b)
-                chip = _severity_phrase_html(cat_x, dir_x, point_condition_phrase(cat_x, dir_x))
-                lead = html.escape(baseline_against_lead(met_active_epoch))
-                _render_html(
-                    f"<div class='atmopulse-narrative-banner'>"
-                    f"{lead}, the area of {addr} is currently{chip}."
-                    f"</div>"
-                )
-            else:
-                a_html = _severity_phrase_html(cat_a, dir_a, point_condition_phrase(cat_a, dir_a))
-                b_html = _severity_phrase_html(cat_b, dir_b, point_condition_phrase(cat_b, dir_b))
-                lead_a = html.escape(baseline_against_lead("A"))
-                lead_b = html.escape(baseline_against_lead("B"))
-                _render_html(
-                    f"<div class='atmopulse-narrative-banner'>"
-                    f"{lead_a}, the area of {addr} is currently{a_html}. "
-                    f"{lead_b}, it is{b_html}."
-                    f"</div>"
-                )
+                try:
+                    current_row = df_indexed.loc[active_date]
+                    current_row_date = active_date
+                except KeyError:
+                    # Defensive-only safety net (e.g. offset_slider pushed past what
+                    # the live series actually returned, or an upstream API gap) —
+                    # NOT the primary alignment mechanism anymore. Nearest available
+                    # calendar day, never the series' arbitrary last/forecast row.
+                    nearest_pos = df_indexed.index.get_indexer([active_date], method='nearest')[0]
+                    current_row = df_indexed.iloc[nearest_pos]
+                    current_row_date = df_indexed.index[nearest_pos]
+
+                if col_target in df_indexed.columns:
+                    value_now = float(current_row[col_target])
+                elif col_target != "T850" and 'TX' in df_indexed.columns and 'TN' in df_indexed.columns:
+                    value_now = float((current_row['TX'] + current_row['TN']) / 2.0)
+                else:
+                    value_now = np.nan
+
+                # Thresholds must be evaluated for THAT specific day (current_row_date),
+                # not the slider's nominal target_date, so a forecast-fallback row never
+                # gets scored against the wrong calendar day's P75/90/95 climatology.
+                #
+                # Baseline isolation: each epoch gets its OWN, freshly-built p_warm/p_cold
+                # dict from compute_point_thresholds — "A" and "B" thresholds are never
+                # assigned into the same variable, so there is no possibility of one
+                # baseline's percentiles silently overwriting the other's.
+                # Both baselines' thresholds are computed unconditionally (cheap — just
+                # ref_clim.sel()+array-index lookups, no I/O) so the debug readout below
+                # can always show both, regardless of which layout is active.
+                percentiles_a = compute_point_thresholds(ref_clim, lat_target, lon_target, current_row_date, meteo_var, "A")
+                percentiles_b = compute_point_thresholds(ref_clim, lat_target, lon_target, current_row_date, meteo_var, "B")
+                cat_a, dir_a = classify_point_severity(value_now, *percentiles_a)
+                cat_b, dir_b = classify_point_severity(value_now, *percentiles_b)
+                addr = html.escape(location.address)
+
+                if map_layout == LAYOUT_FLICKER:
+                    cat_x, dir_x = (cat_a, dir_a) if met_active_epoch == "A" else (cat_b, dir_b)
+                    chip = _severity_phrase_html(cat_x, dir_x, point_condition_phrase(cat_x, dir_x))
+                    lead = html.escape(baseline_against_lead(met_active_epoch))
+                    _render_html(
+                        f"<div class='atmopulse-narrative-banner'>"
+                        f"{lead}, the area of {addr} is currently{chip}."
+                        f"</div>"
+                    )
+                else:
+                    a_html = _severity_phrase_html(cat_a, dir_a, point_condition_phrase(cat_a, dir_a))
+                    b_html = _severity_phrase_html(cat_b, dir_b, point_condition_phrase(cat_b, dir_b))
+                    lead_a = html.escape(baseline_against_lead("A"))
+                    lead_b = html.escape(baseline_against_lead("B"))
+                    _render_html(
+                        f"<div class='atmopulse-narrative-banner'>"
+                        f"{lead_a}, the area of {addr} is currently{a_html}. "
+                        f"{lead_b}, it is{b_html}."
+                        f"</div>"
+                    )
 
             t_arr = df_live[col_target].values if col_target in df_live.columns else ((df_live['TX'].values + df_live['TN'].values) / 2.0)
             global_min, global_max = np.nanmin(t_arr) - 3, np.nanmax(t_arr) + 3
-            tgt_dt_norm = pd.to_datetime(target_date).tz_localize(None)
+            tgt_dt_norm = pd.to_datetime(plot_target_date).tz_localize(None)
 
-            traces_a = get_meteogram_traces(df_live, ref_clim, lat_target, lon_target, target_date, "A", meteo_env, meteo_var, current_condition=(cat_a, dir_a))
-            traces_b = get_meteogram_traces(df_live, ref_clim, lat_target, lon_target, target_date, "B", meteo_env, meteo_var, current_condition=(cat_b, dir_b))
+            traces_a = get_meteogram_traces(df_live, ref_clim, lat_target, lon_target, plot_target_date, "A", meteo_env, meteo_var, current_condition=(cat_a, dir_a))
+            traces_b = get_meteogram_traces(df_live, ref_clim, lat_target, lon_target, plot_target_date, "B", meteo_env, meteo_var, current_condition=(cat_b, dir_b))
 
             show_z500 = show_expert("z500")
             syn_clim = load_synoptic_climatology() if show_z500 else None
             z500_a, z500_rng_a = get_z500_anomaly_traces(
-                df_live, syn_clim, lat_target, lon_target, target_date, "A",
+                df_live, syn_clim, lat_target, lon_target, plot_target_date, "A",
             ) if show_z500 else ([], None)
             z500_b, z500_rng_b = get_z500_anomaly_traces(
-                df_live, syn_clim, lat_target, lon_target, target_date, "B",
+                df_live, syn_clim, lat_target, lon_target, plot_target_date, "B",
             ) if show_z500 else ([], None)
             use_z500 = bool(z500_a and z500_b)
             z500_ylim = None

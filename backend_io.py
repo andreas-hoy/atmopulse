@@ -635,6 +635,105 @@ def get_live_point_series(lat, lon, forecast_model=FORECAST_MODEL_IFS, _series_v
     return df.set_index("Date").reindex(full_index).rename_axis("Date").reset_index()
 
 
+# --- ARCHIVE YEAR (Meteogram: closed calendar-year ERA5, no forecast) ---
+def _archive_year_file(year: int) -> Path:
+    return DATA_ROOT / "Master_Batches" / f"era5_master_daily_{year}.nc"
+
+
+def _archive_year_is_complete(year: int) -> bool:
+    """True iff era5_master_daily_{year}.nc exists and its last covered day
+    reaches 31 Dec of `year` with real (non-placeholder) ERA5/ERA5T data —
+    used to keep an in-progress or not-yet-downloaded year out of the
+    Meteogram's Archive Year selector."""
+    path = _archive_year_file(year)
+    if not path.exists():
+        return False
+    ds = None
+    try:
+        ds = xr.open_dataset(path, engine="netcdf4", decode_timedelta=False)
+        ds = _harmonize_master_archive(ds)
+        t_name = "valid_time" if "valid_time" in ds.dims else "time"
+        if t_name not in ds.coords:
+            return False
+        times = pd.to_datetime(ds[t_name].values)
+        if getattr(times, "tz", None) is not None:
+            times = times.tz_convert("UTC").tz_localize(None)
+        year_end = pd.Timestamp(year=year, month=12, day=31)
+        if pd.DatetimeIndex(times).max().normalize() < year_end:
+            return False
+        var = next((v for v in ("tg", "tx", "mx2t") if v in ds.data_vars), None)
+        if var is None:
+            return False
+        last_day = ds[var].sel({t_name: slice(year_end, year_end)})
+        return bool(np.isfinite(np.asarray(last_day.values, dtype=np.float64)).any())
+    except Exception:
+        return False
+    finally:
+        if ds is not None:
+            try:
+                ds.close()
+            except Exception:
+                pass
+
+
+@st.cache_data(show_spinner=False)
+def get_archive_year_options(today_str: str):
+    """Meteogram Archive Year dropdown options: whole calendar years 1940
+    through the latest COMPLETE ERA5 master year.
+
+    `today_str` (e.g. ``pd.Timestamp.utcnow().strftime("%Y-%m-%d")``) is a
+    plain cache-key nonce — passing "today" explicitly (instead of calling
+    utcnow() inside this cached function) means a new day rolling over the
+    10-Jan cutoff, or a year's file finishing its download mid-day, actually
+    invalidates this cache instead of freezing the dropdown at whatever it
+    first returned this session.
+
+    Year-release rule: `today.year - 1` is only ever a CANDIDATE ceiling once
+    the calendar day is >= 10 Jan (UTC); before that the ceiling is
+    `today.year - 2` (the prior year's ERA5T tail is not considered settled
+    yet). The ceiling then steps back one year at a time until it finds a
+    year whose master file exists and is complete through 31 Dec, so a late
+    file never leaves a gap in the list — it just lowers the ceiling.
+    """
+    today = pd.Timestamp(today_str)
+    candidate = today.year - 1 if (today.month > 1 or today.day >= 10) else today.year - 2
+    for year in range(candidate, 1939, -1):
+        if _archive_year_is_complete(year):
+            return list(range(1940, year + 1))
+    return []
+
+
+@st.cache_data(show_spinner=False)
+def get_archive_year_point_series(lat, lon, year, _series_version=1):
+    """Closed calendar-year ERA5 point series (1 Jan - 31 Dec) for the
+    Meteogram's Archive Year selector: ERA5/ERA5T only, from the single
+    era5_master_daily_{year}.nc batch — no IFS/AIFS overlay, no forecast
+    model involved (the caller's `selected_forecast_model()` is ignored by
+    design; Archive Year always means ERA5/ERA5T at the point).
+
+    `isolate=False`: unlike `get_live_point_series`'s current-calendar-year
+    read, this always targets a CLOSED, already-settled historical batch
+    file (never the in-progress current year), so the subprocess-isolated
+    HDF5 read `get_live_point_series` needs is not required here.
+
+    Same Date/TX/TN/TG/T850/Z500 column contract as `get_live_point_series`,
+    reindexed onto the full 1 Jan - 31 Dec calendar so real ERA5 gaps stay
+    NaN rather than being interpolated. Returns an empty DataFrame (never
+    raises) when the year has no data at this point — the caller renders
+    `st.error(...)` instead of crashing.
+    """
+    path = _archive_year_file(year)
+    start = pd.Timestamp(year=year, month=1, day=1)
+    end = pd.Timestamp(year=year, month=12, day=31)
+    df = _point_frame_from_master_file(path, lat, lon, start, end, isolate=False)
+    if df.empty:
+        return df
+    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None).dt.normalize()
+    df = df.sort_values("Date").drop_duplicates(subset=["Date"])
+    full_index = pd.date_range(start, end, freq="D")
+    return df.set_index("Date").reindex(full_index).rename_axis("Date").reset_index()
+
+
 def _array_has_finite(val) -> bool:
     if val is None:
         return False
