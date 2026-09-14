@@ -563,24 +563,6 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
 .atmopulse-sev-heading-cold {{
     color: {ATMOPULSE_COLD['p5']} !important;
 }}
-.atmopulse-sev-help {{
-    display: inline-flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    width: 16px !important;
-    height: 16px !important;
-    margin-top: 1px !important;
-    border-radius: 50% !important;
-    border: 1px solid #6b7280 !important;
-    color: #6b7280 !important;
-    font-family: {o} !important;
-    font-size: 11px !important;
-    font-weight: 600 !important;
-    line-height: 1 !important;
-    cursor: help !important;
-    flex-shrink: 0 !important;
-    user-select: none !important;
-}}
 .atmopulse-sev-table {{
     width: auto !important;
     min-width: 0 !important;

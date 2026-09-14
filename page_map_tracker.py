@@ -39,6 +39,7 @@ from frontend_plots import (
     _render_synoptic_map,
     get_cached_baseline_map,
     build_opacity_slider_map,
+    map_export_title,
     render_swipe_compare_map,
 )
 from backend_io import (
@@ -295,7 +296,6 @@ def _severity_table_html(headers: tuple[str, ...], body: str) -> str:
 
 
 def _severity_pair_html(warm_table: str, cold_table: str) -> str:
-    tip = html.escape(HELP["europe_share_table"])
     return (
         "<div class='atmopulse-sev-pair'>"
         "<div class='atmopulse-sev-block'>"
@@ -304,7 +304,6 @@ def _severity_pair_html(warm_table: str, cold_table: str) -> str:
         "<div class='atmopulse-sev-block'>"
         "<div class='atmopulse-sev-heading atmopulse-sev-heading-cold'>Cold:</div>"
         f"{cold_table}</div>"
-        f"<span class='atmopulse-sev-help' title='{tip}'>?</span>"
         "</div>"
     )
 
@@ -347,11 +346,15 @@ def _render_expert_severity(
     active_tier: str,
     compare: bool,
 ) -> None:
-    # Markdown so page CSS (severity table) applies; st.html is isolated.
+    # Native Streamlit `help=` (same tooltip as Map view), not a HTML title= bubble.
     if compare and footprint_a is not None and footprint_b is not None:
-        st.markdown(_severity_compare_html(footprint_a, footprint_b, active_tier), unsafe_allow_html=True)
+        body = _severity_compare_html(footprint_a, footprint_b, active_tier)
     elif footprint_single is not None:
-        st.markdown(_severity_single_html(footprint_single, active_tier), unsafe_allow_html=True)
+        body = _severity_single_html(footprint_single, active_tier)
+    else:
+        return
+    st.markdown("**Share of Europe**", help=HELP["europe_share_table"])
+    st.markdown(body, unsafe_allow_html=True)
 
 
 def render_map_tracker(
@@ -561,15 +564,26 @@ def render_map_tracker(
                         _syn_clim=syn_clim,
                     )
 
+                def _map_title(epoch_label: str) -> str:
+                    return map_export_title(
+                        map_var_code, view_mode, epoch_label, target_date, persist_metric,
+                    )
+
                 if map_layout == LAYOUT_SIDE_BY_SIDE:
                     fig_a = _cached_map("A")
                     fig_b = _cached_map("B")
                     with st.container(key="atmopulse_map_columns"):
                         mc1, mc2 = st.columns(2, gap="small")
                         with mc1:
-                            _render_synoptic_map(fig_a, epoch_period_label("A"), "map_a")
+                            _render_synoptic_map(
+                                fig_a, epoch_period_label("A"), "map_a",
+                                export_title=_map_title(epoch_period_label("A")),
+                            )
                         with mc2:
-                            _render_synoptic_map(fig_b, epoch_period_label("B"), "map_b")
+                            _render_synoptic_map(
+                                fig_b, epoch_period_label("B"), "map_b",
+                                export_title=_map_title(epoch_period_label("B")),
+                            )
                     with st.container(key="atmopulse_map_tables"):
                         mc1, mc2 = st.columns(2, gap="small")
                         with mc1:
@@ -582,13 +596,22 @@ def render_map_tracker(
                     fig_a = _cached_map("A", full_width=True)
                     fig_b = _cached_map("B", full_width=True)
                     if map_layout == LAYOUT_SWIPE:
-                        render_swipe_compare_map(fig_a, fig_b)
+                        render_swipe_compare_map(
+                            fig_a, fig_b,
+                            export_title_a=_map_title(epoch_period_label("A")),
+                            export_title_b=_map_title(epoch_period_label("B")),
+                        )
                     else:
                         _render_synoptic_map(
                             build_opacity_slider_map(fig_a, fig_b),
                             f"Opacity Slider Compare: {epoch_period_label('A')} ↔ {epoch_period_label('B')}",
                             "map_opacity",
                             bottom_margin=60,
+                            export_title=map_export_title(
+                                map_var_code, view_mode,
+                                f"{epoch_period_label('A')} ↔ {epoch_period_label('B')}",
+                                target_date, persist_metric,
+                            ),
                         )
                         st.caption("Drag the slider under the map to cross-fade between the two reference periods.")
                     with st.container(key="atmopulse_map_tables"):
@@ -606,6 +629,7 @@ def render_map_tracker(
                         _cached_map(ep_sel, full_width=True),
                         flicker_title,
                         "map_flicker",
+                        export_title=_map_title(flicker_title),
                     )
                     df_h, df_c = calculate_top10(
                         ref_clim, map_phys_data, target_date,

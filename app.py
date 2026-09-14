@@ -28,6 +28,7 @@ from geopy.exc import GeocoderServiceError, GeocoderTimedOut, GeocoderUnavailabl
 from geopy.geocoders import Nominatim
 
 from backend_maps import etccdi_doy_365, latest_era5_archive_date
+from backend_io import get_archive_year_options
 from backend_waves import compute_kysely_waves_data, rank_waves_by_metric
 from labels import HELP
 from atmopulse_theme import (
@@ -59,6 +60,7 @@ from config import (
     SPELL_OFF,
     SPELL_LABELS,
     MAP_VAR_OPTIONS,
+    MAP_VAR_LABELS,
     METEO_COUNT_OPTIONS,
     METEO_COUNT_SPELL,
     FORECAST_OFFSET_MIN,
@@ -161,6 +163,40 @@ def _wave_section_spacer(px: int = 28) -> None:
     # (ridge -> drill-down -> intensity -> frequency) — no divider line,
     # just vertical margin, so the sections read as distinct blocks.
     st.markdown(f"<div style='margin-top:{px}px'></div>", unsafe_allow_html=True)
+
+
+def _open_wave_event_on_map(start_date):
+    """Callback for the per-event 'Map this event' button: point the Map
+    Tracker at this wave's start day (ERA5 Archive), pre-select the
+    Meteogram's Archive Year to match if that calendar year is already a
+    complete ERA5 archive year (else leave the Meteogram on Live), and jump
+    the top nav to Map Tracker. Never touches offset_slider — this is a
+    one-way "open on map" action, not a general Map<->Meteogram coupling.
+
+    No explicit st.rerun() here: Streamlit always reruns the script once
+    after any on_click callback finishes, so calling st.rerun() inside it
+    is a documented no-op (and raises a "Calling st.rerun() within a
+    callback is a no-op" warning banner) rather than a second, real rerun.
+    """
+    start_ts = pd.Timestamp(start_date)
+    min_d = pd.Timestamp(1940, 1, 1).date()
+    max_d = latest_era5_archive_date().date()
+    st.session_state.map_archive_mode = "Date"
+    st.session_state.map_archive_date = min(max(start_ts.date(), min_d), max_d)
+
+    archive_years = get_archive_year_options(pd.Timestamp.utcnow().strftime("%Y-%m-%d"))
+    # Stashed in a plain (never-a-widget) key, not written straight into
+    # met_archive_year: the Meteogram's selectbox won't be instantiated
+    # again for at least this rerun (we're jumping to Map Tracker), and
+    # Streamlit drops session_state for a widget key that isn't recreated
+    # in a run. page_meteogram.render_meteogram() consumes this pending
+    # value into met_archive_year right before building that selectbox,
+    # whenever the user actually gets there — even several reruns later.
+    st.session_state.pending_met_archive_year = (
+        str(start_ts.year) if start_ts.year in archive_years else "Live"
+    )
+
+    st.session_state.atmopulse_top_nav = NAV_MAP
 
 
 def _render_wave_drilldown(payload_a, payload_b, stack_metric, ctx_key, click_events=()):
@@ -336,6 +372,14 @@ def _render_wave_drilldown(payload_a, payload_b, stack_metric, ctx_key, click_ev
                             "value": window.values,
                         }).to_csv(index=False)
                 render_press_export(mini_fig, f"wavogram_event_{w['event_id']}", csv_text=csv_text)
+                st.button(
+                    "Map this event",
+                    key=f"wave_open_map_{w['event_id']}",
+                    use_container_width=True,
+                    help=HELP["wave_open_map"],
+                    on_click=_open_wave_event_on_map,
+                    args=(w["start_date"],),
+                )
     _wave_section_spacer()
 
 # --- UI & CSS: TOP NAVIGATION BAR ---
@@ -554,10 +598,18 @@ with st.sidebar:
             map_is_archive = st.session_state.get("map_archive_mode") == "Date"
             if map_is_archive:
                 _max_archive = latest_era5_archive_date().date()
-                _default_archive = min(st.session_state.get("map_archive_date", _max_archive), _max_archive)
+                # Pre-seed/clamp session_state BEFORE creating the widget, and
+                # never also pass `value=` below — passing both a `value` and
+                # a `key` that's already present in session_state is exactly
+                # the combination that trips Streamlit's yellow
+                # "created with a default value but also had its value set
+                # via the Session State API" warning.
+                if "map_archive_date" not in st.session_state:
+                    st.session_state.map_archive_date = _max_archive
+                else:
+                    st.session_state.map_archive_date = min(st.session_state.map_archive_date, _max_archive)
                 st.date_input(
                     "Archive date:",
-                    value=_default_archive,
                     min_value=pd.Timestamp(1940, 1, 1).date(),
                     max_value=_max_archive,
                     key="map_archive_date",
@@ -883,6 +935,21 @@ elif nav_selection == NAV_MAP:
 
 elif nav_selection in (NAV_METEO, NAV_WAVE):
     st.subheader("🏙️ Target Location")
+    # loc_history_sel / new_loc_input only ever get created on this branch.
+    # Per Streamlit's widget-behavior rules, a keyed widget's value in
+    # session_state is deleted whenever the widget isn't rendered during a
+    # script run — so a detour through Map Tracker or Welcome (e.g. via the
+    # Wavogram's "Map this event" button) silently resets both back to
+    # "Select..." / "" the next time this branch runs. Restore from a
+    # plain shadow key (never itself a widget key, so it's never wiped)
+    # right before the widgets are (re-)created, then keep the shadow in
+    # sync below — the standard Streamlit pattern for carrying a widget's
+    # value across a page/branch it isn't rendered on.
+    if "loc_history_sel" not in st.session_state:
+        st.session_state["loc_history_sel"] = st.session_state.get("_active_loc_history_sel", "Select...")
+    if "new_loc_input" not in st.session_state:
+        st.session_state["new_loc_input"] = st.session_state.get("_active_new_loc_input", "")
+
     search_col1, search_col2 = st.columns([1, 2])
     with search_col1: 
         loc_history_sel = st.selectbox(
@@ -897,6 +964,8 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
             key="new_loc_input",
             on_change=_on_new_loc_input_change,
         )
+    st.session_state["_active_loc_history_sel"] = loc_history_sel
+    st.session_state["_active_new_loc_input"] = new_loc_input
     st.markdown("<div style='margin-bottom: 25px;'></div>", unsafe_allow_html=True)
 
     location = None
@@ -954,11 +1023,11 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                 map_layout = st.radio("Layout:", (LAYOUT_SIDE_BY_SIDE, LAYOUT_FLICKER), horizontal=True, key="wave_layout")
             else:
                 map_layout = STANDARD_DEFAULTS["map_layout"]
-            if is_aifs_model():
+            param_code = meteo_var_code(wave_var)
+            if is_aifs_model() and param_code in ("TX", "TN"):
                 st.warning(AIFS_TXTN_WARNING)
             else:
                 with st.spinner("Generating Historical Waves..."):
-                    param_code = meteo_var_code(wave_var)
                     (fig_m_a, fig_s_a, fig_f_a), (fig_m_b, fig_s_b, fig_f_b) = fetch_aligned_wave_figs(
                         lat_target, lon_target, param_code, wave_thresh,
                         is_warm=is_warm, z500_outline=wave_z500_outline,
@@ -989,6 +1058,14 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                     if str(wave_stack_metric).lower().startswith("day")
                     else "Intensity [K]"
                 )
+                wave_kind = "Heatwaves" if is_warm else "Coldwaves"
+                var_bit = MAP_VAR_LABELS.get(param_code, param_code)
+
+                def _wave_export_title(panel: str, epoch: str) -> str:
+                    return (
+                        f"{panel} · {var_bit} ({param_code}) {wave_kind} | "
+                        f"{epoch_period_label(epoch)}"
+                    )
 
                 if map_layout == LAYOUT_SIDE_BY_SIDE:
                     w_col1, w_col2 = st.columns(2)
@@ -1025,27 +1102,39 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                             f"**{stack_heading} | {epoch_period_label('A')}**",
                             help=HELP["wave_annual_stack"],
                         )
-                        st_plotly_press(fig_s_a, "wavogram_stats_historical")
+                        st_plotly_press(
+                            fig_s_a, "wavogram_stats_historical",
+                            export_title=_wave_export_title(stack_heading, "A"),
+                        )
                         if show_expert("wave_annual_cycle"):
                             _wave_section_spacer()
                             st.markdown(
                                 f"**Frequency [%] | {epoch_period_label('A')}**",
                                 help=HELP["wave_annual_cycle"],
                             )
-                            st_plotly_press(fig_f_a, "wavogram_freq_historical")
+                            st_plotly_press(
+                                fig_f_a, "wavogram_freq_historical",
+                                export_title=_wave_export_title("Frequency [%]", "A"),
+                            )
                     with st_col2:
                         st.markdown(
                             f"**{stack_heading} | {epoch_period_label('B')}**",
                             help=HELP["wave_annual_stack"],
                         )
-                        st_plotly_press(fig_s_b, "wavogram_stats_recent")
+                        st_plotly_press(
+                            fig_s_b, "wavogram_stats_recent",
+                            export_title=_wave_export_title(stack_heading, "B"),
+                        )
                         if show_expert("wave_annual_cycle"):
                             _wave_section_spacer()
                             st.markdown(
                                 f"**Frequency [%] | {epoch_period_label('B')}**",
                                 help=HELP["wave_annual_cycle"],
                             )
-                            st_plotly_press(fig_f_b, "wavogram_freq_recent")
+                            st_plotly_press(
+                                fig_f_b, "wavogram_freq_recent",
+                                export_title=_wave_export_title("Frequency [%]", "B"),
+                            )
                 else:
                     flicker_epoch = st.radio(
                         "Select Reference Period:",
@@ -1066,14 +1155,20 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                         f"**{stack_heading} | {epoch_period_label(ep)}**",
                         help=HELP["wave_annual_stack"],
                     )
-                    st_plotly_press(fig_s_a if use_a else fig_s_b, f"wavogram_stats_{ep}")
+                    st_plotly_press(
+                        fig_s_a if use_a else fig_s_b, f"wavogram_stats_{ep}",
+                        export_title=_wave_export_title(stack_heading, ep),
+                    )
                     if show_expert("wave_annual_cycle"):
                         _wave_section_spacer()
                         st.markdown(
                             f"**Frequency [%] | {epoch_period_label(ep)}**",
                             help=HELP["wave_annual_cycle"],
                         )
-                        st_plotly_press(fig_f_a if use_a else fig_f_b, f"wavogram_freq_{ep}")
+                        st_plotly_press(
+                            fig_f_a if use_a else fig_f_b, f"wavogram_freq_{ep}",
+                            export_title=_wave_export_title("Frequency [%]", ep),
+                        )
 
                 if show_expert("z500") and wave_z500_outline:
                     st.caption(HELP["wave_z500_outline"])

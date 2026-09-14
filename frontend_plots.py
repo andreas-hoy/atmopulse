@@ -15,6 +15,7 @@ circular import while app.py imports these plot builders from here.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import re
 
@@ -328,24 +329,175 @@ def _map_yaxis_kwargs(**extra):
         scaleanchor="x", scaleratio=1, visible=False, **extra,
     )
 
-def _add_map_source_label(fig, *, row=None, col=None):
-    """Anchor source tag to the map axes domain (not full figure paper)."""
-    ann = dict(
-        text=f"Data: ERA5/{'AIFS' if is_aifs_model() else 'IFS'}",
-        xref="x domain", yref="y domain",
-        x=0.99, y=0.0,
-        xanchor="right", yanchor="bottom",
-        showarrow=False,
-        font=dict(size=10, color=ATMOPULSE_BRAND["text_on_light"], family=ATMOPULSE_FONTS["sora_css"]),
-        bgcolor="rgba(255,255,255,0.78)",
-        bordercolor="rgba(200,200,200,0.55)",
-        borderwidth=1,
-        borderpad=3,
+def _output_credit_text(*, html_break: bool = False) -> str:
+    """CC BY 4.0 credit required by LICENSE.md / Legal — not a © claim."""
+    src = "AIFS" if is_aifs_model() else "IFS"
+    data = f"Data: ERA5 / ECMWF {src}"
+    sep = "<br>" if html_break else " \u00b7 "
+    return f"AtmoPulse (atmopulse.eu) \u00b7 CC BY 4.0{sep}{data}"
+
+
+def _credit_meta(fig) -> dict:
+    meta = fig.layout.meta
+    return dict(meta) if isinstance(meta, dict) else {}
+
+
+def _has_output_credit(fig) -> bool:
+    meta = fig.layout.meta
+    return isinstance(meta, dict) and bool(meta.get("output_credit"))
+
+
+def _mark_output_credit(fig) -> None:
+    payload = _credit_meta(fig)
+    payload["output_credit"] = True
+    fig.update_layout(meta=payload)
+
+
+def _strip_credit_annotations(fig) -> None:
+    anns = list(fig.layout.annotations or ())
+    kept = tuple(
+        a for a in anns
+        if "atmopulse.eu" not in str(getattr(a, "text", "") or "").lower()
     )
-    if row is None and col is None:
-        fig.add_annotation(**ann)
-    else:
-        fig.add_annotation(**ann, row=row, col=col)
+    fig.layout.annotations = kept
+
+
+def _axes_draw_ticks(fig) -> bool:
+    xa = fig.layout.xaxis
+    return not (xa is not None and xa.visible is False)
+
+
+def _ensure_output_credit(fig) -> None:
+    """Two-line credit in the bottom margin, below ticks — never on the data.
+
+    Paper y=0 is the bottom of the plotting domain (the x-axis). yanchor='top'
+    plus a pixel yshift hangs the text into the extra bottom margin. Maps have
+    no ticks, so they need only a small gap; charts need room for tick labels.
+    """
+    if fig is None:
+        return
+    if _has_output_credit(fig):
+        return
+    margin = fig.layout.margin
+    b = int(margin.b) if margin is not None and margin.b is not None else 40
+    tick_gap = 44 if _axes_draw_ticks(fig) else 10
+    fig.update_layout(margin=dict(b=max(b, tick_gap + 52)))
+    fig.add_annotation(
+        text=_output_credit_text(html_break=True),
+        xref="paper", yref="paper",
+        x=1.0, y=0.0,
+        xanchor="right", yanchor="top",
+        yshift=-tick_gap,
+        showarrow=False,
+        align="right",
+        font=dict(
+            size=9,
+            color=ATMOPULSE_BRAND["text_on_light"],
+            family=ATMOPULSE_FONTS["sora_css"],
+        ),
+    )
+    _mark_output_credit(fig)
+
+
+def _fig_for_press(fig: go.Figure, export_title: str | None = None) -> go.Figure:
+    """Clone used only for SVG/PDF: optional heading + credit in extra margins."""
+    export = go.Figure(fig)
+    margin = export.layout.margin
+    t0 = int(margin.t) if margin is not None and margin.t is not None else 40
+    b0 = int(margin.b) if margin is not None and margin.b is not None else 40
+    l0 = int(margin.l) if margin is not None and margin.l is not None else 40
+    r0 = int(margin.r) if margin is not None and margin.r is not None else 20
+    paper = export.layout.paper_bgcolor
+    if not paper or str(paper).lower() in ("rgba(0,0,0,0)", "transparent"):
+        export.update_layout(paper_bgcolor="white")
+    export.update_layout(
+        margin=dict(
+            t=max(t0, 72) if export_title else max(t0, 16),
+            b=max(b0, 96),
+            l=max(l0, 16),
+            r=max(r0, 16),
+        ),
+    )
+    if export_title:
+        export.update_layout(
+            title=dict(
+                text=export_title,
+                font=plotly_title_font(size=14),
+                x=0.5, xanchor="center",
+                y=0.98, yanchor="top",
+            ),
+        )
+    payload = _credit_meta(export)
+    payload.pop("output_credit", None)
+    export.update_layout(meta=payload)
+    _strip_credit_annotations(export)
+    _ensure_output_credit(export)
+    return export
+
+
+def map_export_title(
+    map_var_code: str, view_mode: str, epoch_label: str, target_date,
+    persist_metric: str | None = None,
+) -> str:
+    """Heading baked into map SVG/PDF (live maps keep titles outside Plotly)."""
+    var = MAP_VAR_LABELS.get(map_var_code, map_var_code)
+    daily = is_daily_map_view(view_mode)
+    kind = "extremes" if daily else "persistence"
+    metric = "" if daily or not persist_metric else f" · {persist_metric}"
+    date_s = pd.Timestamp(target_date).strftime("%d.%m.%Y")
+    return f"{var} ({map_var_code}) {kind}{metric} | {epoch_label} | {date_s}"
+
+
+def _add_map_source_label(fig, *, row=None, col=None):
+    """Kept for call-site compatibility; maps no longer burn credit onto the data."""
+    del fig, row, col
+    return
+
+
+def _browser_download(data: bytes, filename: str, mime: str) -> None:
+    """Trigger a file download in the same click that rendered the vector.
+
+    Streamlit's component iframe often blocks ``a.download`` on itself, so
+    the click is issued on ``window.parent.document``. A nonce keeps
+    Streamlit from skipping a repeated identical HTML block.
+    """
+    b64 = base64.b64encode(data).decode("ascii")
+    safe_name = (
+        filename.replace("\\", "_").replace("'", "").replace('"', "").replace("`", "")
+    )
+    nonce = int(st.session_state.get("_press_dl_n", 0)) + 1
+    st.session_state["_press_dl_n"] = nonce
+    components.html(
+        f"""<script>
+(function() {{
+  const n = {nonce};
+  const mime = {mime!r};
+  const name = {safe_name!r};
+  const b64 = {b64!r};
+  function blobFromB64() {{
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], {{type: mime}});
+  }}
+  const url = URL.createObjectURL(blobFromB64());
+  function clickOn(doc) {{
+    const a = doc.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.rel = 'noopener';
+    doc.body.appendChild(a);
+    a.click();
+    a.remove();
+  }}
+  try {{ clickOn(window.parent.document); }}
+  catch (e) {{ clickOn(document); }}
+  setTimeout(function() {{ URL.revokeObjectURL(url); }}, 4000);
+}})();
+</script>""",
+        height=1,
+        width=1,
+    )
 
 
 def _attach_press_csv(fig: go.Figure, csv_text: str | None) -> None:
@@ -380,6 +532,7 @@ def _fig_fingerprint(fig: go.Figure) -> str:
                 parts.append(str(arr.flat[0]))
                 parts.append(str(arr.flat[-1]))
             break
+    parts.append(_output_credit_text())
     return hashlib.md5("|".join(parts).encode("utf-8", errors="ignore")).hexdigest()
 
 
@@ -402,58 +555,41 @@ def _kaleido_image(fig: go.Figure, fmt: str) -> bytes:
 
 
 def _press_vector_slot(fig: go.Figure, stem: str, fmt: str, label: str, mime: str) -> None:
-    """One SVG or PDF control: click to render, then a download button.
-
-    Kaleido only runs after the user asks for that format, and only for that
-    format. A figure change (new fingerprint) clears the prepared state so
-    date/toggle reruns do not silently re-export.
-    """
-    fp = _fig_fingerprint(fig)
-    ready_key = f"press_ready_{fmt}_{stem}"
-    fp_key = f"press_fp_{fmt}_{stem}"
-    if st.session_state.get(fp_key) != fp:
-        st.session_state[ready_key] = False
-        st.session_state[fp_key] = fp
-    if not st.session_state.get(ready_key):
-        if st.button(label, key=f"press_go_{fmt}_{stem}"):
-            st.session_state[ready_key] = True
-            st.rerun()
-        return
-    try:
-        with st.spinner(f"Rendering {label}…"):
-            blob = _kaleido_image(fig, fmt)
-    except Exception as exc:
-        st.caption(f"{label} unavailable")
-        st.caption(f"Vector export needs the kaleido package ({exc})")
-        return
-    st.download_button(
-        label, data=blob,
-        file_name=f"AtmoPulse_{stem}.{fmt}",
-        mime=mime, key=f"press_{stem}_{fmt}",
-    )
+    """One click renders the vector and starts the browser download."""
+    if st.button(label, key=f"press_go_{fmt}_{stem}"):
+        try:
+            with st.spinner(f"Rendering {label}…"):
+                blob = _kaleido_image(fig, fmt)
+            _browser_download(blob, f"AtmoPulse_{stem}.{fmt}", mime)
+        except Exception as exc:
+            st.caption(f"{label} unavailable")
+            st.caption(f"Vector export needs the kaleido package ({exc})")
 
 
 def render_press_export(
     fig: go.Figure, stem: str, csv_text: str | None = None, *, heavy: bool = False,
+    export_title: str | None = None,
 ) -> None:
     """Compact SVG / PDF / CSV row. Vector files are built only on request.
 
     ``heavy`` is kept so existing map call-sites do not break; it is no longer
     a separate code path (maps used to bundle SVG+PDF behind one Prepare click).
+    ``export_title`` is drawn only on the downloaded SVG/PDF, not on the live chart.
     """
     del heavy
     if csv_text is None:
         meta = fig.layout.meta
         if isinstance(meta, dict):
             csv_text = meta.get("press_csv")
+    press_fig = _fig_for_press(fig, export_title=export_title)
     stem = _press_stem(stem)
     n = 3 if csv_text else 2
     with st.container(key=f"press-row-{stem}"):
         cols = st.columns([1] * n + [10], gap="small")
         with cols[0]:
-            _press_vector_slot(fig, stem, "svg", "SVG", "image/svg+xml")
+            _press_vector_slot(press_fig, stem, "svg", "SVG", "image/svg+xml")
         with cols[1]:
-            _press_vector_slot(fig, stem, "pdf", "PDF", "application/pdf")
+            _press_vector_slot(press_fig, stem, "pdf", "PDF", "application/pdf")
         if csv_text:
             with cols[2]:
                 st.download_button(
@@ -466,6 +602,7 @@ def render_press_export(
 def st_plotly_press(
     fig: go.Figure, stem: str, csv_text: str | None = None,
     *, on_select: str | None = None, selection_mode=("points",), key: str | None = None,
+    export_title: str | None = None,
     **chart_kw,
 ):
     """`st.plotly_chart` + the compact SVG/PDF/CSV row.
@@ -484,11 +621,15 @@ def st_plotly_press(
     if key is not None:
         plot_kwargs["key"] = key
     event = st.plotly_chart(fig, **plot_kwargs)
-    render_press_export(fig, stem, csv_text=csv_text)
+    st.caption(_output_credit_text())
+    render_press_export(fig, stem, csv_text=csv_text, export_title=export_title)
     return event
 
 
-def _render_synoptic_map(fig, title: str, key: str, *, bottom_margin: int = 0) -> None:
+def _render_synoptic_map(
+    fig, title: str, key: str, *, bottom_margin: int = 0,
+    export_title: str | None = None,
+) -> None:
     """Render one synoptic map: Streamlit title above a CSS 70:42 frame.
 
     Titles stay outside Plotly so the plot area can match EUROPE_BBOX
@@ -516,7 +657,11 @@ def _render_synoptic_map(fig, title: str, key: str, *, bottom_margin: int = 0) -
             config=SYNOPTIC_MAP_CONFIG,
             key=f"plotly_{key}",
         )
-    render_press_export(fig, f"map_{key}", heavy=True)
+    st.caption(_output_credit_text())
+    render_press_export(
+        fig, f"map_{key}", heavy=True,
+        export_title=export_title or title,
+    )
 
 def _mslp_sep2(lon1, lat1, lon2, lat2) -> float:
     """Squared angular distance with a cosine correction for longitude."""
@@ -1207,7 +1352,7 @@ def get_cached_baseline_map(
     t_warm_items, t_cold_items, active_toggles, source_mtime, forecast_model,
     full_width=False, anchor_date_str=None, spell_days=6,
     anom_mslp_hpa=_MSLP_ANOM_INTERVAL, _hl_version=_MSLP_HL_VERSION,
-    _jet_version=_JET_OVERLAY_VERSION,
+    _jet_version=_JET_OVERLAY_VERSION, _credit_version=2,
     *, _ref_data, _map_phys_data, _syn_clim=None,
 ):
     """Schritt C: @st.cache_data front door for build_baseline_map.
@@ -1339,7 +1484,9 @@ def build_opacity_slider_map(
     return fig
 
 
-def render_swipe_compare_map(fig_a, fig_b) -> None:
+def render_swipe_compare_map(
+    fig_a, fig_b, *, export_title_a: str | None = None, export_title_b: str | None = None,
+) -> None:
     """One map, two Plotly.js instances drawn inside a single self-owned
     iframe, with the top layer clipped by a CSS custom property.
 
@@ -1579,11 +1726,18 @@ def render_swipe_compare_map(fig_a, fig_b) -> None:
 """
     components.html(html, height=520, scrolling=False)
     st.caption("Drag the map or the slider: left is 1961–1990, right is 1996–2025.")
+    st.caption(_output_credit_text())
     e1, e2 = st.columns(2)
     with e1:
-        render_press_export(fig_bottom, "swipe_historical", heavy=True)
+        render_press_export(
+            fig_bottom, "swipe_historical", heavy=True,
+            export_title=export_title_a,
+        )
     with e2:
-        render_press_export(fig_top, "swipe_recent", heavy=True)
+        render_press_export(
+            fig_top, "swipe_recent", heavy=True,
+            export_title=export_title_b,
+        )
 
 # --- METEOGRAM CORE TRACES (For Subplots) ---
 def _densify_at_level_crossings(x, y, *levels):
@@ -1848,14 +2002,14 @@ def _z500_fill_rgba(hex_color: str, alpha: float) -> str:
 def get_z500_anomaly_traces(df_live, syn_clim, lat, lon, target_date, epoch):
     """Expert driver panel: point Z500 minus the epoch's 5-day DOY mean (dam).
 
-    Returns ``(traces, y_range)``. ``y_range`` is symmetric about zero.
+    Returns ``(traces, y_range, csv_text)``. ``y_range`` is symmetric about zero.
     Empty traces and ``None`` when Z500 or the synoptic climatology is missing.
     """
     if syn_clim is None or df_live is None or df_live.empty or "Z500" not in df_live.columns:
-        return [], None
+        return [], None, None
     clim = synoptic_clim_point_doy(syn_clim, "z500", epoch, lat, lon)
     if clim is None or clim.size < 365:
-        return [], None
+        return [], None, None
 
     dates = pd.to_datetime(df_live["Date"], utc=True).dt.tz_convert(None)
     tgt_dt_norm = pd.to_datetime(target_date, utc=True).tz_convert(None)
@@ -1864,7 +2018,7 @@ def get_z500_anomaly_traces(df_live, syn_clim, lat, lon, target_date, epoch):
     z_clim = clim[np.clip(doys - 1, 0, len(clim) - 1)]
     anom = z_live - z_clim
     if not np.isfinite(anom).any():
-        return [], None
+        return [], None, None
 
     span = float(np.nanmax(np.abs(anom)))
     y_lim = max(_Z500_ANOM_Y_FLOOR, span * 1.15)
@@ -1924,7 +2078,13 @@ def get_z500_anomaly_traces(df_live, syn_clim, lat, lon, target_date, epoch):
             "<extra></extra>"
         ),
     ))
-    return traces, y_range
+    csv_text = pd.DataFrame({
+        "date": pd.DatetimeIndex(pd.to_datetime(dates)).strftime("%Y-%m-%d"),
+        "z500_dam": np.round(z_live, 2),
+        "doy_mean_dam": np.round(z_clim, 2),
+        "z500_anom_dam": np.round(anom, 2),
+    }).to_csv(index=False)
+    return traces, y_range, csv_text
 
 
 def _days_in_runs(flag, dates, min_len=6):
@@ -2014,7 +2174,7 @@ def build_yearly_extremes_chart(
     years = res.index
     bar_kw = dict(hoverinfo="skip", hovertemplate=None)
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.26,
+        rows=2, cols=1, shared_xaxes=False, vertical_spacing=0.28,
         subplot_titles=(
             "Warm · WSDI (6×P90)" if wsdi else "Warm",
             "Cold · CSDI (6×P10)" if csdi else "Cold",
@@ -2059,16 +2219,16 @@ def build_yearly_extremes_chart(
         barmode="stack",
         hovermode="x",
         title=f"Days exceeding thresholds | {epoch_period_label(epoch)}",
-        height=580,
-        margin=dict(t=56, b=56, l=50, r=20),
+        height=620,
+        margin=dict(t=56, b=80, l=50, r=20),
         template="plotly_white",
         legend=dict(
-            orientation="h", y=0.63, yanchor="top",
+            orientation="h", y=0.50, yanchor="top",
             x=0.5, xanchor="center", bgcolor="rgba(0,0,0,0)",
             traceorder="normal",
         ),
         legend2=dict(
-            orientation="h", y=-0.06, yanchor="top",
+            orientation="h", y=-0.10, yanchor="top",
             x=0.5, xanchor="center", bgcolor="rgba(0,0,0,0)",
             traceorder="normal",
         ),
@@ -2100,8 +2260,16 @@ def build_yearly_extremes_chart(
     )
     fig.update_yaxes(title_text="WSDI days" if wsdi else "days ≥ P75", rangemode="tozero", **grid, row=1, col=1)
     fig.update_yaxes(title_text="CSDI days" if csdi else "days ≤ P25", rangemode="tozero", **grid, row=2, col=1)
-    fig.update_xaxes(dtick=20, tick0=1960, automargin=True, **grid, row=1, col=1)
-    fig.update_xaxes(dtick=20, tick0=1960, automargin=True, **grid, row=2, col=1)
+    fig.update_xaxes(
+        dtick=20, tick0=1960, automargin=True,
+        showticklabels=True, ticks="outside", visible=True, **grid,
+        row=1, col=1,
+    )
+    fig.update_xaxes(
+        dtick=20, tick0=1960, automargin=True,
+        showticklabels=True, ticks="outside", visible=True, **grid,
+        row=2, col=1,
+    )
     return fig
 
 

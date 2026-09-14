@@ -214,4 +214,8 @@ HELP: dict[str, str] = {
         "Intensity for every detected event. Switching Intensity ↔ Days resets all five slots to the new "
         "Top 5, unless you've changed a slot manually — then your picks are kept and just re-ranked."
     ),
+    "wave_open_map": (
+        "Opens the Europe-wide map on this event's first wave day (ERA5 Archive) and sets the Meteogram to "
+        "that calendar year."
+    ),
 }
