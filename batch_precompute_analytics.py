@@ -138,11 +138,11 @@ def _cached_country_weight_grid(lons_tuple, lats_tuple):
 
 
 def _footprint_path(target_date_str: str, map_var_code: str, epoch: str, threshold: str):
-    return OUTPUT_DIR / f"footprint_{target_date_str}_{map_var_code}_{epoch}_{threshold}.parquet"
+    return OUTPUT_DIR / f"footprint_{target_date_str}_{map_var_code}_{epoch}_{threshold}_v3.parquet"
 
 
 def _top10_paths(target_date_str: str, map_var_code: str, epoch: str, threshold: str):
-    base = f"top10_{target_date_str}_{map_var_code}_{epoch}_{threshold}"
+    base = f"top10_{target_date_str}_{map_var_code}_{epoch}_{threshold}_v3"
     return OUTPUT_DIR / f"{base}_warm.parquet", OUTPUT_DIR / f"{base}_cold.parquet"
 
 

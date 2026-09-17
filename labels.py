@@ -38,8 +38,11 @@ HELP: dict[str, str] = {
         "weather forecasts."
     ),
     "forecast_offset": (
-        "Adjusts the target date. Negative values analyze the past (ERA5 reanalysis), "
-        "positive values look into the future (IFS or AIFS forecast)."
+        "Shifts the live map date relative to today (negative = recent past, "
+        "positive = forecast). The last ~6 days and the forecast use the selected "
+        "IFS/AIFS overlay; older days stay on ERA5. Inactive while Map date is "
+        "Date. Stays active when Map date is Live, including Dates compare "
+        "(left panel)."
     ),
     "forecast_model": (
         "IFS (Physics-based): ECMWF HRES with native diurnal TX/TN extremes.\n\n"
@@ -53,7 +56,24 @@ HELP: dict[str, str] = {
         "Date: a single historical calendar day, read straight from that year's ERA5 "
         "archive batch only — no forecast model involved, and the Forecast Offset "
         "below is inactive. Available from 1 Jan 1940 through the most recent "
-        "settled ERA5 day."
+        "settled ERA5 day. In Dates compare this is the left panel; the partner "
+        "date is Compare with on the map."
+    ),
+    "map_compare_axis": (
+        "Reference periods: both panels show the same map date against 1961–1990 (left) "
+        "and 1996–2025 (right). Dates: both panels use the same climatology (Colour against; "
+        "default 1996–2025). Left follows Map date (Live from Forecast Offset, or an "
+        "Archive Date); right is Compare with (ERA5 only). Two archive dates are both ERA5. "
+        "Layout (side-by-side, flicker, opacity, swipe) then applies to whichever comparison is active."
+    ),
+    "map_compare_date": (
+        "Partner ERA5 calendar day for Dates compare (right panel). Default is the same "
+        "month/day one year earlier than the left date. No forecast overlay — archive only. "
+        "Available from 1 Jan 1940 through the most recent settled ERA5 day."
+    ),
+    "map_date_epoch": (
+        "Climatology used to colour both dates. Default is the recent 1996–2025 baseline "
+        "so the two dates are judged on the same scale."
     ),
     "map_variable": (
         "Mean Temperature (TG): 24-hour mean (0–0 UTC) of air temperature at 2 m.\n\n"
@@ -131,6 +151,11 @@ HELP: dict[str, str] = {
         "Each level includes all stricter levels. The highlighted row is the selected analysis level. "
         "All-time records are not epoch-relative, so Change is omitted."
     ),
+    "europe_share_table_dates": (
+        "Share of Europe at each cumulative severity level on the left date and the "
+        "compare date, both judged against the same selected climatology. "
+        "Each level includes all stricter levels. The highlighted row is the selected analysis level."
+    ),
 
     # --- Point Meteogram ---
     "meteogram_envelope": (
@@ -141,8 +166,29 @@ HELP: dict[str, str] = {
     ),
     "meteo_archive_year": (
         "Live (default): rolling ~375-day window with the current IFS/AIFS forecast overlay. "
-        "A calendar year: closed 1 Jan-31 Dec ERA5/ERA5T series at this point only — no "
-        "forecast, and the Forecast Model choice is ignored."
+        "A calendar year: ERA5/ERA5T only at this point — no forecast, and the Forecast Model "
+        "choice is ignored. Closed years are 1 Jan–31 Dec. The current year runs from 1 Jan "
+        "through the last settled ERA5/ERA5T day, so it ends a few days before Live "
+        "(Live continues with IFS/AIFS; archive is never filled with forecast). "
+        "In Live vs Year this is the left series; the partner year is Compare year on the right."
+    ),
+    "meteo_compare_axis": (
+        "Reference periods: both panels show the same series against 1961–1990 and 1996–2025. "
+        "Live vs Year: both panels use the same climatology (Colour against; default 1996–2025). "
+        "Left follows Archive Year (Live window, or a calendar year). Right is Compare year "
+        "(ERA5/ERA5T). Live vs a year uses the same season as the Live window (including the "
+        "previous year if Live crosses 1 January); two archive years are calendar years "
+        "(the current year only as far as ERA5/ERA5T has landed)."
+    ),
+    "meteo_compare_year": (
+        "Partner year for Live vs Year (right panel). Against Live: the same season as the "
+        "Live window (including the preceding year if the window crosses 1 January). Against "
+        "another archive year: ERA5/ERA5T for that calendar year. The current year ends a few "
+        "days before Live because it is ERA5/ERA5T only — no IFS/AIFS fill. Default is one year "
+        "before the left series, preferring a closed year over the in-progress current year."
+    ),
+    "meteo_date_epoch": (
+        "Climatology used to colour both envelopes. Default is the recent 1996–2025 baseline."
     ),
     "meteo_z500_panel": (
         "500 hPa height anomaly at this grid cell versus the 5-day day-of-year mean of the "
@@ -201,8 +247,8 @@ HELP: dict[str, str] = {
         "detected record for the reference period chosen below. Each mini-chart shows the daily ERA5 values "
         "around that event (±3 display days) with the two active percentile thresholds (main trigger: solid, "
         "bold; drop tolerance: dotted, faded — same colour) and the detected event window shaded up to its "
-        "last in-wave day. Swap a slot below, or click a wave on the ridge plot above (best-effort — the "
-        "dropdown always works)."
+        "last in-wave day. In Expert mode a Z500-anomaly sparkline is shown under each example. Swap a slot "
+        "below, or click a wave on the ridge plot above (best-effort — the dropdown always works)."
     ),
     "wave_drilldown_epoch": (
         "Which reference period's detected events are ranked and shown below — independent of which ridge/"

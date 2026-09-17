@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Build Quantile Delta Mapping (QDM) transfer functions for IFS vs ERA5.
 
-Computes a static 99-quantile bias lookup (IFS hindcast minus ERA5) for
-TX, diurnal temperature range (DTR = TX − TN), and TG over the 2004–2023
-calibration overlap. Each day-of-year uses a centred 31-day window on a
-homogeneous ETCCDI 365-day calendar (29 February excised; leap-year DOY
-shifted after 1 March). Output: ``qdm_transfer_functions.nc``.
+Computes a static 99-quantile lookup for TX, diurnal temperature range
+(DTR = TX − TN), and TG over the 2004–2023 calibration overlap. Each
+day-of-year uses a centred 31-day window on a homogeneous ETCCDI 365-day
+calendar (29 February excised; leap-year DOY shifted after 1 March).
+
+Writes ``qdm_transfer_functions.nc`` with, for each variable:
+  ``*_bias``  — Δ(τ) = Q_ERA5(τ) − Q_IFS(τ)
+  ``*_ifs_q`` — Q_IFS(τ), so a new forecast value can be ranked (true QDM)
+
+T850 is intentionally omitted (free atmosphere; not bias-corrected).
+Application is in ``backend_io.py`` at read time, never in ifs_ingestion.py.
 """
 
 from __future__ import annotations
@@ -143,16 +149,31 @@ def build_qdm_matrices() -> None:
             "tx_bias": empty_4d(),
             "dtr_bias": empty_4d(),
             "tg_bias": empty_4d(),
+            "tx_ifs_q": empty_4d(),
+            "dtr_ifs_q": empty_4d(),
+            "tg_ifs_q": empty_4d(),
+        },
+        attrs={
+            "title": "IFS vs ERA5 Quantile Delta Mapping transfer functions",
+            "qdm": "Cannon 2015: x' = x + Δ(F_IFS(x)); Δ = Q_ERA5 − Q_IFS",
+            "applied_in": "backend_io.py (live IFS overlay only; not AIFS, not ERA5)",
+            "not_corrected": "t850 (free atmosphere)",
         },
     )
+    ds_qdm["tx_bias"].attrs["long_name"] = "ERA5 minus IFS TX quantile"
+    ds_qdm["dtr_bias"].attrs["long_name"] = "ERA5 minus IFS DTR quantile"
+    ds_qdm["tg_bias"].attrs["long_name"] = "ERA5 minus IFS TG quantile"
+    ds_qdm["tx_ifs_q"].attrs["long_name"] = "IFS TX empirical quantile values"
+    ds_qdm["dtr_ifs_q"].attrs["long_name"] = "IFS DTR empirical quantile values"
+    ds_qdm["tg_ifs_q"].attrs["long_name"] = "IFS TG empirical quantile values"
 
     variables = [
-        ("tx", "tx", "tx_bias"),
-        ("dtr", "dtr", "dtr_bias"),
-        ("tg", "tg", "tg_bias"),
+        ("tx", "tx", "tx_bias", "tx_ifs_q"),
+        ("dtr", "dtr", "dtr_bias", "dtr_ifs_q"),
+        ("tg", "tg", "tg_bias", "tg_ifs_q"),
     ]
 
-    for var_era5, var_ifs, out_var in variables:
+    for var_era5, var_ifs, out_var, ifs_q_var in variables:
         logging.info("Computing transfer functions for: %s...", out_var.upper())
 
         if var_era5 == "dtr":
@@ -171,11 +192,12 @@ def build_qdm_matrices() -> None:
             )
             q_ifs = calculate_empirical_quantiles(arr_ifs, ifs_doys, target_doy)
 
-            # Bias = observation − model; added to the live forecast in
-            # ifs_ingestion.py.
+            # Bias = observation − model. Live IFS is ranked on q_ifs, then
+            # this Δ is added (backend_io.py). Do not bake it into ingest.
             bias_matrix = q_era5 - q_ifs
 
             ds_qdm[out_var].values[idx] = bias_matrix
+            ds_qdm[ifs_q_var].values[idx] = q_ifs
 
             if target_doy % 30 == 0 or target_doy == 365:
                 print(

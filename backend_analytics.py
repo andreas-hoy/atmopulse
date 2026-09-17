@@ -34,46 +34,44 @@ PRECOMPUTED_ANALYTICS_DIR: Path = DATA_ROOT / "Precomputed_Analytics"
 # with the Top-10 files. Any of the four is equally valid on read; this is
 # just the fixed one the lazy-loading wrapper below looks for.
 _FOOTPRINT_CACHE_THRESHOLD = "Strong"
+# Bump when classification inputs change (native TG percentiles). Old
+# Parquet files stay on disk but must not be served.
+_ANALYTICS_SCHEMA = "v3"
 
 
 def _synoptic_temp_pair(map_phys_data):
-    """TX/TN arrays for the map renderer, resolved INDEPENDENTLY.
+    """TX/TN arrays for the map renderer, resolved independently.
 
     The Map Tracker's per-variable data fetch (`synoptic_vars_for_map`)
     only loads the field(s) an actual view needs — a TX-only view fetches
-    "tx" alone, never "tn" — so requiring both to be present together (the
-    previous behaviour) wrongly blanked single-variable TX/TN views
-    whenever the other, unrequested field wasn't in `map_phys_data`.
+    "tx" alone, never "tn" — so requiring both to be present together
+    wrongly blanked single-variable TX/TN views whenever the other,
+    unrequested field wasn't in `map_phys_data`.
 
-    Each side now falls back to TG only for ITSELF when missing (AIFS has
-    no native diurnal extremes, so this only ever substitutes for an
-    IFS/ERA5 gap), and is `None` only when neither that side nor TG is
-    available at all — no other fabricated substitute. Callers must check
-    only the specific side(s) their `map_var` actually needs, via
-    `_temp_pair_missing()`, not assume both are always populated together.
+    Missing TX or TN stays `None`. Never substitute TG (or anything else)
+    for a diurnal extreme. Callers must check only the side(s) their
+    `map_var` actually needs, via `_temp_pair_missing()`.
     """
     tx = map_phys_data.get("tx")
     tn = map_phys_data.get("tn")
-    tg = map_phys_data.get("tg")
-    tg_arr = _synoptic_array(tg) if tg is not None else None
-    tx_arr = _synoptic_array(tx) if tx is not None else tg_arr
-    tn_arr = _synoptic_array(tn) if tn is not None else tg_arr
+    tx_arr = _synoptic_array(tx) if tx is not None else None
+    tn_arr = _synoptic_array(tn) if tn is not None else None
     return tx_arr, tn_arr
 
 
-def _temp_pair_missing(map_var: str, tx_curr, tn_curr) -> bool:
-    """True when the side(s) of `_synoptic_temp_pair()`'s result that
-    `map_var` actually needs are absent. TX only needs `tx_curr`, TN only
-    needs `tn_curr` (see `_synoptic_temp_pair`'s docstring for why); TG
-    needs both (its own value only falls back to `(tx+tn)/2` when "tg"
-    itself is missing). T850 never uses this pair — callers already gate
-    that case separately (`map_var != "T850"`) before calling this.
+def _temp_pair_missing(map_var: str, tx_curr, tn_curr, map_phys_data=None) -> bool:
+    """True when the field `map_var` actually classifies is absent.
+
+    TX needs `tx_curr`, TN needs `tn_curr`, TG needs native `tg` in
+    `map_phys_data`. No cross-variable substitute. T850 is gated by
+    callers (`map_var != "T850"`) before this check.
     """
     if map_var == "TX":
         return tx_curr is None
     if map_var == "TN":
         return tn_curr is None
-    return tx_curr is None or tn_curr is None
+    tg = None if map_phys_data is None else map_phys_data.get("tg")
+    return tg is None
 
 
 def _synoptic_lonlat(map_phys_data):
@@ -88,7 +86,11 @@ def _synoptic_lonlat(map_phys_data):
 
 
 def _map_var_threshold_arrays(map_var, map_phys_data, safe_get, suffix, tx, tn):
-    """Current field plus P95/P90/P75/P25/P10/P5 for the selected mapped variable."""
+    """Current field plus P95/P90/P75/P25/P10/P5 for the selected mapped variable.
+
+    TG uses the native `tg` field and native `tg_p*_doy_*` percentiles.
+    Never the mean of TX and TN (field or thresholds).
+    """
     if map_var == "TX":
         v_curr, prefix = tx, "tx"
     elif map_var == "TN":
@@ -98,17 +100,9 @@ def _map_var_threshold_arrays(map_var, map_phys_data, safe_get, suffix, tx, tn):
         v_curr = _synoptic_array(raw) if raw is not None else None
         prefix = "t850"
     else:
-        tg = map_phys_data.get("tg") if map_phys_data else None
-        v_curr = _synoptic_array(tg) if tg is not None else (tx + tn) / 2.0
-        return (
-            v_curr,
-            (safe_get(f"tx_p95_doy_{suffix}") + safe_get(f"tn_p95_doy_{suffix}")) / 2,
-            (safe_get(f"tx_p90_doy_{suffix}") + safe_get(f"tn_p90_doy_{suffix}")) / 2,
-            (safe_get(f"tx_p75_doy_{suffix}") + safe_get(f"tn_p75_doy_{suffix}")) / 2,
-            (safe_get(f"tx_p25_doy_{suffix}") + safe_get(f"tn_p25_doy_{suffix}")) / 2,
-            (safe_get(f"tx_p10_doy_{suffix}") + safe_get(f"tn_p10_doy_{suffix}")) / 2,
-            (safe_get(f"tx_p5_doy_{suffix}") + safe_get(f"tn_p5_doy_{suffix}")) / 2,
-        )
+        raw = map_phys_data.get("tg") if map_phys_data else None
+        v_curr = _synoptic_array(raw) if raw is not None else None
+        prefix = "tg"
     if v_curr is None:
         return (None,) * 7
     return (
@@ -224,11 +218,14 @@ def _top10_analysis_key(top10_threshold: str) -> str:
 
 
 def _footprint_parquet_path(target_date_str, map_var, baseline_type) -> Path:
-    return PRECOMPUTED_ANALYTICS_DIR / f"footprint_{target_date_str}_{map_var}_{baseline_type}_{_FOOTPRINT_CACHE_THRESHOLD}.parquet"
+    return PRECOMPUTED_ANALYTICS_DIR / (
+        f"footprint_{target_date_str}_{map_var}_{baseline_type}_"
+        f"{_FOOTPRINT_CACHE_THRESHOLD}_{_ANALYTICS_SCHEMA}.parquet"
+    )
 
 
 def _top10_parquet_paths(target_date_str, map_var, baseline_type, top10_threshold) -> tuple[Path, Path]:
-    base = f"top10_{target_date_str}_{map_var}_{baseline_type}_{top10_threshold}"
+    base = f"top10_{target_date_str}_{map_var}_{baseline_type}_{top10_threshold}_{_ANALYTICS_SCHEMA}"
     return (
         PRECOMPUTED_ANALYTICS_DIR / f"{base}_warm.parquet",
         PRECOMPUTED_ANALYTICS_DIR / f"{base}_cold.parquet",
@@ -296,7 +293,7 @@ def _calc_compute_map_footprint_raw(_ref_data, _map_phys_data, target_date_str, 
     lons, lats = _synoptic_lonlat(_map_phys_data)
     if lons is None or lats is None:
         return None
-    if map_var != "T850" and _temp_pair_missing(map_var, tx_curr, tn_curr):
+    if map_var != "T850" and _temp_pair_missing(map_var, tx_curr, tn_curr, _map_phys_data):
         return None
     daily_ref = _ref_data.sel(dayofyear=doy).reindex(latitude=lats, longitude=lons, method="nearest")
     shape = tx_curr.shape if tx_curr is not None else (len(lats), len(lons))
@@ -381,7 +378,7 @@ def _calc_calculate_top10_raw(
     suffix, doy = ("A" if baseline_type == "A" else "B"), etccdi_doy_365(target_date)
     lons, lats = _synoptic_lonlat(_map_phys_data)
     tx, tn = _synoptic_temp_pair(_map_phys_data)
-    if map_var != "T850" and _temp_pair_missing(map_var, tx, tn):
+    if map_var != "T850" and _temp_pair_missing(map_var, tx, tn, _map_phys_data):
         return pd.DataFrame(), pd.DataFrame()
     if lons is None or lats is None:
         return pd.DataFrame(), pd.DataFrame()

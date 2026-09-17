@@ -71,6 +71,45 @@ def plotly_title_font(*, size: int = 20) -> dict:
     return dict(size=size, family=ATMOPULSE_FONTS["sora_css"])
 
 
+def inject_monday_weekstart() -> None:
+    """Force Streamlit date pickers to Monday–Sunday.
+
+    ``st.date_input`` has no first-day parameter: it reads
+    ``Intl.Locale.getWeekInfo()`` from the browser language, so an en-US
+    Cursor/Chrome session shows Sunday first. Patch the parent window before
+    any calendar opens. ISO weekend is Saturday–Sunday.
+    """
+    import streamlit.components.v1 as components
+
+    components.html(
+        """
+<script>
+(function () {
+  var w = window.parent || window;
+  try {
+    if (w.__atmopulseMondayWeek) return;
+    var proto = w.Intl && w.Intl.Locale && w.Intl.Locale.prototype;
+    if (!proto) return;
+    var iso = {firstDay: 1, weekend: [6, 7], minimalDays: 4};
+    var orig = proto.getWeekInfo;
+    proto.getWeekInfo = function () {
+      if (typeof orig === "function") {
+        try {
+          return Object.assign({}, orig.call(this), {firstDay: 1, weekend: [6, 7]});
+        } catch (e) {}
+      }
+      return iso;
+    };
+    w.__atmopulseMondayWeek = true;
+  } catch (e) {}
+})();
+</script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
 def map_contour_label_font(*, size: int = 9, color: str | None = None) -> dict:
     """Return small font dictionary for synoptic contour labels (MSLP/Z500 isolines)."""
     font = dict(size=size, family=ATMOPULSE_FONTS["sora_css"])
@@ -90,6 +129,16 @@ def atmopulse_streamlit_css(brand: dict) -> str:
     wave_uri = _svg_data_uri(WAVOGRAM_SVG)
     return f"""
 @import url('{GOOGLE_FONTS_URL}');
+
+/* Hide the 0-height iframe that patches date-picker week start. */
+div[data-testid="stIFrame"]:has(iframe[height="0"]),
+.stElementContainer:has(iframe[height="0"]) {{
+    display: none !important;
+    height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: hidden !important;
+}}
 
 /* Navigation bar container — single-row flex. The logo now lives at the top
    of the sidebar, so this bar is dedicated entirely to the nav tabs and
@@ -463,17 +512,15 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     line-height: 1 !important;
 }}
 
-/* Map Tracker: side-by-side baselines share one column pair (maps + tables)
-   with a vertical divider. min-width:0 lets nested dataframes shrink. */
-.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"],
-.st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] {{
+/* Side-by-side A/B compare: one vertical brand-blue divider. Used by Map
+   Tracker, Meteogram, and Wavogram (`st.container(key="atmopulse_split_…")`).
+   min-width:0 lets nested dataframes/charts shrink. */
+[class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] {{
     gap: 0 !important;
     align-items: stretch !important;
 }}
-.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
-.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"],
-.st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
-.st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="column"] {{
+[class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+[class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="column"] {{
     flex: 1 1 0 !important;
     width: 50% !important;
     max-width: 50% !important;
@@ -484,39 +531,30 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     overflow-x: auto !important;
     position: relative !important;
 }}
-.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
-.st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child,
-.st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
-.st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
+[class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
+[class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
     box-shadow: inset -2px 0 0 0 {_hex_to_rgba(brand['primary'], 0.55)} !important;
 }}
-.st-key-atmopulse_map_columns [data-testid="stDataFrame"],
-.st-key-atmopulse_map_tables [data-testid="stDataFrame"] {{
+[class*="st-key-atmopulse_split"] [data-testid="stDataFrame"] {{
     width: 100% !important;
     max-width: 100% !important;
 }}
-.st-key-atmopulse_map_columns [data-testid="stDataFrame"] > div,
-.st-key-atmopulse_map_tables [data-testid="stDataFrame"] > div {{
+[class*="st-key-atmopulse_split"] [data-testid="stDataFrame"] > div {{
     width: 100% !important;
     max-width: 100% !important;
 }}
 @media (max-width: 900px) {{
-    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"],
-    .st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] {{
+    [class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] {{
         flex-wrap: wrap !important;
     }}
-    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
-    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"],
-    .st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
-    .st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="column"] {{
+    [class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+    [class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="column"] {{
         flex: 1 1 100% !important;
         width: 100% !important;
         max-width: 100% !important;
     }}
-    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
-    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child,
-    .st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
-    .st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
+    [class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
+    [class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
         border-right: none !important;
         box-shadow: none !important;
         border-bottom: 2px solid {_hex_to_rgba(brand['primary'], 0.55)} !important;
@@ -526,10 +564,8 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
         width: 100% !important;
         max-width: 100% !important;
     }}
-    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child,
-    .st-key-atmopulse_map_columns [data-testid="stHorizontalBlock"] > [data-testid="column"]:last-child,
-    .st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child,
-    .st-key-atmopulse_map_tables [data-testid="stHorizontalBlock"] > [data-testid="column"]:last-child {{
+    [class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child,
+    [class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="column"]:last-child {{
         padding-left: 10px !important;
         width: 100% !important;
         max-width: 100% !important;
@@ -796,7 +832,7 @@ section[data-testid="stSidebar"] [data-baseweb="select"] {{
     font-family: {o} !important;
     font-weight: {uw} !important;
     font-size: 15px !important;
-    margin: 0 0 0.5rem 0 !important;
+    margin: 0 0 1.15rem 0 !important;
     line-height: 1.45 !important;
 }}
 .atmopulse-narrative-chip {{
@@ -871,6 +907,20 @@ section[data-testid="stSidebar"] [data-baseweb="select"] {{
 .main div[data-testid="stDataFrame"] td {{
     font-family: {o} !important; 
     font-weight: {uw} !important;
+}}
+/* Wavogram ridge hover: Plotly gives every <br> a full-height tspan, so a
+   half-line gap before Z500 is done here — 5th line is a spacer (Duration,
+   Length, Severity, Rank, spacer, Z500-…). */
+[class*="st-key-wave_ridge_click"] .hoverlayer .hovertext tspan:nth-of-type(5) {{
+    font-size: 6px !important;
+    fill: transparent !important;
+    stroke: none !important;
+}}
+[class*="st-key-wave_ridge_click"] .hoverlayer .hovertext br:nth-of-type(4) {{
+    display: block;
+    content: "";
+    line-height: 0.5em;
+    margin: 0.15em 0;
 }}
 """
 

@@ -23,15 +23,19 @@ from config import (
     LAYOUT_FLICKER,
     LAYOUT_OPACITY,
     LAYOUT_SWIPE,
+    COMPARE_EPOCHS,
+    COMPARE_DATES,
     AIFS_TXTN_WARNING,
     FORECAST_MODEL_IFS,
     PERSISTENCE_LOOKBACK_PAD,
     PERSISTENCE_MAX_DAYS,
     TOP10_GRID_VERSION,
+    analog_calendar_date,
     is_expert_mode,
     is_aifs_model,
     selected_forecast_model,
     is_daily_map_view,
+    STANDARD_DEFAULTS,
 )
 from backend_analytics import compute_map_footprint, calculate_top10
 from frontend_plots import (
@@ -50,7 +54,7 @@ from backend_io import (
     synoptic_source_mtime,
     _load_persistence_daily_series,
 )
-from backend_maps import synoptic_vars_for_map
+from backend_maps import synoptic_vars_for_map, latest_era5_archive_date
 from frontend_widgets import _top10_header_html
 
 
@@ -218,7 +222,7 @@ def _banner_wrap(inner: str) -> str:
         f"<div class='atmopulse-narrative-banner' style='"
         f"background-color:{bg}; color:{fg}; padding:0.75rem 1rem; "
         f"border-radius:0.5rem; font-family:{font}; font-weight:{weight}; "
-        f"font-size:{_BANNER_FONT_PX}px; line-height:1.55; margin:0 0 0.5rem 0;'>"
+        f"font-size:{_BANNER_FONT_PX}px; line-height:1.55; margin:0 0 1.15rem 0;'>"
         f"{inner}</div>"
     )
 
@@ -261,6 +265,46 @@ def _compare_footprint_banner(footprint_a: dict, footprint_b: dict, active_tier:
     )
 
 
+def _dates_footprint_banner(
+    footprint_live: dict, footprint_arch: dict, active_tier: str,
+    baseline_label: str, live_date, arch_date,
+) -> str:
+    colder = baseline_label.startswith("1961")
+    lead = (
+        f"Against the colder historical baseline ({html.escape(baseline_label)})"
+        if colder
+        else f"Against the warmer recent baseline ({html.escape(baseline_label)})"
+    )
+    live_s = pd.Timestamp(live_date).strftime("%d.%m.%Y")
+    arch_s = pd.Timestamp(arch_date).strftime("%d.%m.%Y")
+    wl = footprint_live[active_tier]["warm_pct"]
+    cl = footprint_live[active_tier]["cold_pct"]
+    wa = footprint_arch[active_tier]["warm_pct"]
+    ca = footprint_arch[active_tier]["cold_pct"]
+    return _banner_wrap(
+        f"{lead}, on {html.escape(live_s)} {_europe_clause(active_tier, wl, cl)}. "
+        f"On {html.escape(arch_s)} {_europe_clause(active_tier, wa, ca)}."
+    )
+
+
+def _shift_map_compare_date(days: int) -> None:
+    current = st.session_state.get("map_compare_date")
+    if current is None:
+        return
+    min_d = pd.Timestamp(1940, 1, 1).date()
+    max_d = latest_era5_archive_date().date()
+    new_d = (pd.Timestamp(current) + pd.Timedelta(days=int(days))).date()
+    st.session_state.map_compare_date = min(max(new_d, min_d), max_d)
+
+
+def map_compare_prev_day():
+    _shift_map_compare_date(-1)
+
+
+def map_compare_next_day():
+    _shift_map_compare_date(1)
+
+
 def _fmt_area_pct(pct: float) -> str:
     return f"{pct:.1f}"
 
@@ -271,7 +315,9 @@ def _fmt_change_cell(new: float, old: float, *, dash: bool = False) -> str:
     return f"{new - old:+.1f}"
 
 
-def _severity_level_rows(values_fn, active_tier: str, *, with_change: bool) -> str:
+def _severity_level_rows(values_fn, active_tier: str, *, with_change: bool, show_right: bool | None = None) -> str:
+    if show_right is None:
+        show_right = with_change
     rows = []
     for t in _FOOTPRINT_TIER_ORDER:
         old, new = values_fn(t)
@@ -281,8 +327,10 @@ def _severity_level_rows(values_fn, active_tier: str, *, with_change: bool) -> s
             f"<th scope='row'>{_FOOTPRINT_TIER_TITLES[t]}</th>"
             f"<td>{_fmt_area_pct(old)}</td>"
         )
+        if show_right:
+            cells += f"<td>{_fmt_area_pct(new)}</td>"
         if with_change:
-            cells += f"<td>{_fmt_area_pct(new)}</td><td>{_fmt_change_cell(new, old, dash=rec)}</td>"
+            cells += f"<td>{_fmt_change_cell(new, old, dash=rec)}</td>"
         rows.append(f"<tr class='atmopulse-sev-level{active}'>{cells}</tr>")
     return "".join(rows)
 
@@ -308,8 +356,11 @@ def _severity_pair_html(warm_table: str, cold_table: str) -> str:
     )
 
 
-def _severity_compare_html(footprint_a: dict, footprint_b: dict, active_tier: str) -> str:
-    headers = ("", "1961–1990", "1996–2025", "Change")
+def _severity_compare_html(
+    footprint_a: dict, footprint_b: dict, active_tier: str,
+    headers: tuple[str, ...] | None = None, *, with_change: bool = True,
+) -> str:
+    headers = headers or ("", "1961–1990", "1996–2025", "Change")
 
     def warm(t):
         return footprint_a[t]["warm_pct"], footprint_b[t]["warm_pct"]
@@ -318,8 +369,14 @@ def _severity_compare_html(footprint_a: dict, footprint_b: dict, active_tier: st
         return footprint_a[t]["cold_pct"], footprint_b[t]["cold_pct"]
 
     return _severity_pair_html(
-        _severity_table_html(headers, _severity_level_rows(warm, active_tier, with_change=True)),
-        _severity_table_html(headers, _severity_level_rows(cold, active_tier, with_change=True)),
+        _severity_table_html(
+            headers,
+            _severity_level_rows(warm, active_tier, with_change=with_change, show_right=True),
+        ),
+        _severity_table_html(
+            headers,
+            _severity_level_rows(cold, active_tier, with_change=with_change, show_right=True),
+        ),
     )
 
 
@@ -345,15 +402,21 @@ def _render_expert_severity(
     footprint_single: dict | None,
     active_tier: str,
     compare: bool,
+    headers: tuple[str, ...] | None = None,
+    with_change: bool = True,
+    help_key: str = "europe_share_table",
 ) -> None:
     # Native Streamlit `help=` (same tooltip as Map view), not a HTML title= bubble.
     if compare and footprint_a is not None and footprint_b is not None:
-        body = _severity_compare_html(footprint_a, footprint_b, active_tier)
+        body = _severity_compare_html(
+            footprint_a, footprint_b, active_tier,
+            headers=headers, with_change=with_change,
+        )
     elif footprint_single is not None:
         body = _severity_single_html(footprint_single, active_tier)
     else:
         return
-    st.markdown("**Share of Europe**", help=HELP["europe_share_table"])
+    st.markdown("**Share of Europe**", help=HELP[help_key])
     st.markdown(body, unsafe_allow_html=True)
 
 
@@ -379,20 +442,109 @@ def render_map_tracker(
     # (Schritt C: a Plotly trace can't be a cache-data key), so it is no
     # longer fetched here directly.
 
-    # Map Layout is a core viewing control (not an expert-only toggle) -> render
-    # it globally for Standard and Expert users alike.
-    map_layout = st.radio(
-        "Map Layout:",
-        (LAYOUT_SIDE_BY_SIDE, LAYOUT_FLICKER, LAYOUT_OPACITY, LAYOUT_SWIPE),
-        horizontal=True,
-    )
-    if map_layout == LAYOUT_FLICKER:
-        flicker_epoch = st.radio(
-            "Select Reference Period:",
-            (epoch_period_label("A"), epoch_period_label("B")),
+    # Compare axis is orthogonal to Map Layout: A/B climatology at one date,
+    # or two dates at one climatology. Layout then applies to that pair.
+    if "map_compare_axis" not in st.session_state:
+        st.session_state.map_compare_axis = STANDARD_DEFAULTS["map_compare"]
+    top1, top2 = st.columns([1.05, 2.15])
+    with top1:
+        compare_axis = st.radio(
+            "Compare:",
+            (COMPARE_EPOCHS, COMPARE_DATES),
             horizontal=True,
-            index=1,
+            key="map_compare_axis",
+            help=HELP["map_compare_axis"],
         )
+    with top2:
+        map_layout = st.radio(
+            "Map Layout:",
+            (LAYOUT_SIDE_BY_SIDE, LAYOUT_FLICKER, LAYOUT_OPACITY, LAYOUT_SWIPE),
+            horizontal=True,
+        )
+    compare_dates = compare_axis == COMPARE_DATES
+    date_epoch = "B"
+    live_label = arch_label = None
+    compare_date = None
+    if compare_dates:
+        _max_archive = latest_era5_archive_date()
+        _min_archive = pd.Timestamp(1940, 1, 1)
+        analog = analog_calendar_date(
+            target_date, years_back=1, min_date=_min_archive, max_date=_max_archive,
+        )
+        if "map_compare_date" not in st.session_state:
+            st.session_state.map_compare_date = analog.date()
+        else:
+            st.session_state.map_compare_date = min(
+                st.session_state.map_compare_date, _max_archive.date(),
+            )
+        if is_expert_mode():
+            d1, d2 = st.columns([1.25, 1.15])
+            with d1:
+                st.date_input(
+                    "Compare with:",
+                    min_value=_min_archive.date(),
+                    max_value=_max_archive.date(),
+                    key="map_compare_date",
+                    format="DD.MM.YYYY",
+                    help=HELP["map_compare_date"],
+                )
+            with d2:
+                if "map_date_epoch" not in st.session_state:
+                    st.session_state.map_date_epoch = epoch_period_label("B")
+                date_epoch = epoch_from_label(st.radio(
+                    "Colour against:",
+                    (epoch_period_label("A"), epoch_period_label("B")),
+                    horizontal=True,
+                    key="map_date_epoch",
+                    help=HELP["map_date_epoch"],
+                ))
+        else:
+            st.date_input(
+                "Compare with:",
+                min_value=_min_archive.date(),
+                max_value=_max_archive.date(),
+                key="map_compare_date",
+                format="DD.MM.YYYY",
+                help=HELP["map_compare_date"],
+            )
+            date_epoch = "B"
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            st.button(
+                "← Prev Day", key="map_compare_prev_btn",
+                on_click=map_compare_prev_day, use_container_width=True,
+                disabled=st.session_state.map_compare_date <= _min_archive.date(),
+            )
+        with dc2:
+            st.button(
+                "Next Day →", key="map_compare_next_btn",
+                on_click=map_compare_next_day, use_container_width=True,
+                disabled=st.session_state.map_compare_date >= _max_archive.date(),
+            )
+        compare_date = pd.Timestamp(st.session_state.map_compare_date)
+        left_kind = "Archive" if map_is_archive else "Live"
+        live_label = f"{left_kind} ({pd.Timestamp(target_date).strftime('%d.%m.%Y')})"
+        arch_label = f"Compare ({compare_date.strftime('%d.%m.%Y')})"
+
+    flicker_epoch = None
+    flicker_date_choice = None
+    if map_layout == LAYOUT_FLICKER:
+        if compare_dates:
+            if st.session_state.get("map_flicker_date") not in (live_label, arch_label):
+                st.session_state.map_flicker_date = live_label
+            flicker_date_choice = st.radio(
+                "Show date:",
+                (live_label, arch_label),
+                horizontal=True,
+                key="map_flicker_date",
+            )
+        else:
+            flicker_epoch = st.radio(
+                "Select Reference Period:",
+                (epoch_period_label("A"), epoch_period_label("B")),
+                horizontal=True,
+                index=1,
+            )
 
     if not is_daily_map_view(view_mode):
         _, pers_meta = _load_persistence_daily_series(
@@ -416,6 +568,10 @@ def render_map_tracker(
             )
         else:
             st.info(f"**Persistence Mode Active:** Showing number of consecutive days with target percentiles, ending on {target_date.strftime('%d.%m.%Y')}.")
+        if compare_dates and compare_date is not None:
+            st.caption(
+                f"Right panel persistence ends on {compare_date.strftime('%d.%m.%Y')} (ERA5 only)."
+            )
 
     def _render_impact_table(title: str, df, impact_col: str) -> None:
         st.markdown(_top10_header_html(title), unsafe_allow_html=True)
@@ -458,187 +614,319 @@ def render_map_tracker(
         if aifs_hatch_blocked:
             toggles = {**toggles, "hatching": False}
         try:
-            target_date_str = target_date.strftime('%Y-%m-%d')
-            anchor_date_str = anchor_date.strftime('%Y-%m-%d')
-            # Schritt C: same mtime feeds fetch_cached_synoptic_data (the
-            # data itself), compute_map_footprint/calculate_top10 (the
-            # narrative/tables, which key on _map_phys_data being underscore-
-            # excluded from their own cache), and get_cached_baseline_map
-            # (the figure) — one fresh forecast download invalidates all
-            # three consistently instead of only some of them.
-            source_mtime = synoptic_source_mtime(target_date_str, forecast_model=forecast_model)
-            with st.spinner("Loading synoptic fields..."):
-                map_phys_data, map_time_meta = fetch_cached_synoptic_data(
-                    target_date_str, anchor_date_str,
-                    forecast_model=forecast_model,
-                    needed_vars=synoptic_vars_for_map(map_var_code, toggles, view_mode),
-                    source_mtime=source_mtime,
+            needed_vars = synoptic_vars_for_map(map_var_code, toggles, view_mode)
+
+            def _load_fields(date, anchor, model):
+                date_str = pd.Timestamp(date).strftime("%Y-%m-%d")
+                anchor_str = pd.Timestamp(anchor).strftime("%Y-%m-%d")
+                mtime = synoptic_source_mtime(date_str, forecast_model=model)
+                phys, meta = fetch_cached_synoptic_data(
+                    date_str, anchor_str,
+                    forecast_model=model,
+                    needed_vars=needed_vars,
+                    source_mtime=mtime,
                 )
-            if not map_time_meta.get("available"):
-                if map_is_archive:
+                return date_str, anchor_str, mtime, phys, meta
+
+            def _unavailable_warning(date, *, archive: bool) -> None:
+                if archive:
                     st.warning(
-                        f"No ERA5 archive data for **{target_date.strftime('%d.%m.%Y')}** "
-                        f"in era5_master_daily_{target_date.year}.nc — try another Archive date."
+                        f"No ERA5 archive data for **{pd.Timestamp(date).strftime('%d.%m.%Y')}** "
+                        f"in era5_master_daily_{pd.Timestamp(date).year}.nc — try another Archive date."
                     )
                 else:
                     st.warning(
-                        f"No synoptic data for **{target_date.strftime('%d.%m.%Y')}**. "
+                        f"No synoptic data for **{pd.Timestamp(date).strftime('%d.%m.%Y')}**. "
                         "The IFS HRES forecast may not yet cover this date — try a lower Forecast Offset."
                     )
-            else:
-                if not map_time_meta.get("temps_available", True):
-                    st.warning(
-                        f"Temperature extremes (TX/TN/TG) are missing for **{target_date.strftime('%d.%m.%Y')}** "
-                        "in the ERA5 archive, so the colour overlay cannot be drawn. "
-                        "Synoptic contours are shown where available."
-                    )
-                footprint_a = footprint_b = footprint_single = None
-                active_tier = "strong"
-                if is_daily_map_view(view_mode):
-                    # Cumulative severity ladder: Moderate INCLUDES Strong/Extreme/Record,
-                    # Strong INCLUDES Extreme/Record, Extreme INCLUDES Record, Record is exclusive.
-                    # Active analysis level drives which single tier the sentence narrates.
-                    active_tier = {
-                        "Moderate": "moderate", "Strong": "strong",
-                        "Extreme": "extreme", "All-Time Record": "record",
-                    }.get(top10_threshold, "strong")
 
-                    if map_layout == LAYOUT_FLICKER:
+            def _temps_warning(date) -> None:
+                st.warning(
+                    f"Temperature extremes (TX/TN/TG) are missing for **{pd.Timestamp(date).strftime('%d.%m.%Y')}** "
+                    "in the ERA5 archive, so the colour overlay cannot be drawn. "
+                    "Synoptic contours are shown where available."
+                )
+
+            spinner_label = (
+                "Loading synoptic fields (two dates)..."
+                if compare_dates else "Loading synoptic fields..."
+            )
+            with st.spinner(spinner_label):
+                target_date_str, anchor_date_str, source_mtime, map_phys_data, map_time_meta = _load_fields(
+                    target_date, anchor_date, forecast_model,
+                )
+                arch_pack = None
+                if compare_dates and compare_date is not None:
+                    arch_pack = _load_fields(compare_date, compare_date, FORECAST_MODEL_IFS)
+
+            live_ok = bool(map_time_meta.get("available"))
+            arch_ok = bool(arch_pack and arch_pack[4].get("available")) if compare_dates else True
+            if not live_ok:
+                _unavailable_warning(target_date, archive=map_is_archive)
+            if compare_dates and not arch_ok:
+                _unavailable_warning(compare_date, archive=True)
+            if not live_ok or (compare_dates and not arch_ok):
+                return
+
+            if not map_time_meta.get("temps_available", True):
+                _temps_warning(target_date)
+            if compare_dates and arch_pack is not None and not arch_pack[4].get("temps_available", True):
+                _temps_warning(compare_date)
+
+            if compare_dates:
+                arch_date_str, arch_anchor_str, arch_mtime, arch_phys, _arch_meta = arch_pack
+                left_title, right_title = live_label, arch_label
+                left_epoch = right_epoch = date_epoch
+                left_date, right_date = target_date, compare_date
+                left_anchor, right_anchor = anchor_date, compare_date
+                left_mtime, right_mtime = source_mtime, arch_mtime
+                left_phys, right_phys = map_phys_data, arch_phys
+                left_model, right_model = forecast_model, FORECAST_MODEL_IFS
+            else:
+                left_title, right_title = epoch_period_label("A"), epoch_period_label("B")
+                left_epoch, right_epoch = "A", "B"
+                left_date = right_date = target_date
+                left_anchor = right_anchor = anchor_date
+                left_mtime = right_mtime = source_mtime
+                left_phys = right_phys = map_phys_data
+                left_model = right_model = forecast_model
+                arch_date_str = arch_anchor_str = None
+                arch_mtime = None
+                arch_phys = None
+
+            footprint_a = footprint_b = footprint_single = None
+            active_tier = "strong"
+            if is_daily_map_view(view_mode):
+                active_tier = {
+                    "Moderate": "moderate", "Strong": "strong",
+                    "Extreme": "extreme", "All-Time Record": "record",
+                }.get(top10_threshold, "strong")
+
+                def _fp(phys, date_str, epoch, anchor_str, mtime):
+                    return compute_map_footprint(
+                        ref_clim, phys, date_str,
+                        st.session_state.toggles_warm, st.session_state.toggles_cold,
+                        epoch, map_var_code, anchor_date_str=anchor_str,
+                        source_mtime=mtime,
+                    )
+
+                if map_layout == LAYOUT_FLICKER:
+                    if compare_dates:
+                        use_live = flicker_date_choice == live_label
+                        footprint_single = _fp(
+                            map_phys_data if use_live else arch_phys,
+                            target_date_str if use_live else arch_date_str,
+                            date_epoch,
+                            anchor_date_str if use_live else arch_anchor_str,
+                            source_mtime if use_live else arch_mtime,
+                        )
+                        if footprint_single:
+                            _render_html(_single_footprint_banner(
+                                footprint_single, active_tier, EPOCH_LABELS[date_epoch],
+                            ))
+                    else:
                         active_epoch = epoch_from_label(flicker_epoch)
-                        footprint_single = compute_map_footprint(
-                            ref_clim, map_phys_data, target_date_str,
-                            st.session_state.toggles_warm, st.session_state.toggles_cold,
-                            active_epoch, map_var_code, anchor_date_str=anchor_date_str,
-                            source_mtime=source_mtime,
+                        footprint_single = _fp(
+                            map_phys_data, target_date_str, active_epoch,
+                            anchor_date_str, source_mtime,
                         )
                         if footprint_single:
                             _render_html(_single_footprint_banner(
                                 footprint_single, active_tier, EPOCH_LABELS[active_epoch],
                             ))
-                    else:
-                        footprint_a = compute_map_footprint(
-                            ref_clim, map_phys_data, target_date_str,
-                            st.session_state.toggles_warm, st.session_state.toggles_cold,
-                            "A", map_var_code, anchor_date_str=anchor_date_str,
-                            source_mtime=source_mtime,
+                else:
+                    if compare_dates:
+                        footprint_a = _fp(
+                            map_phys_data, target_date_str, date_epoch,
+                            anchor_date_str, source_mtime,
                         )
-                        footprint_b = compute_map_footprint(
-                            ref_clim, map_phys_data, target_date_str,
-                            st.session_state.toggles_warm, st.session_state.toggles_cold,
-                            "B", map_var_code, anchor_date_str=anchor_date_str,
-                            source_mtime=source_mtime,
+                        footprint_b = _fp(
+                            arch_phys, arch_date_str, date_epoch,
+                            arch_anchor_str, arch_mtime,
+                        )
+                        if footprint_a and footprint_b:
+                            _render_html(_dates_footprint_banner(
+                                footprint_a, footprint_b, active_tier,
+                                EPOCH_LABELS[date_epoch], target_date, compare_date,
+                            ))
+                    else:
+                        footprint_a = _fp(
+                            map_phys_data, target_date_str, "A",
+                            anchor_date_str, source_mtime,
+                        )
+                        footprint_b = _fp(
+                            map_phys_data, target_date_str, "B",
+                            anchor_date_str, source_mtime,
                         )
                         if footprint_a and footprint_b:
                             _render_html(_compare_footprint_banner(
                                 footprint_a, footprint_b, active_tier,
                             ))
 
-                    if is_expert_mode():
-                        _render_expert_severity(
-                            footprint_a=footprint_a, footprint_b=footprint_b,
-                            footprint_single=footprint_single, active_tier=active_tier,
-                            compare=map_layout != LAYOUT_FLICKER,
-                        )
-                    st.markdown(_daily_legend_html(top10_threshold), unsafe_allow_html=True)
-
-                # Schritt C: hashable-only front door for build_baseline_map.
-                # Same date_str/toggles/source_mtime -> a Layout-radio rerun
-                # (e.g. Side-by-Side <-> Opacity) hits this cache instead of
-                # rebuilding the figure/hovertemplate from scratch; a new
-                # forecast download (source_mtime changes) or an actual
-                # toggle/date change still rebuilds it.
-                def _cached_map(baseline_type, full_width=False):
-                    return get_cached_baseline_map(
-                        target_date_str, baseline_type, map_var_code, view_mode,
-                        persist_metric, top10_threshold,
-                        tuple(sorted(st.session_state.toggles_warm.items())),
-                        tuple(sorted(st.session_state.toggles_cold.items())),
-                        frozenset(
-                            name for name, active in toggles.items()
-                            if name in _MAP_OVERLAY_TOGGLES and active
-                        ),
-                        source_mtime, forecast_model,
-                        full_width=full_width, anchor_date_str=anchor_date_str,
-                        spell_days=int(toggles.get("spell_days", 6)),
-                        _ref_data=ref_clim, _map_phys_data=map_phys_data,
-                        _syn_clim=syn_clim,
+                if is_expert_mode():
+                    sev_headers = None
+                    sev_change = True
+                    sev_help = "europe_share_table"
+                    if compare_dates:
+                        sev_headers = ("", live_label, arch_label)
+                        sev_change = False
+                        sev_help = "europe_share_table_dates"
+                    _render_expert_severity(
+                        footprint_a=footprint_a, footprint_b=footprint_b,
+                        footprint_single=footprint_single, active_tier=active_tier,
+                        compare=map_layout != LAYOUT_FLICKER,
+                        headers=sev_headers, with_change=sev_change,
+                        help_key=sev_help,
                     )
+                st.markdown(_daily_legend_html(top10_threshold), unsafe_allow_html=True)
 
-                def _map_title(epoch_label: str) -> str:
-                    return map_export_title(
-                        map_var_code, view_mode, epoch_label, target_date, persist_metric,
-                    )
+            overlay_names = frozenset(
+                name for name, active in toggles.items()
+                if name in _MAP_OVERLAY_TOGGLES and active
+            )
+            warm_items = tuple(sorted(st.session_state.toggles_warm.items()))
+            cold_items = tuple(sorted(st.session_state.toggles_cold.items()))
+            spell_days = int(toggles.get("spell_days", 6))
 
-                if map_layout == LAYOUT_SIDE_BY_SIDE:
-                    fig_a = _cached_map("A")
-                    fig_b = _cached_map("B")
-                    with st.container(key="atmopulse_map_columns"):
-                        mc1, mc2 = st.columns(2, gap="small")
-                        with mc1:
-                            _render_synoptic_map(
-                                fig_a, epoch_period_label("A"), "map_a",
-                                export_title=_map_title(epoch_period_label("A")),
-                            )
-                        with mc2:
-                            _render_synoptic_map(
-                                fig_b, epoch_period_label("B"), "map_b",
-                                export_title=_map_title(epoch_period_label("B")),
-                            )
-                    with st.container(key="atmopulse_map_tables"):
-                        mc1, mc2 = st.columns(2, gap="small")
-                        with mc1:
-                            df_h_a, df_c_a = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "A", map_var_code, anchor_date=anchor_date, _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid, source_mtime=source_mtime)
-                            render_top10_period(df_h_a, df_c_a)
-                        with mc2:
-                            df_h_b, df_c_b = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "B", map_var_code, anchor_date=anchor_date, _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid, source_mtime=source_mtime)
-                            render_top10_period(df_h_b, df_c_b)
-                elif map_layout in (LAYOUT_OPACITY, LAYOUT_SWIPE):
-                    fig_a = _cached_map("A", full_width=True)
-                    fig_b = _cached_map("B", full_width=True)
-                    if map_layout == LAYOUT_SWIPE:
-                        render_swipe_compare_map(
-                            fig_a, fig_b,
-                            export_title_a=_map_title(epoch_period_label("A")),
-                            export_title_b=_map_title(epoch_period_label("B")),
-                        )
-                    else:
+            def _cached_map_for(date_str, epoch, mtime, model, phys, anchor_str, full_width=False):
+                return get_cached_baseline_map(
+                    date_str, epoch, map_var_code, view_mode,
+                    persist_metric, top10_threshold,
+                    warm_items, cold_items, overlay_names,
+                    mtime, model,
+                    full_width=full_width, anchor_date_str=anchor_str,
+                    spell_days=spell_days,
+                    _ref_data=ref_clim, _map_phys_data=phys,
+                    _syn_clim=syn_clim,
+                )
+
+            def _title_for(panel, when):
+                return map_export_title(
+                    map_var_code, view_mode, panel, when, persist_metric,
+                )
+
+            def _top10(phys, date, epoch, anchor, mtime):
+                return calculate_top10(
+                    ref_clim, phys, date,
+                    st.session_state.toggles_warm, st.session_state.toggles_cold,
+                    view_mode, persist_metric, top10_threshold,
+                    epoch, map_var_code, anchor_date=anchor,
+                    _get_persistence_arrays=get_persistence_arrays,
+                    _get_country_weight_grid=get_country_weight_grid,
+                    source_mtime=mtime,
+                )
+
+            left_date_str = pd.Timestamp(left_date).strftime("%Y-%m-%d")
+            right_date_str = pd.Timestamp(right_date).strftime("%Y-%m-%d")
+            left_anchor_str = pd.Timestamp(left_anchor).strftime("%Y-%m-%d")
+            right_anchor_str = pd.Timestamp(right_anchor).strftime("%Y-%m-%d")
+
+            if map_layout == LAYOUT_SIDE_BY_SIDE:
+                fig_a = _cached_map_for(
+                    left_date_str, left_epoch, left_mtime, left_model, left_phys, left_anchor_str,
+                )
+                fig_b = _cached_map_for(
+                    right_date_str, right_epoch, right_mtime, right_model, right_phys, right_anchor_str,
+                )
+                with st.container(key="atmopulse_split_map"):
+                    mc1, mc2 = st.columns(2, gap="small")
+                    with mc1:
                         _render_synoptic_map(
-                            build_opacity_slider_map(fig_a, fig_b),
-                            f"Opacity Slider Compare: {epoch_period_label('A')} ↔ {epoch_period_label('B')}",
-                            "map_opacity",
-                            bottom_margin=60,
-                            export_title=map_export_title(
-                                map_var_code, view_mode,
-                                f"{epoch_period_label('A')} ↔ {epoch_period_label('B')}",
-                                target_date, persist_metric,
-                            ),
+                            fig_a, left_title, "map_a",
+                            export_title=_title_for(left_title, left_date),
                         )
-                        st.caption("Drag the slider under the map to cross-fade between the two reference periods.")
-                    with st.container(key="atmopulse_map_tables"):
-                        map_col1, map_col2 = st.columns(2, gap="small")
-                        with map_col1:
-                            df_h_a, df_c_a = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "A", map_var_code, anchor_date=anchor_date, _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid, source_mtime=source_mtime)
-                            render_top10_period(df_h_a, df_c_a, epoch_period_label("A"))
-                        with map_col2:
-                            df_h_b, df_c_b = calculate_top10(ref_clim, map_phys_data, target_date, st.session_state.toggles_warm, st.session_state.toggles_cold, view_mode, persist_metric, top10_threshold, "B", map_var_code, anchor_date=anchor_date, _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid, source_mtime=source_mtime)
-                            render_top10_period(df_h_b, df_c_b, epoch_period_label("B"))
+                    with mc2:
+                        _render_synoptic_map(
+                            fig_b, right_title, "map_b",
+                            export_title=_title_for(right_title, right_date),
+                        )
+                with st.container(key="atmopulse_split_map_tables"):
+                    mc1, mc2 = st.columns(2, gap="small")
+                    with mc1:
+                        df_h_a, df_c_a = _top10(left_phys, left_date, left_epoch, left_anchor, left_mtime)
+                        render_top10_period(df_h_a, df_c_a)
+                    with mc2:
+                        df_h_b, df_c_b = _top10(right_phys, right_date, right_epoch, right_anchor, right_mtime)
+                        render_top10_period(df_h_b, df_c_b)
+            elif map_layout in (LAYOUT_OPACITY, LAYOUT_SWIPE):
+                fig_a = _cached_map_for(
+                    left_date_str, left_epoch, left_mtime, left_model, left_phys, left_anchor_str,
+                    full_width=True,
+                )
+                fig_b = _cached_map_for(
+                    right_date_str, right_epoch, right_mtime, right_model, right_phys, right_anchor_str,
+                    full_width=True,
+                )
+                if map_layout == LAYOUT_SWIPE:
+                    render_swipe_compare_map(
+                        fig_a, fig_b,
+                        export_title_a=_title_for(left_title, left_date),
+                        export_title_b=_title_for(right_title, right_date),
+                    )
+                else:
+                    _render_synoptic_map(
+                        build_opacity_slider_map(fig_a, fig_b),
+                        f"Opacity Slider Compare: {left_title} ↔ {right_title}",
+                        "map_opacity",
+                        bottom_margin=60,
+                        export_title=map_export_title(
+                            map_var_code, view_mode,
+                            f"{left_title} ↔ {right_title}",
+                            left_date, persist_metric,
+                        ),
+                    )
+                    st.caption(
+                        "Drag the slider under the map to cross-fade between "
+                        + ("the two dates." if compare_dates else "the two reference periods.")
+                    )
+                with st.container(key="atmopulse_split_map_tables_overlay"):
+                    map_col1, map_col2 = st.columns(2, gap="small")
+                    with map_col1:
+                        df_h_a, df_c_a = _top10(left_phys, left_date, left_epoch, left_anchor, left_mtime)
+                        render_top10_period(df_h_a, df_c_a, left_title)
+                    with map_col2:
+                        df_h_b, df_c_b = _top10(right_phys, right_date, right_epoch, right_anchor, right_mtime)
+                        render_top10_period(df_h_b, df_c_b, right_title)
+            else:
+                if compare_dates:
+                    use_live = flicker_date_choice == live_label
+                    flicker_title = live_label if use_live else arch_label
+                    fig = _cached_map_for(
+                        left_date_str if use_live else right_date_str,
+                        date_epoch,
+                        left_mtime if use_live else right_mtime,
+                        left_model if use_live else right_model,
+                        left_phys if use_live else right_phys,
+                        left_anchor_str if use_live else right_anchor_str,
+                        full_width=True,
+                    )
+                    _render_synoptic_map(
+                        fig, flicker_title, "map_flicker",
+                        export_title=_title_for(flicker_title, left_date if use_live else right_date),
+                    )
+                    df_h, df_c = _top10(
+                        left_phys if use_live else right_phys,
+                        left_date if use_live else right_date,
+                        date_epoch,
+                        left_anchor if use_live else right_anchor,
+                        left_mtime if use_live else right_mtime,
+                    )
+                    render_top10_tables(df_h, df_c)
                 else:
                     ep_sel = epoch_from_label(flicker_epoch)
                     flicker_title = epoch_period_label(ep_sel)
                     _render_synoptic_map(
-                        _cached_map(ep_sel, full_width=True),
+                        _cached_map_for(
+                            target_date_str, ep_sel, source_mtime, forecast_model,
+                            map_phys_data, anchor_date_str, full_width=True,
+                        ),
                         flicker_title,
                         "map_flicker",
-                        export_title=_map_title(flicker_title),
+                        export_title=_title_for(flicker_title, target_date),
                     )
-                    df_h, df_c = calculate_top10(
-                        ref_clim, map_phys_data, target_date,
-                        st.session_state.toggles_warm, st.session_state.toggles_cold,
-                        view_mode, persist_metric, top10_threshold,
-                        ep_sel, map_var_code, anchor_date=anchor_date,
-                        _get_persistence_arrays=get_persistence_arrays, _get_country_weight_grid=get_country_weight_grid,
-                        source_mtime=source_mtime,
+                    df_h, df_c = _top10(
+                        map_phys_data, target_date, ep_sel, anchor_date, source_mtime,
                     )
                     render_top10_tables(df_h, df_c)
-        except Exception as e: 
+        except Exception as e:
             st.error(f"Error loading maps: {e}")

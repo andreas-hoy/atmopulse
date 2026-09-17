@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 # --- Data root (single source of truth for the on-disk climate warehouse) ---
@@ -44,6 +45,14 @@ LAYOUT_SIDE_BY_SIDE = "Side-by-Side Compare"
 LAYOUT_FLICKER = "Single Map Flicker"
 LAYOUT_OPACITY = "Opacity Slider Compare"
 LAYOUT_SWIPE = "Swipe Slider Compare"
+
+# Comparison *axis* (orthogonal to LAYOUT_*): climatology A vs B at one time,
+# or two times against one climatology. Map Tracker uses COMPARE_DATES
+# (Live or Archive left, Archive right). Meteogram uses COMPARE_YEARS
+# (Live or a calendar year left, partner year right).
+COMPARE_EPOCHS = "Reference periods"
+COMPARE_DATES = "Dates (Live vs Archive)"
+COMPARE_YEARS = "Live vs Year"
 
 AIFS_TXTN_WARNING = (
     "Diurnal extreme analytics (TX/TN and associated Wave Tracking) are currently unavailable "
@@ -117,6 +126,8 @@ STANDARD_DEFAULTS = {
     "wave_thresh": "Strong",
     "wave_z500_outline": False,
     "map_layout": LAYOUT_SIDE_BY_SIDE,
+    "map_compare": COMPARE_EPOCHS,
+    "meteo_compare": COMPARE_EPOCHS,
 }
 
 MAP_VAR_LABELS = {
@@ -164,6 +175,34 @@ def epoch_from_label(text: str) -> str:
     if "1961" in raw or "Historical" in raw:
         return "A"
     return "B"
+
+
+def analog_calendar_date(live, *, years_back: int = 1, min_date=None, max_date=None):
+    """Same month/day ``years_back`` earlier, clamped to an optional range.
+
+    29 Feb maps to 28 Feb in a non-leap analog year (ETCCDI has no 29 Feb slot).
+    """
+    live = pd.Timestamp(live).normalize()
+    year = int(live.year) - int(years_back)
+    try:
+        analog = live.replace(year=year)
+    except ValueError:
+        analog = live.replace(year=year, day=28)
+    if min_date is not None:
+        analog = max(analog, pd.Timestamp(min_date).normalize())
+    if max_date is not None:
+        analog = min(analog, pd.Timestamp(max_date).normalize())
+    return analog
+
+
+def analog_date_in_year(live, year: int):
+    """Same month/day as ``live`` in ``year`` (29 Feb → 28 Feb if needed)."""
+    live = pd.Timestamp(live).normalize()
+    year = int(year)
+    try:
+        return live.replace(year=year)
+    except ValueError:
+        return live.replace(year=year, day=28)
 
 FORECAST_OFFSET_MIN = -7
 FORECAST_OFFSET_MAX = 3

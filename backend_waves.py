@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from backend_maps import drop_era5t_aux
+from backend_maps import drop_era5t_aux, etccdi_doy_365
 from config import ZARR_MASTER_TIME_SERIES
 
 DATA_DIR = Path("ERA5_ClimateTool/Master_Batches")
@@ -146,7 +146,24 @@ WAVE_SYNOPTIC_VARS = ("z500",)
 WAVE_Z500_RIDGE_DAM = 8.0
 # Detection windows (thresholds stay JJA / DJF). Display may crop to a
 # shorter core season in frontend_plots — that must not truncate events.
-WAVE_PLOT_X_MAX = 366
+WAVE_PLOT_X_MAX = 365
+
+
+def _wave_plot_x(dates, is_warm: bool) -> np.ndarray:
+    """Season x-coordinate on the ETCCDI 365-day axis (same as the month ticks).
+
+    Warm: day-of-year 1–365. Cold: days since 1 July on that same calendar
+    (1 July = 1, 30 June = 365). 29 February shares the 1 March slot, so
+    leap years no longer sit one day to the right of non-leap years.
+    """
+    d = pd.DatetimeIndex(pd.to_datetime(np.atleast_1d(dates)))
+    if d.tz is not None:
+        d = d.tz_convert("UTC").tz_localize(None)
+    doy = np.asarray(etccdi_doy_365(d), dtype=np.int64)
+    if is_warm:
+        return doy.astype(np.float64)
+    months = d.month.to_numpy()
+    return np.where(months >= 7, doy - 181, doy + 184).astype(np.float64)
 
 
 def _wave_season_origin(yr: int, is_warm: bool) -> pd.Timestamp:
@@ -443,15 +460,13 @@ def _prepare_wave_season_df(lat, lon, parameter="TX", is_warm=None) -> tuple[pd.
     df_season = df.copy()
     if is_warm:
         group_key = 'year'
-        origins = pd.to_datetime(df_season['year'].astype(str) + '-01-01')
-        df_season['plot_x'] = (df_season['date'] - origins).dt.days + 1
+        df_season['plot_x'] = _wave_plot_x(df_season['date'], True)
     else:
         df_season['winter_year'] = np.where(
             df_season['month'] >= 7, df_season['year'], df_season['year'] - 1,
         )
         group_key = 'winter_year'
-        origins = pd.to_datetime(df_season['winter_year'].astype(str) + '-07-01')
-        df_season['plot_x'] = (df_season['date'] - origins).dt.days + 1
+        df_season['plot_x'] = _wave_plot_x(df_season['date'], False)
 
     diagnostics = {
         "var_key": var_key,
@@ -491,7 +506,7 @@ def _detect_kysely_waves(df_season: pd.DataFrame, group_key: str, p_thresh: floa
         # a coldwave streak crossing it is one continuous run, not a gap.
         # Missing ERA5 days (true holes) still surface as NaN — never filled.
         group = group.set_index('date').reindex(full_dates)
-        group['plot_x'] = np.arange(1, len(full_dates) + 1)
+        group['plot_x'] = _wave_plot_x(group.index, is_warm)
 
         temps, xs = group['Temp'].values, group['plot_x'].values
         dates = group.index.values
@@ -548,30 +563,32 @@ def _detect_kysely_waves(df_season: pd.DataFrame, group_key: str, p_thresh: floa
     return waves_data
 
 
-def _attach_wave_z500_anomalies(waves_data: list[dict], lat, lon, suffix: str) -> None:
+def _attach_wave_z500_anomalies(waves_data: list[dict], lat, lon, suffix: str) -> pd.Series | None:
     """Mean Z500 anomaly (dam) over each wave window vs that epoch's DOY mean.
 
     Does not change Kyselý detection. Missing Z500 or climatology leaves
     the anomaly fields unset / NaN. Mean, max and min are all over the
-    full [start, end] window.
+    full [start, end] window. Returns the point Z500 series (dam) for the
+    expert drill-down mini-charts, or None if Z500 is unavailable.
     """
-    if not waves_data:
-        return
     from backend_io import load_synoptic_climatology, synoptic_clim_point_doy
-    from backend_maps import etccdi_doy_365
 
     df_pt = _era5_master_point_series(lat, lon)
     if df_pt.empty or "z500" not in df_pt.columns:
-        return
-    clim = synoptic_clim_point_doy(load_synoptic_climatology(), "z500", suffix, lat, lon)
-    if clim is None or clim.size < 365:
-        return
+        return None
 
     dates_pt = pd.DatetimeIndex(pd.to_datetime(df_pt["Date"]))
     if dates_pt.tz is not None:
         dates_pt = dates_pt.tz_convert("UTC").tz_localize(None)
     dates_pt = dates_pt.normalize()
     z_vals = np.asarray(df_pt["z500"].values, dtype=np.float64)
+    series = pd.Series(z_vals, index=dates_pt, name="z500")
+
+    if not waves_data:
+        return series
+    clim = synoptic_clim_point_doy(load_synoptic_climatology(), "z500", suffix, lat, lon)
+    if clim is None or clim.size < 365:
+        return series
 
     for w in waves_data:
         start = pd.Timestamp(w["start_date"]).normalize()
@@ -593,6 +610,7 @@ def _attach_wave_z500_anomalies(waves_data: list[dict], lat, lon, suffix: str) -
             w["z500_anom_mean"] = float("nan")
             w["z500_anom_max"] = float("nan")
             w["z500_anom_min"] = float("nan")
+    return series
 
 
 _ORDINAL_SUFFIXES = {1: "st", 2: "nd", 3: "rd"}
@@ -644,23 +662,24 @@ def _wave_day_frequency(waves_data, df_season, group_key, n_plot_x) -> pd.Series
 def rank_waves_by_metric(waves_data: list[dict], metric: str = "Intensity") -> list[dict]:
     """Sorted copy of `waves_data` for the Point Wavogram drill-down: same
     metric as the annual intensity-stack switch (Intensity = Kyselý K·days
-    excess, Days = duration_days), descending, ties broken by longer
-    duration then earlier start_date. Adds a 1-based 'rank' (over the full
-    list, not just the returned slice) to each copied dict.
+    excess, Days = duration_days), descending. Ties use the *other* metric
+    (also descending), then earlier start_date only if both are equal.
+    Adds a 1-based 'rank' (over the full list, not just the returned slice)
+    to each copied dict.
 
     Read-only w.r.t. `waves_data` / detection — this only reorders the
     already-detected events for display, it does not call
     `_detect_kysely_waves` again or change thresholds.
     """
     use_days = str(metric).lower().startswith("day")
-    key_field = "duration_days" if use_days else "intensity"
 
     def _sort_key(w):
-        return (
-            -float(w.get(key_field, 0) or 0),
-            -float(w.get("duration_days", 0) or 0),
-            pd.Timestamp(w["start_date"]),
-        )
+        intensity = float(w.get("intensity", 0) or 0)
+        duration = float(w.get("duration_days", 0) or 0)
+        start = pd.Timestamp(w["start_date"])
+        if use_days:
+            return (-duration, -intensity, start)
+        return (-intensity, -duration, start)
 
     ordered = sorted(waves_data or [], key=_sort_key)
     ranked = []
@@ -799,7 +818,7 @@ def compute_kysely_waves_data(lat, lon, parameter="TX", selected_epoch="B", thre
     waves_str = _detect_kysely_waves(df_season, group_key, p_t_str, p_d_str, parameter, is_warm=is_warm)
     waves_ext = _detect_kysely_waves(df_season, group_key, p_t_ext, p_d_ext, parameter, is_warm=is_warm)
     waves_data = waves_ext if "Extreme" in threshold_level else waves_str
-    _attach_wave_z500_anomalies(waves_data, lat, lon, suffix)
+    z500_series = _attach_wave_z500_anomalies(waves_data, lat, lon, suffix)
 
     # TEMP DIAGNOSTICS (see app.py debug panel) — safe to remove once the
     # TX-vs-TN wave-count discrepancy is root-caused.
@@ -826,6 +845,8 @@ def compute_kysely_waves_data(lat, lon, parameter="TX", selected_epoch="B", thre
         "epoch": suffix,
         "threshold_level": threshold_level,
         "is_warm": is_warm,
+        "lat": float(lat),
+        "lon": float(lon),
         "var_key": var_key,
         # Wave table / ridge series: one dict per detected event (year, xs,
         # temps, intensity, start_date, end_date, duration_days, event_id).
@@ -839,6 +860,7 @@ def compute_kysely_waves_data(lat, lon, parameter="TX", selected_epoch="B", thre
             df_season.drop_duplicates(subset=["date"], keep="first")
             .set_index("date")["Temp"]
         ),
+        "z500_series": z500_series,
         "z500_ridge_dam": WAVE_Z500_RIDGE_DAM,
         "group_key": group_key,
         "p_thresh": p_thresh,

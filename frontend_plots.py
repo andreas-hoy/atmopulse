@@ -41,10 +41,12 @@ from backend_analytics import (
 from backend_maps import _synoptic_array, etccdi_doy_365
 from backend_io import (
     load_invariant_fields,
+    load_synoptic_climatology,
     point_clim_ladder,
     synoptic_clim_mean_display,
     synoptic_clim_point_doy,
 )
+from backend_waves import rank_waves_by_metric
 from config import epoch_period_label
 from atmopulse_theme import (
     ATMOPULSE_BRAND,
@@ -67,6 +69,7 @@ from config import MAP_VAR_LABELS, PERSISTENCE_COLORBAR_DAYS, is_aifs_model, is_
 # compute-only). See `build_kysely_wave_figs` below. ---
 WAVE_RIDGE_SPLINE_PTS = 100      # Smoothness of the ridge curve
 WAVE_RIDGE_SKEW_FACTOR = 2.5     # Interior lean vs. intensity (0 = symmetric)
+WAVE_RIDGE_SKEW_SPAN_FRAC = 0.30 # Max lean as a fraction of event length (days)
 WAVE_RIDGE_HEIGHT_SCALE = 20.0   # Vertical extent in axis-year units (÷ intensity)
 WAVE_BREAK_TAIL_LEN = 0.5        # X-axis length of the post-peak decay tail (days)
 WAVE_BREAK_TAIL_STEPS = 30       # Number of points along the decay tail
@@ -110,19 +113,24 @@ def _wave_ridge_colors(parameter: str, is_warm: bool, norm_val: float) -> tuple[
     return base, peak
 
 
-def _wave_break_tail(x_end: float, y_peak: float) -> tuple[np.ndarray, np.ndarray]:
+def _wave_break_tail(x_end: float, y_peak: float, span: float | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Visual-only post-peak closure (Bezier). `x_end` is the last event day.
 
     Control-x is an absolute day offset (not scaled by tail length), so a
     short tail still gets a leftward curl instead of a vertical drop.
+    For short events the curl and tail are scaled down so the glyph does
+    not sit a day late of its dates.
     """
     if y_peak <= 0:
         return np.array([x_end]), np.array([0.0])
 
+    scale = 1.0
+    if span is not None and span > 0:
+        scale = float(np.clip(span / 6.0, 0.35, 1.0))
     t = np.linspace(0, 1, WAVE_BREAK_TAIL_STEPS)
-    x_ctrl = x_end + WAVE_BREAK_CTRL_DX
+    x_ctrl = x_end + WAVE_BREAK_CTRL_DX * scale
     y_ctrl = y_peak * WAVE_BREAK_CTRL_Y
-    x_out = x_end + WAVE_BREAK_TAIL_LEN
+    x_out = x_end + WAVE_BREAK_TAIL_LEN * scale
 
     x_break = (1 - t) ** 2 * x_end + 2 * (1 - t) * t * x_ctrl + t ** 2 * x_out
     y_break = (1 - t) ** 2 * y_peak + 2 * (1 - t) * t * y_ctrl
@@ -130,7 +138,11 @@ def _wave_break_tail(x_end: float, y_peak: float) -> tuple[np.ndarray, np.ndarra
 
 
 def _wave_ridge_x(x_true: np.ndarray, y_fine: np.ndarray) -> np.ndarray:
-    """Lean the rising body right; keep the peak on the last real day."""
+    """Lean the rising body right; keep start and peak on the real days.
+
+    Short events cap the lean at ``WAVE_RIDGE_SKEW_SPAN_FRAC`` of their
+    length so a 3-day wave is not shoved a full day later.
+    """
     x_true = np.asarray(x_true, dtype=float)
     y_fine = np.asarray(y_fine, dtype=float)
     if x_true.size < 2:
@@ -139,8 +151,10 @@ def _wave_ridge_x(x_true: np.ndarray, y_fine: np.ndarray) -> np.ndarray:
     span = x_true[-1] - x_true[0]
     if y_max <= 0 or span <= 0:
         return x_true.copy()
+    max_skew = min(WAVE_RIDGE_SKEW_FACTOR, WAVE_RIDGE_SKEW_SPAN_FRAC * span)
     t = np.clip((x_true - x_true[0]) / span, 0.0, 1.0)
-    x_drawn = x_true + (y_fine / y_max) * WAVE_RIDGE_SKEW_FACTOR * (1.0 - t)
+    x_drawn = x_true + (y_fine / y_max) * max_skew * (1.0 - t)
+    x_drawn[0] = x_true[0]
     x_drawn[-1] = x_true[-1]
     return x_drawn
 
@@ -260,6 +274,10 @@ _MSLP_HL_MAX_LABELS = 2
 _MSLP_HL_STEER_FRAC = 0.60
 _MSLP_HL_VERSION = 7
 MAP_EXTREMES_OPACITY = 0.75
+# Spell-hatching (WSDI/CSDI overlay on the daily map): black "x" per cell.
+# 0.40 / size 4.5 buried the colour field; keep a readable mark, not a second map.
+MAP_HATCH_OPACITY = 0.20
+MAP_HATCH_SIZE = 3.6
 SYNOPTIC_MAP_CONFIG = {
     "displayModeBar": True,
     "displaylogo": False,
@@ -281,33 +299,49 @@ def _fmt_hover_year(v) -> str:
 def _fmt_hover_days(v) -> str:
     return str(int(round(float(v)))) if np.isfinite(v) else "N/A"
 
+_MASK_HOVER_CLASS = {
+    1: "Record cold",
+    2: "Extreme cold",
+    3: "Strong cold",
+    4: "Moderate cold",
+    5: "Moderate warm",
+    6: "Strong warm",
+    7: "Extreme warm",
+    8: "Record warm",
+}
+
+
+def _fmt_hover_class(v) -> str:
+    """Legend class for a display-mask code; unclassed cells are Typical."""
+    if not np.isfinite(v):
+        return "Typical"
+    return _MASK_HOVER_CLASS.get(int(v), "Typical")
+
 # Vectorized once at module scope (Schritt B): reused by the customdata
 # builders below instead of building a per-cell HTML string grid.
 _vfmt_num = np.vectorize(_fmt_hover_num, otypes=[object])
 _vfmt_diff = np.vectorize(_fmt_hover_diff, otypes=[object])
 _vfmt_year = np.vectorize(_fmt_hover_year, otypes=[object])
 _vfmt_days = np.vectorize(_fmt_hover_days, otypes=[object])
+_vfmt_class = np.vectorize(_fmt_hover_class, otypes=[object])
 
-def _build_map_customdata(v_curr, v_rec_w, yr_w, diff_w, v_rec_c, yr_c, diff_c):
-    """customdata for the Daily map heatmap, shape (nlat, nlon, 7).
+def _build_map_customdata(v_curr, v_rec_w, yr_w, diff_w, v_rec_c, yr_c, diff_c, mask=None):
+    """customdata for the Daily map heatmap, shape (nlat, nlon, 8).
 
     Channels: [0] v_curr, [1] v_rec_w, [2] yr_w, [3] diff_w, [4] v_rec_c,
-    [5] yr_c, [6] diff_c.
-
-    Values are pre-formatted short strings (object dtype), not raw
-    float32/int16, for one hard reason: NaN cannot round-trip through
-    Plotly's JSON payload as a *number* (`fig.to_json()` / the Streamlit
-    component transport both need valid JSON, and bare `NaN`/`null` then
-    format as "NaN"/"0.0" via `%{customdata[i]:.1f}`, not "N/A"). Formatting
-    once here with the existing `_fmt_hover_*` helpers (same rules as the old
-    hovertext path: 1 decimal, signed diff, integer year, "N/A" on non-finite)
-    keeps the hover content byte-identical while cutting per-cell payload
-    from a multi-line HTML block to 7 short tokens.
+    [5] yr_c, [6] diff_c, [7] legend class (Typical / Moderate warm / …).
+    Diff channels stay in the payload for cache compatibility; the hover
+    template no longer shows them (they are current minus all-time).
     """
-    return np.stack([
+    layers = [
         _vfmt_num(v_curr), _vfmt_num(v_rec_w), _vfmt_year(yr_w), _vfmt_diff(diff_w),
         _vfmt_num(v_rec_c), _vfmt_year(yr_c), _vfmt_diff(diff_c),
-    ], axis=-1)
+    ]
+    if mask is None:
+        layers.append(np.full(np.asarray(v_curr).shape, "Typical", dtype=object))
+    else:
+        layers.append(_vfmt_class(mask))
+    return np.stack(layers, axis=-1)
 
 def _build_persistence_customdata(warm, cold):
     """customdata for the Persistence map heatmap, shape (nlat, nlon, 2):
@@ -1138,7 +1172,7 @@ def build_baseline_map(
     lons, lats = _synoptic_lonlat(map_phys_data)
     if lons is None or lats is None:
         return go.Figure()
-    if map_var != "T850" and _temp_pair_missing(map_var, tx_curr, tn_curr):
+    if map_var != "T850" and _temp_pair_missing(map_var, tx_curr, tn_curr, map_phys_data):
         return go.Figure()
     
     # Align the climatology grid to the live/archive field's actual lat/lon
@@ -1186,13 +1220,16 @@ def build_baseline_map(
 
         colorscale = map_extremes_colorscale()
 
-        daily_customdata = _build_map_customdata(v_curr, v_rec_w, yr_w, diff_w, v_rec_c, yr_c, diff_c)
+        daily_customdata = _build_map_customdata(
+            v_curr, v_rec_w, yr_w, diff_w, v_rec_c, yr_c, diff_c, mask=mask,
+        )
         daily_hovertemplate = (
             "<b>%{text}</b><br>"
             "Latitude: %{y:.2f}, Longitude: %{x:.2f}<br><br>"
             + var_label + ": %{customdata[0]} °C<br>"
-            "All-Time Warm: %{customdata[1]} °C (Year %{customdata[2]}; %{customdata[3]} °C diff)<br>"
-            "All-Time Cold: %{customdata[4]} °C (Year %{customdata[5]}; %{customdata[6]} °C diff)"
+            "Class: %{customdata[7]}<br>"
+            "All-Time Warm: %{customdata[1]} °C (Year %{customdata[2]})<br>"
+            "All-Time Cold: %{customdata[4]} °C (Year %{customdata[5]})"
             "<extra></extra>"
         )
 
@@ -1227,8 +1264,16 @@ def build_baseline_map(
                 min_days = int(toggles.get("spell_days", 6) or 6)
                 hatch_mask = (streaks[h_idx] >= min_days) | (streaks[c_idx] >= min_days)
                 if np.any(hatch_mask):
-                    h_lons, h_lats = lon_grid[hatch_mask][::2], lat_grid[hatch_mask][::2]
-                    fig.add_trace(go.Scatter(x=h_lons, y=h_lats, mode='markers', marker=dict(symbol='x', color='rgba(0,0,0,0.15)', size=3), hoverinfo='skip', showlegend=False))
+                    h_lons, h_lats = lon_grid[hatch_mask], lat_grid[hatch_mask]
+                    fig.add_trace(go.Scatter(
+                        x=h_lons, y=h_lats, mode="markers",
+                        marker=dict(
+                            symbol="x",
+                            color=f"rgba(0,0,0,{MAP_HATCH_OPACITY})",
+                            size=MAP_HATCH_SIZE,
+                        ),
+                        hoverinfo="skip", showlegend=False,
+                    ))
                     
     else:
         anchor_date_str = anchor_date.strftime('%Y-%m-%d') if anchor_date is not None else None
@@ -1352,7 +1397,7 @@ def get_cached_baseline_map(
     t_warm_items, t_cold_items, active_toggles, source_mtime, forecast_model,
     full_width=False, anchor_date_str=None, spell_days=6,
     anom_mslp_hpa=_MSLP_ANOM_INTERVAL, _hl_version=_MSLP_HL_VERSION,
-    _jet_version=_JET_OVERLAY_VERSION, _credit_version=2,
+    _jet_version=_JET_OVERLAY_VERSION, _credit_version=4, _hatch_version=2,
     *, _ref_data, _map_phys_data, _syn_clim=None,
 ):
     """Schritt C: @st.cache_data front door for build_baseline_map.
@@ -1500,21 +1545,10 @@ def render_swipe_compare_map(
     fig_bottom = go.Figure(fig_a)
     fig_top = go.Figure(fig_b)
     fig_top.update_layout(annotations=[])
-    for t in fig_top.data:
-        if getattr(t, "showscale", None):
-            t.showscale = False
     for fig in (fig_bottom, fig_top):
         for t in fig.data:
-            # Since Schritt B, build_baseline_map already sets zsmooth=False
-            # on every map heatmap it creates, so this is now a no-op belt-
-            # and-suspenders line. Kept explicit: zsmooth='best' would
-            # interpolate each cell against its OWN neighbours, and two
-            # independently smoothed grids, hard-clipped together at the
-            # swipe line, blend differently right at that seam — visible as
-            # a jagged strip of "wrong" pixels that belong to neither
-            # dataset. Flat per-cell colour on both sides makes the seam
-            # land exactly on a real data boundary instead of an
-            # interpolation artifact.
+            if getattr(t, "showscale", None):
+                t.showscale = False
             if getattr(t, "type", None) == "heatmap":
                 t.zsmooth = False
 
@@ -1600,9 +1634,9 @@ def render_swipe_compare_map(
 
   var figA = {json_a};
   var figB = {json_b};
-  var cfgA = {{displayModeBar: true, displaylogo: false, responsive: true,
+  var cfgA = {{displayModeBar: true, displaylogo: false, responsive: false,
                modeBarButtonsToRemove: ["autoScale2d", "select2d", "lasso2d"], scrollZoom: false}};
-  var cfgB = {{displayModeBar: false, responsive: true, scrollZoom: false}};
+  var cfgB = {{displayModeBar: false, responsive: false, scrollZoom: false}};
 
   var stack = document.getElementById("swipe-stack");
   var slider = document.getElementById("atmopulse-swipe-range");
@@ -1614,20 +1648,27 @@ def render_swipe_compare_map(
     if (String(slider.value) !== String(v)) slider.value = v;
   }}
 
-  // The stack uses CSS aspect-ratio 70/42 (EUROPE_BBOX), same as the
-  // Streamlit map frames. Do not set height from full iframe width:
-  // Plotly's colour bar then shrinks the plot area and scaleanchor
-  // crops latitude (appears as a zoomed-in map).
+  // Size the stack to EUROPE_BBOX (70°×42°) from the iframe WIDTH, then
+  // ask Streamlit to grow the iframe. A short default iframe + overflow
+  // hidden previously cropped latitude (scaleanchor 1:1) — SVG/PDF export
+  // never hit that path, so they looked complete.
   function layout() {{
-    var ctrl = document.querySelector(".atmopulse-swipe-ctrl");
-    var mapH = stack.getBoundingClientRect().height || 0;
-    var ctrlH = ctrl ? (ctrl.getBoundingClientRect().height || SLIDER_H) : SLIDER_H;
+    var w = stack.clientWidth || document.documentElement.clientWidth || 0;
+    var mapH = w > 0 ? Math.round(w * 42 / 70) : 0;
     if (mapH > 0) {{
-      window.parent.postMessage({{type: "streamlit:setFrameHeight", height: Math.ceil(mapH + ctrlH + 8)}}, "*");
+      stack.style.aspectRatio = "auto";
+      stack.style.width = "100%";
+      stack.style.height = mapH + "px";
     }}
-    if (plotted) {{
-      Plotly.Plots.resize("swipe-a");
-      Plotly.Plots.resize("swipe-b");
+    var ctrl = document.querySelector(".atmopulse-swipe-ctrl");
+    var ctrlH = ctrl ? (ctrl.getBoundingClientRect().height || SLIDER_H) : SLIDER_H;
+    var total = Math.ceil((mapH || 0) + ctrlH + 8);
+    if (total > 0) {{
+      window.parent.postMessage({{type: "streamlit:setFrameHeight", height: total}}, "*");
+    }}
+    if (plotted && w > 0 && mapH > 0) {{
+      Plotly.relayout("swipe-a", {{autosize: false, width: w, height: mapH}});
+      Plotly.relayout("swipe-b", {{autosize: false, width: w, height: mapH}});
     }}
   }}
 
@@ -1718,13 +1759,13 @@ def render_swipe_compare_map(
 
   window.addEventListener("resize", layout);
   if (window.ResizeObserver) {{
-    new ResizeObserver(layout).observe(stack);
+    new ResizeObserver(layout).observe(document.documentElement);
   }}
   [50, 150, 300, 600, 1000].forEach(function(t) {{ setTimeout(layout, t); }});
 }})();
 </script>
 """
-    components.html(html, height=520, scrolling=False)
+    components.html(html, height=900, scrolling=False)
     st.caption("Drag the map or the slider: left is 1961–1990, right is 1996–2025.")
     st.caption(_output_credit_text())
     e1, e2 = st.columns(2)
@@ -1854,13 +1895,12 @@ def get_meteogram_traces(df_live, ref_clim, lat, lon, target_date, epoch, meteo_
 
     col_target = meteo_var_code(meteo_var)
     if col_target in df_live.columns:
-        t_hist = df_live.loc[dates <= tgt_dt_norm, col_target].values
         t_full = df_live[col_target].values
-        y_all = t_full
+        t_hist = df_live.loc[dates <= tgt_dt_norm, col_target].values
     else:
-        t_hist = (df_live.loc[dates <= tgt_dt_norm, 'TX'].values + df_live.loc[dates <= tgt_dt_norm, 'TN'].values) / 2.0
-        t_full = (df_live['TX'].values + df_live['TN'].values) / 2.0
-        y_all = t_full
+        t_full = np.full(len(df_live), np.nan)
+        t_hist = np.full(int((dates <= tgt_dt_norm).sum()), np.nan)
+    y_all = t_full
 
     c_base, p75_daily, p90_daily, p95_daily, rec_w_daily, p25_daily, p10_daily, p5_daily, rec_c_daily = (
         point_clim_ladder(pt_clim, doys, meteo_var, epoch)
@@ -1999,6 +2039,67 @@ def _z500_fill_rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
+# Shared Z500-anomaly drawing (Meteogram panel and Wavogram event minis).
+_Z500_RIDGE_FILL_ALPHA = 0.32   # positive: purple fill
+_Z500_TROUGH_FILL_ALPHA = 0.28  # negative: blue fill
+_Z500_LINE_WIDTH = 1.5
+_Z500_FCST_LINE_WIDTH = 2.0
+_Z500_ZERO_LINE = dict(color="rgba(0,0,0,0.45)", width=1)
+_Z500_HOVERTEMPLATE = (
+    "<b>Z500 anomaly</b><br>"
+    "Anomaly: %{customdata[2]:+.1f} dam<br>"
+    "Z500: %{customdata[0]:.1f} dam<br>"
+    "DOY mean: %{customdata[1]:.1f} dam"
+    "<extra></extra>"
+)
+
+
+def _z500_anomaly_colors() -> dict:
+    overlay = ATMOPULSE_OVERLAY
+    return {
+        "ridge": _z500_fill_rgba(overlay["z500_anom_contour"], _Z500_RIDGE_FILL_ALPHA),
+        "trough": _z500_fill_rgba(overlay["z500_contour"], _Z500_TROUGH_FILL_ALPHA),
+        "line": overlay["z500_anom_contour"],
+    }
+
+
+def _z500_anomaly_band_traces(dates, anom) -> list:
+    """Zero line + ridge/trough fills. Same traces the Meteogram Z500 panel uses."""
+    colors = _z500_anomaly_colors()
+    y_pos = np.where(np.isfinite(anom) & (anom > 0), anom, 0.0)
+    y_neg = np.where(np.isfinite(anom) & (anom < 0), anom, 0.0)
+    return [
+        go.Scatter(
+            x=dates, y=np.zeros(len(dates)), mode="lines",
+            line=_Z500_ZERO_LINE,
+            name="Zero", showlegend=False, hoverinfo="skip",
+        ),
+        go.Scatter(
+            x=dates, y=y_pos, mode="lines",
+            line=dict(width=0), fill="tozeroy", fillcolor=colors["ridge"],
+            name="Ridge", showlegend=False, hoverinfo="skip",
+        ),
+        go.Scatter(
+            x=dates, y=y_neg, mode="lines",
+            line=dict(width=0), fill="tozeroy", fillcolor=colors["trough"],
+            name="Trough", showlegend=False, hoverinfo="skip",
+        ),
+    ]
+
+
+def _z500_anomaly_hover_trace(dates, anom, z_live, z_clim) -> go.Scatter:
+    c_data = np.empty((len(dates), 3), dtype=object)
+    c_data[:, 0] = np.round(z_live, 1)
+    c_data[:, 1] = np.round(z_clim, 1)
+    c_data[:, 2] = np.round(anom, 1)
+    return go.Scatter(
+        x=dates, y=anom, mode="lines",
+        line=dict(width=0, color="rgba(0,0,0,0)"),
+        customdata=c_data, name="Z500 anomaly",
+        showlegend=False, hovertemplate=_Z500_HOVERTEMPLATE,
+    )
+
+
 def get_z500_anomaly_traces(df_live, syn_clim, lat, lon, target_date, epoch):
     """Expert driver panel: point Z500 minus the epoch's 5-day DOY mean (dam).
 
@@ -2024,60 +2125,22 @@ def get_z500_anomaly_traces(df_live, syn_clim, lat, lon, target_date, epoch):
     y_lim = max(_Z500_ANOM_Y_FLOOR, span * 1.15)
     y_range = (-y_lim, y_lim)
 
-    ridge = _z500_fill_rgba(ATMOPULSE_OVERLAY["z500_anom_contour"], 0.32)
-    trough = _z500_fill_rgba(ATMOPULSE_OVERLAY["z500_contour"], 0.28)
-    line_col = ATMOPULSE_OVERLAY["z500_anom_contour"]
-
-    y_pos = np.where(np.isfinite(anom) & (anom > 0), anom, 0.0)
-    y_neg = np.where(np.isfinite(anom) & (anom < 0), anom, 0.0)
-    traces = [
-        go.Scatter(
-            x=dates, y=np.zeros(len(dates)), mode="lines",
-            line=dict(color="rgba(0,0,0,0.45)", width=1),
-            name="Zero", showlegend=False, hoverinfo="skip",
-        ),
-        go.Scatter(
-            x=dates, y=y_pos, mode="lines",
-            line=dict(width=0), fill="tozeroy", fillcolor=ridge,
-            name="Ridge", showlegend=False, hoverinfo="skip",
-        ),
-        go.Scatter(
-            x=dates, y=y_neg, mode="lines",
-            line=dict(width=0), fill="tozeroy", fillcolor=trough,
-            name="Trough", showlegend=False, hoverinfo="skip",
-        ),
-    ]
+    line_col = _z500_anomaly_colors()["line"]
+    traces = _z500_anomaly_band_traces(dates, anom)
 
     fcst_mask = dates >= tgt_dt_norm
     hist_mask = dates <= tgt_dt_norm
     traces.append(go.Scatter(
         x=dates[hist_mask], y=anom[hist_mask.values], mode="lines",
-        line=dict(color=line_col, width=1.5, shape="linear"),
+        line=dict(color=line_col, width=_Z500_LINE_WIDTH, shape="linear"),
         name="Z500 anomaly", showlegend=False, hoverinfo="skip",
     ))
     traces.append(go.Scatter(
         x=dates[fcst_mask], y=anom[fcst_mask.values], mode="lines",
-        line=dict(color=line_col, width=2.0, dash="dot"),
+        line=dict(color=line_col, width=_Z500_FCST_LINE_WIDTH, dash="dot"),
         name="Z500 anomaly (forecast)", showlegend=False, hoverinfo="skip",
     ))
-
-    c_data = np.empty((len(dates), 3), dtype=object)
-    c_data[:, 0] = np.round(z_live, 1)
-    c_data[:, 1] = np.round(z_clim, 1)
-    c_data[:, 2] = np.round(anom, 1)
-    traces.append(go.Scatter(
-        x=dates, y=anom, mode="lines",
-        line=dict(width=0, color="rgba(0,0,0,0)"),
-        customdata=c_data, name="Z500 anomaly",
-        showlegend=False,
-        hovertemplate=(
-            "<b>Z500 anomaly</b><br>"
-            "Anomaly: %{customdata[2]:+.1f} dam<br>"
-            "Z500: %{customdata[0]:.1f} dam<br>"
-            "DOY mean: %{customdata[1]:.1f} dam"
-            "<extra></extra>"
-        ),
-    ))
+    traces.append(_z500_anomaly_hover_trace(dates, anom, z_live, z_clim))
     csv_text = pd.DataFrame({
         "date": pd.DatetimeIndex(pd.to_datetime(dates)).strftime("%Y-%m-%d"),
         "z500_dam": np.round(z_live, 2),
@@ -2437,9 +2500,9 @@ def _build_kysely_wave_stack_fig(payload, stack_metric: str = "Intensity") -> go
     return fig
 
 
-# Wavogram x-axis: plot_x is days from 1 Jan (heat) or 1 Jul (cold), non-leap
-# month bounds. Core display is May–Sep / Nov–Mar; extra months appear only
-# when a detected wave has days there (e.g. October heat, April cold).
+# Wavogram x-axis: plot_x is ETCCDI 365-day from 1 Jan (heat) or 1 Jul (cold).
+# Month bounds match that calendar (29 Feb shares 1 March). Core display is
+# May–Sep / Nov–Mar; extra months appear only when an event has days there.
 _WARM_MONTHS = (
     (1, "JANUARY", 1, 16, 31),
     (2, "FEBRUARY", 32, 47, 59),
@@ -2505,7 +2568,6 @@ def _wave_xaxis(is_warm: bool, waves_data, x_range=None) -> dict:
         x0 = min(x0, xs_min)
         x1 = max(x1, xs_max)
     else:
-        # Leap-year plot_x can sit one day past the non-leap month end.
         x0 = min(x0, xs_min)
         x1 = max(x1, xs_max)
     if x_range is not None:
@@ -2695,6 +2757,10 @@ def build_kysely_wave_figs(
         )
 
     if waves_data:
+        ranked = rank_waves_by_metric(waves_data, stack_metric)
+        n_total = len(ranked)
+        rank_by_id = {w.get("event_id"): w["rank"] for w in ranked}
+        rank_metric = "Days" if str(stack_metric).lower().startswith("day") else "Intensity"
         for w in waves_data:
             y_base, w_xs, w_ts = w['year'], np.array(w['xs']), np.array(w['temps'])
             cum_sum = np.cumsum(np.maximum(0, w_ts - p_thresh) if is_warm else np.maximum(0, p_thresh - w_ts))
@@ -2710,7 +2776,8 @@ def build_kysely_wave_figs(
                 x_skewed, y_fine = np.asarray(w_xs, dtype=float), np.asarray(cum_sum, dtype=float)
                 x_skewed = _wave_ridge_x(x_skewed, y_fine)
 
-            break_x, y_break = _wave_break_tail(x_skewed[-1], y_fine[-1])
+            span = float(w_xs[-1] - w_xs[0]) if len(w_xs) else 0.0
+            break_x, y_break = _wave_break_tail(x_skewed[-1], y_fine[-1], span=span)
 
             x_full = np.concatenate(([x_skewed[0]], x_skewed, break_x, [break_x[-1]]))
             y_full = np.concatenate(([0.0], y_fine, y_break, [0.0]))
@@ -2721,11 +2788,20 @@ def build_kysely_wave_figs(
             (r_b, g_b, b_b), (r, g, b) = _wave_ridge_colors(parameter, is_warm, norm_val)
 
             sd_str, ed_str = pd.to_datetime(w['start_date']).strftime('%d.%m.'), pd.to_datetime(w['end_date']).strftime('%d.%m.%Y')
+            event_id = w.get('event_id') or (
+                f"{pd.Timestamp(w['start_date']).date().isoformat()}_"
+                f"{pd.Timestamp(w['end_date']).date().isoformat()}"
+            )
+            rank = rank_by_id.get(event_id)
             hover = (
                 f"<b>Duration: {sd_str}–{ed_str}</b><br>"
                 f"Length: {len(w_xs)} days<br>"
                 f"Severity: {w['intensity']:.1f} K"
             )
+            if rank is not None:
+                hover += f"<br>Rank: #{rank}/{n_total} ({rank_metric})"
+            else:
+                hover += "<br>Rank: —"
             line_color = f"rgba({r},{g},{b},{WAVE_LINE_ALPHA})"
             line_width = WAVE_LINE_WIDTH
             if show_expert("z500"):
@@ -2737,7 +2813,10 @@ def build_kysely_wave_figs(
                         tag = " (Ridge)"
                     elif z_mean <= -ridge_dam:
                         tag = " (Trough)"
-                    hover += f"<br>Z500-Mean: {z_mean:+.1f} dam{tag}"
+                    # Extra hover line; wavogram CSS shrinks the 5th tspan
+                    # to ~half a line (Plotly otherwise treats every <br> as
+                    # a full line and strips padding/font-size in hover HTML).
+                    hover += f"<br>\u00a0<br>Z500-Mean: {z_mean:+.1f} dam{tag}"
                     z_ext = w.get("z500_anom_max") if is_warm else w.get("z500_anom_min")
                     ext_label = "Z500-Max" if is_warm else "Z500-Min"
                     if z_ext is not None and np.isfinite(z_ext):
@@ -2750,10 +2829,6 @@ def build_kysely_wave_figs(
                         line_color = ATMOPULSE_OVERLAY["z500_anom_contour"]
                         line_width = WAVE_Z500_LINE_WIDTH
 
-            event_id = w.get('event_id') or (
-                f"{pd.Timestamp(w['start_date']).date().isoformat()}_"
-                f"{pd.Timestamp(w['end_date']).date().isoformat()}"
-            )
             fig_main.add_trace(go.Scatter(
                 x=x_full, y=y_coords, mode='lines',
                 line=dict(color=line_color, width=line_width, shape='spline'),
@@ -2902,6 +2977,82 @@ def build_wave_event_mini_fig(payload: dict, wave: dict, n_total: int, y_range=N
         # Shared y-scale across all displayed slots (set by the caller from
         # the union of their data + thresholds) so the mini-charts are
         # directly comparable instead of each auto-scaling independently.
+        yaxis_kw["range"] = list(y_range)
+    fig.update_yaxes(**yaxis_kw)
+    return fig
+
+
+def wave_event_z500_window(payload: dict, wave: dict):
+    """Z500 anomaly (dam) for [start-3d, end+3d]. None if series/clim missing."""
+    series = payload.get("z500_series")
+    lat, lon = payload.get("lat"), payload.get("lon")
+    if series is None or len(series) == 0 or lat is None or lon is None:
+        return None
+    epoch = "A" if str(payload.get("epoch", "B")).upper().startswith("A") else "B"
+    start = pd.Timestamp(wave["start_date"]).normalize() - pd.Timedelta(days=3)
+    end = pd.Timestamp(wave["end_date"]).normalize() + pd.Timedelta(days=3)
+    idx = pd.DatetimeIndex(pd.to_datetime(series.index))
+    if idx.tz is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    idx = idx.normalize()
+    z = pd.Series(np.asarray(series.values, dtype=np.float64), index=idx)
+    z = z[(z.index >= start) & (z.index <= end)]
+    if z.empty or not np.isfinite(z.values).any():
+        return None
+    clim = synoptic_clim_point_doy(load_synoptic_climatology(), "z500", epoch, lat, lon)
+    if clim is None or clim.size < 365:
+        return None
+    doys = etccdi_doy_365(z.index)
+    z_clim = clim[np.clip(doys - 1, 0, len(clim) - 1)]
+    anom = np.asarray(z.values, dtype=np.float64) - z_clim
+    return z.index, anom, np.asarray(z.values, dtype=np.float64), z_clim
+
+
+def build_wave_event_z500_mini_fig(payload: dict, wave: dict, y_range=None) -> go.Figure | None:
+    """Expert drill-down: Z500 anomaly under one event, same ±3-day window.
+
+    Fill, line colour/width and hover match ``get_z500_anomaly_traces``
+    (Meteogram Z500 panel). The event window is the same vrect as the
+    temperature mini (0.12 wash, last in-wave day, no extra outline).
+    """
+    packed = wave_event_z500_window(payload, wave)
+    if packed is None:
+        return None
+    dates, anom, z_live, z_clim = packed
+    is_warm = bool(payload.get("is_warm", True))
+    start = pd.Timestamp(wave["start_date"]).normalize()
+    end = pd.Timestamp(wave["end_date"]).normalize()
+    line_col = _z500_anomaly_colors()["line"]
+    fig = go.Figure()
+    for tr in _z500_anomaly_band_traces(dates, anom):
+        fig.add_trace(tr)
+    fig.add_trace(go.Scatter(
+        x=dates, y=anom, mode="lines",
+        line=dict(color=line_col, width=_Z500_LINE_WIDTH, shape="linear"),
+        showlegend=False, hoverinfo="skip",
+    ))
+    fig.add_trace(_z500_anomaly_hover_trace(dates, anom, z_live, z_clim))
+    period_hex = (
+        ATMOPULSE_OVERLAY["z500_anom_contour"] if is_warm
+        else ATMOPULSE_OVERLAY["z500_contour"]
+    )
+    fig.add_vrect(
+        x0=start, x1=end,
+        fillcolor=_z500_fill_rgba(period_hex, 0.12),
+        line_width=0, layer="below",
+    )
+    fig.update_layout(
+        **plotly_typography(),
+        title=dict(text="Z500 anomaly", font=plotly_title_font(size=11)),
+        height=170, margin=dict(t=28, b=24, l=42, r=10),
+        template="plotly_white", showlegend=False, hovermode="x",
+    )
+    fig.update_xaxes(tickformat="%d.%m", showgrid=False, zeroline=False)
+    yaxis_kw = dict(
+        title_text="Z500 anom. (dam)", showgrid=True, gridcolor=ATMOPULSE_OVERLAY["grid"],
+        zeroline=True, zerolinecolor="rgba(0,0,0,0.45)",
+    )
+    if y_range is not None:
         yaxis_kw["range"] = list(y_range)
     fig.update_yaxes(**yaxis_kw)
     return fig

@@ -27,7 +27,7 @@ from datetime import datetime
 from geopy.exc import GeocoderServiceError, GeocoderTimedOut, GeocoderUnavailable
 from geopy.geocoders import Nominatim
 
-from backend_maps import etccdi_doy_365, latest_era5_archive_date
+from backend_maps import etccdi_doy_365, latest_era5_archive_date, latest_forecast_cycle_label
 from backend_io import get_archive_year_options
 from backend_waves import compute_kysely_waves_data, rank_waves_by_metric
 from labels import HELP
@@ -35,6 +35,7 @@ from atmopulse_theme import (
     ATMOPULSE_BRAND,
     atmopulse_streamlit_css,
     atmopulse_wordmark_html,
+    inject_monday_weekstart,
     LOGO_SVG,
 )
 from config import (
@@ -69,6 +70,7 @@ from config import (
     SLIDER_PAD_FUTURE,
     is_expert_mode,
     is_aifs_model,
+    selected_forecast_model,
     show_expert,
     is_daily_map_view,
     epoch_period_label,
@@ -82,7 +84,10 @@ from frontend_plots import (
     st_plotly_press,
     align_wave_stats_yranges,
     build_wave_event_mini_fig,
+    build_wave_event_z500_mini_fig,
     render_press_export,
+    wave_event_z500_window,
+    _Z500_ANOM_Y_FLOOR,
 )
 
 
@@ -168,8 +173,9 @@ def _wave_section_spacer(px: int = 28) -> None:
 def _open_wave_event_on_map(start_date):
     """Callback for the per-event 'Map this event' button: point the Map
     Tracker at this wave's start day (ERA5 Archive), pre-select the
-    Meteogram's Archive Year to match if that calendar year is already a
-    complete ERA5 archive year (else leave the Meteogram on Live), and jump
+    Meteogram's Archive Year to match if that calendar year is in the
+    Archive Year list (complete years plus the in-progress current year;
+    else leave the Meteogram on Live), and jump
     the top nav to Map Tracker. Never touches offset_slider — this is a
     one-way "open on map" action, not a general Map<->Meteogram coupling.
 
@@ -351,6 +357,21 @@ def _render_wave_drilldown(payload_a, payload_b, stack_metric, ctx_key, click_ev
             y_range = (y_min - pad, y_max + pad)
 
         mini_cols = st.columns(len(selected_waves))
+        show_z500_minis = show_expert("z500")
+        z500_range = None
+        if show_z500_minis:
+            z_abs = []
+            for w in selected_waves:
+                packed = wave_event_z500_window(payload_b, w)
+                if packed is None:
+                    continue
+                anom = packed[1]
+                finite = anom[np.isfinite(anom)]
+                if finite.size:
+                    z_abs.append(float(np.max(np.abs(finite))))
+            if z_abs:
+                z_lim = max(_Z500_ANOM_Y_FLOOR, max(z_abs) * 1.15)
+                z500_range = (-z_lim, z_lim)
         for col, w in zip(mini_cols, selected_waves):
             with col:
                 mini_fig = build_wave_event_mini_fig(payload_b, w, n_total, y_range=y_range)
@@ -372,6 +393,27 @@ def _render_wave_drilldown(payload_a, payload_b, stack_metric, ctx_key, click_ev
                             "value": window.values,
                         }).to_csv(index=False)
                 render_press_export(mini_fig, f"wavogram_event_{w['event_id']}", csv_text=csv_text)
+                if show_z500_minis:
+                    z_fig = build_wave_event_z500_mini_fig(payload_b, w, y_range=z500_range)
+                    if z_fig is not None:
+                        st.plotly_chart(
+                            z_fig, use_container_width=True,
+                            key=f"wave_mini_z500_{w['event_id']}",
+                        )
+                        packed = wave_event_z500_window(payload_b, w)
+                        z_csv = None
+                        if packed is not None:
+                            dates, anom, z_live, z_clim = packed
+                            z_csv = pd.DataFrame({
+                                "date": pd.DatetimeIndex(dates).strftime("%Y-%m-%d"),
+                                "z500_dam": np.round(z_live, 2),
+                                "doy_mean_dam": np.round(z_clim, 2),
+                                "z500_anom_dam": np.round(anom, 2),
+                            }).to_csv(index=False)
+                        render_press_export(
+                            z_fig, f"wavogram_event_z500_{w['event_id']}",
+                            csv_text=z_csv,
+                        )
                 st.button(
                     "Map this event",
                     key=f"wave_open_map_{w['event_id']}",
@@ -385,6 +427,7 @@ def _render_wave_drilldown(payload_a, payload_b, stack_metric, ctx_key, click_ev
 # --- UI & CSS: TOP NAVIGATION BAR ---
 st.set_page_config(page_title="AtmoPulse", layout="wide", page_icon="assets/favicon.svg", initial_sidebar_state="expanded")
 st.markdown(f"<style>{atmopulse_streamlit_css(ATMOPULSE_BRAND)}</style>", unsafe_allow_html=True)
+inject_monday_weekstart()
 
 geolocator = Nominatim(user_agent="atmopulse_extremes_tracker_2026")
 
@@ -588,6 +631,10 @@ with st.sidebar:
         # Wavogram/Meteogram never see this block (nav_selection-gated).
         map_is_archive = False
         if nav_selection == NAV_MAP:
+            if "map_archive_mode" not in st.session_state:
+                st.session_state["map_archive_mode"] = st.session_state.get(
+                    "_active_map_archive_mode", "Live",
+                )
             st.radio(
                 "Map date:",
                 ("Live", "Date"),
@@ -595,6 +642,7 @@ with st.sidebar:
                 key="map_archive_mode",
                 help=HELP["map_archive_date"],
             )
+            st.session_state["_active_map_archive_mode"] = st.session_state.map_archive_mode
             map_is_archive = st.session_state.get("map_archive_mode") == "Date"
             if map_is_archive:
                 _max_archive = latest_era5_archive_date().date()
@@ -605,15 +653,18 @@ with st.sidebar:
                 # "created with a default value but also had its value set
                 # via the Session State API" warning.
                 if "map_archive_date" not in st.session_state:
-                    st.session_state.map_archive_date = _max_archive
-                else:
-                    st.session_state.map_archive_date = min(st.session_state.map_archive_date, _max_archive)
+                    st.session_state.map_archive_date = st.session_state.get(
+                        "_active_map_archive_date", _max_archive,
+                    )
+                st.session_state.map_archive_date = min(st.session_state.map_archive_date, _max_archive)
                 st.date_input(
                     "Archive date:",
                     min_value=pd.Timestamp(1940, 1, 1).date(),
                     max_value=_max_archive,
                     key="map_archive_date",
+                    format="DD.MM.YYYY",
                 )
+                st.session_state["_active_map_archive_date"] = st.session_state.map_archive_date
                 _arch_col1, _arch_col2 = st.columns(2)
                 with _arch_col1:
                     st.button(
@@ -640,9 +691,11 @@ with st.sidebar:
         else:
             st.session_state.forecast_model = FORECAST_MODEL_IFS
         _fc_tag = "AIFS" if is_aifs_model() else "IFS"
+        _cycle = latest_forecast_cycle_label(selected_forecast_model())
+        _fc_when = f" run {_cycle}" if _cycle else ""
         st.markdown(
             f"<p style='font-size: 12px; color: #555; margin-top: -10px;'>📡 Data: ERA5 Archive (~ 5 days ago) | "
-            f"{_fc_tag} Forecast ({default_date.strftime('%d.%m.%Y')} 12 UTC).</p>",
+            f"{_fc_tag} Forecast{_fc_when}.</p>",
             unsafe_allow_html=True,
             help=HELP["data_vintage"],
         )
@@ -1068,17 +1121,18 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                     )
 
                 if map_layout == LAYOUT_SIDE_BY_SIDE:
-                    w_col1, w_col2 = st.columns(2)
-                    with w_col1:
-                        click_a = st_plotly_press(
-                            fig_m_a, "wavogram_ridge_historical",
-                            on_select="rerun", selection_mode=("points",), key="wave_ridge_click_a",
-                        )
-                    with w_col2:
-                        click_b = st_plotly_press(
-                            fig_m_b, "wavogram_ridge_recent",
-                            on_select="rerun", selection_mode=("points",), key="wave_ridge_click_b",
-                        )
+                    with st.container(key="atmopulse_split_wave_ridge"):
+                        w_col1, w_col2 = st.columns(2, gap="small")
+                        with w_col1:
+                            click_a = st_plotly_press(
+                                fig_m_a, "wavogram_ridge_historical",
+                                on_select="rerun", selection_mode=("points",), key="wave_ridge_click_a",
+                            )
+                        with w_col2:
+                            click_b = st_plotly_press(
+                                fig_m_b, "wavogram_ridge_recent",
+                                on_select="rerun", selection_mode=("points",), key="wave_ridge_click_b",
+                            )
                     # One Event Drill-down block under both ridges, not a
                     # 5+5 split — a Reference-period toggle inside picks
                     # which epoch's events are ranked/shown (default: B).
@@ -1096,45 +1150,46 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                     # written into a given `st.columns()` pair as one
                     # contiguous row wherever that pair was first created,
                     # so it can't be interleaved with content in between.
-                    st_col1, st_col2 = st.columns(2)
-                    with st_col1:
-                        st.markdown(
-                            f"**{stack_heading} | {epoch_period_label('A')}**",
-                            help=HELP["wave_annual_stack"],
-                        )
-                        st_plotly_press(
-                            fig_s_a, "wavogram_stats_historical",
-                            export_title=_wave_export_title(stack_heading, "A"),
-                        )
-                        if show_expert("wave_annual_cycle"):
-                            _wave_section_spacer()
+                    with st.container(key="atmopulse_split_wave_stats"):
+                        st_col1, st_col2 = st.columns(2, gap="small")
+                        with st_col1:
                             st.markdown(
-                                f"**Frequency [%] | {epoch_period_label('A')}**",
-                                help=HELP["wave_annual_cycle"],
+                                f"**{stack_heading} | {epoch_period_label('A')}**",
+                                help=HELP["wave_annual_stack"],
                             )
                             st_plotly_press(
-                                fig_f_a, "wavogram_freq_historical",
-                                export_title=_wave_export_title("Frequency [%]", "A"),
+                                fig_s_a, "wavogram_stats_historical",
+                                export_title=_wave_export_title(stack_heading, "A"),
                             )
-                    with st_col2:
-                        st.markdown(
-                            f"**{stack_heading} | {epoch_period_label('B')}**",
-                            help=HELP["wave_annual_stack"],
-                        )
-                        st_plotly_press(
-                            fig_s_b, "wavogram_stats_recent",
-                            export_title=_wave_export_title(stack_heading, "B"),
-                        )
-                        if show_expert("wave_annual_cycle"):
-                            _wave_section_spacer()
+                            if show_expert("wave_annual_cycle"):
+                                _wave_section_spacer()
+                                st.markdown(
+                                    f"**Frequency [%] | {epoch_period_label('A')}**",
+                                    help=HELP["wave_annual_cycle"],
+                                )
+                                st_plotly_press(
+                                    fig_f_a, "wavogram_freq_historical",
+                                    export_title=_wave_export_title("Frequency [%]", "A"),
+                                )
+                        with st_col2:
                             st.markdown(
-                                f"**Frequency [%] | {epoch_period_label('B')}**",
-                                help=HELP["wave_annual_cycle"],
+                                f"**{stack_heading} | {epoch_period_label('B')}**",
+                                help=HELP["wave_annual_stack"],
                             )
                             st_plotly_press(
-                                fig_f_b, "wavogram_freq_recent",
-                                export_title=_wave_export_title("Frequency [%]", "B"),
+                                fig_s_b, "wavogram_stats_recent",
+                                export_title=_wave_export_title(stack_heading, "B"),
                             )
+                            if show_expert("wave_annual_cycle"):
+                                _wave_section_spacer()
+                                st.markdown(
+                                    f"**Frequency [%] | {epoch_period_label('B')}**",
+                                    help=HELP["wave_annual_cycle"],
+                                )
+                                st_plotly_press(
+                                    fig_f_b, "wavogram_freq_recent",
+                                    export_title=_wave_export_title("Frequency [%]", "B"),
+                                )
                 else:
                     flicker_epoch = st.radio(
                         "Select Reference Period:",

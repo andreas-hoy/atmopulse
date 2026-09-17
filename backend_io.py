@@ -43,6 +43,7 @@ from backend_maps import (
     drop_era5t_aux,
     etccdi_doy_365,
     get_synoptic_map_data,
+    live_forecast_dates,
     set_synoptic_anchor,
 )
 from config import (
@@ -267,8 +268,14 @@ def _load_persistence_window_source(
 
 
 @st.cache_data(show_spinner=False)
-def _load_persistence_daily_series(start_date_str, end_date_str, anchor_date_str=None, forecast_model=FORECAST_MODEL_IFS):
-    """Build a daily TX/TN/T850 cube from ERA5 masters; IFS/AIFS only in the last 6 days + forecast."""
+def _load_persistence_daily_series(
+    start_date_str, end_date_str, anchor_date_str=None, forecast_model=FORECAST_MODEL_IFS,
+    _series_version=4,
+):
+    """Build a daily TX/TN/TG/T850 cube from ERA5 masters; IFS/AIFS only in the last 6 days + forecast.
+
+    Each variable is stored independently. Missing TX/TN is never filled from TG.
+    """
     start_date = pd.to_datetime(start_date_str).normalize()
     end_date = pd.to_datetime(end_date_str).normalize()
     by_date = {}
@@ -290,7 +297,7 @@ def _load_persistence_daily_series(start_date_str, end_date_str, anchor_date_str
                 # leftover duplicate timestamps.
                 # 29 Feb is kept as a real day here too — persistence streaks
                 # are a live/actual-data view, not the 365-day baseline array.
-                tx_by, tn_by, t850_by = {}, {}, {}
+                tx_by, tn_by, t850_by, tg_by = {}, {}, {}, {}
                 if "tx" in sub.data_vars:
                     tx_d = sub["tx"].groupby("valid_time.date").max()
                     for i, d in enumerate(tx_d["date"].values):
@@ -306,13 +313,9 @@ def _load_persistence_daily_series(start_date_str, end_date_str, anchor_date_str
                 if "tg" in sub.data_vars:
                     tg_d = sub["tg"].groupby("valid_time.date").mean()
                     for i, d in enumerate(tg_d["date"].values):
-                        day = pd.Timestamp(d).normalize()
-                        if day not in tx_by:
-                            tx_by[day] = tg_d.values[i]
-                        if day not in tn_by:
-                            tn_by[day] = tg_d.values[i]
-                for day in set(tx_by) | set(tn_by) | set(t850_by):
-                    by_date[day] = (tx_by.get(day), tn_by.get(day), t850_by.get(day))
+                        tg_by[pd.Timestamp(d).normalize()] = tg_d.values[i]
+                for day in set(tx_by) | set(tn_by) | set(t850_by) | set(tg_by):
+                    by_date[day] = (tx_by.get(day), tn_by.get(day), t850_by.get(day), tg_by.get(day))
 
     archive_max = max((d for d in by_date if d < overlay_cut), default=None)
 
@@ -326,7 +329,7 @@ def _load_persistence_daily_series(start_date_str, end_date_str, anchor_date_str
         sample = next((by_date[d][idx] for d in eligible if by_date[d][idx] is not None), None)
         if sample is None:
             other = next(
-                (by_date[d][j] for d in eligible for j in range(3) if by_date[d][j] is not None),
+                (by_date[d][j] for d in eligible for j in range(4) if by_date[d][j] is not None),
                 None,
             )
             if other is None:
@@ -338,8 +341,37 @@ def _load_persistence_daily_series(start_date_str, end_date_str, anchor_date_str
     tx_vals = _stack_field(0)
     tn_vals = _stack_field(1)
     t850_vals = _stack_field(2)
-    if tx_vals is None and tn_vals is None and t850_vals is None:
+    tg_vals = _stack_field(3)
+    if tx_vals is None and tn_vals is None and t850_vals is None and tg_vals is None:
         return None, {"archive_max": archive_max, "effective_end": None, "uses_ifs": False, "has_gap": False}
+
+    if (
+        "AIFS" not in str(forecast_model)
+        and ds is not None
+        and "latitude" in ds.coords
+        and "longitude" in ds.coords
+    ):
+        live_days = live_forecast_dates(forecast_model)
+        if live_days:
+            eligible_ts = [pd.Timestamp(d).normalize() for d in eligible]
+            mask = np.array([d in live_days for d in eligible_ts], dtype=bool)
+            if mask.any():
+                lats = np.asarray(ds.latitude.values)
+                lons = np.asarray(ds.longitude.values)
+                ifs_dates = [d for d, keep in zip(eligible_ts, mask) if keep]
+                tx_s = tx_vals[mask] if tx_vals is not None else None
+                tn_s = tn_vals[mask] if tn_vals is not None else None
+                tg_s = tg_vals[mask] if tg_vals is not None else None
+                tx_s, tn_s, tg_s = _apply_ifs_mean_qdm(tx_s, tn_s, tg_s, lats, lons, ifs_dates)
+                if tx_vals is not None and tx_s is not None:
+                    tx_vals = np.array(tx_vals, copy=True)
+                    tx_vals[mask] = tx_s
+                if tn_vals is not None and tn_s is not None:
+                    tn_vals = np.array(tn_vals, copy=True)
+                    tn_vals[mask] = tn_s
+                if tg_vals is not None and tg_s is not None:
+                    tg_vals = np.array(tg_vals, copy=True)
+                    tg_vals[mask] = tg_s
 
     ifs_used = any(d >= overlay_cut for d in eligible)
     has_gap = False
@@ -354,17 +386,17 @@ def _load_persistence_daily_series(start_date_str, end_date_str, anchor_date_str
         "uses_ifs": ifs_used,
         "has_gap": has_gap,
     }
-    return (np.array(eligible), tx_vals, tn_vals, t850_vals), meta
+    return (np.array(eligible), tx_vals, tn_vals, t850_vals, tg_vals), meta
 
 
 # --- QDM BIAS CORRECTION ---
 @st.cache_resource(show_spinner=False)
 def _load_qdm_bias_ds():
     """
-    Optional IFS-vs-ERA5 QDM bias cube (see calculate_qdm_bias.py). Returns
-    None — a documented zero-bias passthrough — until that build script has
-    been run (it requires archived IFS_Hindcasts/*.nc, which are not part of
-    this deployment yet).
+    Optional IFS-vs-ERA5 QDM cube (see calculate_qdm_bias.py). True QDM
+    needs ``*_ifs_q`` plus ``*_bias``; older files with only bias fall back
+    to the mean-quantile shift. Returns None (zero-bias passthrough) until
+    the hindcast builder has been run. T850 is never in this cube.
     """
     if not QDM_TRANSFER_FILE.exists():
         return None
@@ -374,24 +406,187 @@ def _load_qdm_bias_ds():
         return None
 
 
-def _qdm_mean_bias(lat, lon, doys_1_365, bias_var):
+_QDM_IFS_Q_VAR = {
+    "tx_bias": "tx_ifs_q",
+    "dtr_bias": "dtr_ifs_q",
+    "tg_bias": "tg_ifs_q",
+}
+
+
+def _qdm_apply_field(x, q_model, bias):
+    """True QDM on a spatial field: x' = x + Δ(F_IFS(x)).
+
+    ``q_model`` and ``bias`` are (nq, nlat, nlon). Values outside the stored
+    quantile range keep the endpoint Δ (Cannon). NaN in ``x`` is unchanged.
     """
-    Per-day-of-year QDM bias for one point, averaged across the stored
-    quantile axis. The transfer cube persists only the BIAS at each
-    empirical quantile (q_era5 - q_ifs), not the raw IFS quantile VALUES
-    needed to rank a brand-new forecast value into a quantile bin — so a
-    full per-value quantile-mapping isn't reconstructible from this artifact
-    alone. Averaging over quantiles yields the mean systematic bias for that
-    calendar day, a documented simplification of true QDM. Returns zeros
-    (no-op) when the cube isn't available.
+    x = np.asarray(x, dtype=np.float64)
+    q = np.asarray(q_model, dtype=np.float64)
+    b = np.asarray(bias, dtype=np.float64)
+    if x.shape != q.shape[1:] or b.shape != q.shape:
+        return x
+    nq = q.shape[0]
+    if nq < 2:
+        return x
+    q_mono = np.maximum.accumulate(np.where(np.isfinite(q), q, -np.inf), axis=0)
+    q0, qn = q_mono[0], q_mono[-1]
+    below = x <= q0
+    above = x >= qn
+    ge = q_mono >= x
+    has = np.any(ge, axis=0)
+    idx_hi = np.where(has, np.argmax(ge, axis=0), nq - 1)
+    idx_lo = np.maximum(idx_hi - 1, 0)
+
+    def _take(arr, idx):
+        return np.take_along_axis(arr, idx[np.newaxis], axis=0)[0]
+
+    ql, qh = _take(q_mono, idx_lo), _take(q_mono, idx_hi)
+    bl, bh = _take(b, idx_lo), _take(b, idx_hi)
+    denom = qh - ql
+    w = np.divide(x - ql, denom, out=np.zeros_like(x), where=np.abs(denom) > 1e-8)
+    w = np.clip(w, 0.0, 1.0)
+    delta = bl + w * (bh - bl)
+    delta = np.where(below, b[0], delta)
+    delta = np.where(above, b[-1], delta)
+    delta = np.nan_to_num(delta, nan=0.0)
+    return np.where(np.isfinite(x), x + delta, x)
+
+
+def _qdm_apply_scalar(x, q_model, bias):
+    """True QDM for one value against 1-D quantile curves."""
+    if not np.isfinite(x):
+        return x
+    q = np.asarray(q_model, dtype=np.float64)
+    b = np.asarray(bias, dtype=np.float64)
+    ok = np.isfinite(q) & np.isfinite(b)
+    if int(ok.sum()) < 2:
+        return x
+    q, b = q[ok], b[ok]
+    order = np.argsort(q, kind="mergesort")
+    q, b = q[order], b[order]
+    q, uniq = np.unique(q, return_index=True)
+    b = b[uniq]
+    if q.size < 2:
+        return x + float(b[0] if b.size else 0.0)
+    return x + float(np.interp(x, q, b))
+
+
+def _qdm_has_ifs_q(ds_qdm, bias_var) -> bool:
+    q_var = _QDM_IFS_Q_VAR.get(bias_var)
+    return bool(ds_qdm is not None and q_var and q_var in ds_qdm.data_vars)
+
+
+def _qdm_mean_bias_grid(lats, lons, doys_1_365, bias_var):
+    """Mean-quantile bias on a lat/lon grid: shape (n_time, n_lat, n_lon).
+
+    Fallback when the cube has no ``*_ifs_q`` (older files). Zeros when the
+    cube or variable is missing.
     """
+    lats = np.asarray(lats)
+    lons = np.asarray(lons)
+    doys = np.atleast_1d(np.asarray(doys_1_365, dtype=int))
+    shape = (doys.size, lats.size, lons.size)
     ds_qdm = _load_qdm_bias_ds()
     if ds_qdm is None or bias_var not in ds_qdm.data_vars:
-        return np.zeros(len(doys_1_365), dtype=np.float64)
+        return np.zeros(shape, dtype=np.float64)
+    try:
+        da = ds_qdm[bias_var].mean(dim="quantile")
+        da = da.reindex(latitude=lats, longitude=lons, method="nearest")
+    except Exception:
+        return np.zeros(shape, dtype=np.float64)
+    n_doy = int(da.sizes.get("dayofyear", 365))
+    idx = np.clip(doys - 1, 0, n_doy - 1)
+    return np.nan_to_num(np.asarray(da.values, dtype=np.float64)[idx], nan=0.0)
+
+
+def _qdm_correct_grid(field, lats, lons, doys_1_365, bias_var):
+    """Correct a 2-D or 3-D IFS field. True QDM if ``*_ifs_q`` exists."""
+    if field is None:
+        return None
+    arr = np.asarray(field, dtype=np.float64)
+    doys = np.atleast_1d(np.asarray(doys_1_365, dtype=int))
+    ds_qdm = _load_qdm_bias_ds()
+    if ds_qdm is None or bias_var not in ds_qdm.data_vars:
+        return arr
+    if not _qdm_has_ifs_q(ds_qdm, bias_var):
+        bias = _qdm_mean_bias_grid(lats, lons, doys, bias_var)
+        if arr.ndim == 2:
+            return arr + bias[0]
+        return arr + bias
+    q_var = _QDM_IFS_Q_VAR[bias_var]
+    try:
+        da_q = ds_qdm[q_var].reindex(latitude=lats, longitude=lons, method="nearest")
+        da_b = ds_qdm[bias_var].reindex(latitude=lats, longitude=lons, method="nearest")
+    except Exception:
+        return arr
+    n_doy = int(da_q.sizes.get("dayofyear", 365))
+    out = np.array(arr, copy=True)
+    stacked = out[np.newaxis, ...] if out.ndim == 2 else out
+    n_t = stacked.shape[0]
+    for t, doy in enumerate(doys[:n_t]):
+        di = int(np.clip(doy - 1, 0, n_doy - 1))
+        q_sl = np.asarray(da_q.isel(dayofyear=di).values, dtype=np.float64)
+        b_sl = np.asarray(da_b.isel(dayofyear=di).values, dtype=np.float64)
+        stacked[t] = _qdm_apply_field(stacked[t], q_sl, b_sl)
+    return stacked[0] if out.ndim == 2 else stacked
+
+
+def _apply_ifs_mean_qdm(tx, tn, tg, lats, lons, dates):
+    """IFS-only QDM on grids (same TX/DTR/TG rules as the meteogram).
+
+    True Cannon QDM when ``*_ifs_q`` is in the cube; otherwise the mean
+    quantile bias. T850 is never corrected. ``tx``/``tn``/``tg`` are Celsius
+    ndarrays, 2D or 3D, or None.
+    """
+    dates = pd.DatetimeIndex(pd.to_datetime(np.atleast_1d(dates)))
+    if dates.tz is not None:
+        dates = dates.tz_convert("UTC").tz_localize(None)
+    dates = dates.normalize()
+    doys = etccdi_doy_365(dates)
+
+    tx_out = _qdm_correct_grid(tx, lats, lons, doys, "tx_bias")
+    tg_out = _qdm_correct_grid(tg, lats, lons, doys, "tg_bias")
+    tn_out = None if tn is None else np.asarray(tn, dtype=np.float64)
+    if tn_out is not None and tx is not None:
+        tx_raw = np.asarray(tx, dtype=np.float64)
+        dtr_raw = tx_raw - tn_out
+        dtr_corr = _qdm_correct_grid(dtr_raw, lats, lons, doys, "dtr_bias")
+        tn_out = None if tx_out is None or dtr_corr is None else tx_out - dtr_corr
+    return tx_out, tn_out, tg_out
+
+
+def _qdm_mean_bias(lat, lon, doys_1_365, bias_var):
+    """Fallback: mean over the stored quantile axis (older cubes without Q_IFS)."""
+    ds_qdm = _load_qdm_bias_ds()
+    doys = np.atleast_1d(np.asarray(doys_1_365, dtype=int))
+    if ds_qdm is None or bias_var not in ds_qdm.data_vars:
+        return np.zeros(len(doys), dtype=np.float64)
     pt = ds_qdm[bias_var].sel(latitude=lat, longitude=lon, method='nearest')
-    by_doy = pt.mean(dim='quantile').values  # shape (365,)
-    idx = np.clip(np.asarray(doys_1_365) - 1, 0, len(by_doy) - 1)
+    by_doy = pt.mean(dim='quantile').values
+    idx = np.clip(doys - 1, 0, len(by_doy) - 1)
     return np.nan_to_num(by_doy[idx], nan=0.0)
+
+
+def _qdm_correct_point(values, lat, lon, doys_1_365, bias_var):
+    """Point QDM: true mapping when ``*_ifs_q`` exists, else mean-quantile bias."""
+    values = np.asarray(values, dtype=np.float64)
+    doys = np.atleast_1d(np.asarray(doys_1_365, dtype=int))
+    ds_qdm = _load_qdm_bias_ds()
+    if ds_qdm is None or bias_var not in ds_qdm.data_vars:
+        return values
+    if not _qdm_has_ifs_q(ds_qdm, bias_var):
+        return values + _qdm_mean_bias(lat, lon, doys, bias_var)
+    q_var = _QDM_IFS_Q_VAR[bias_var]
+    pt_q = ds_qdm[q_var].sel(latitude=lat, longitude=lon, method="nearest")
+    pt_b = ds_qdm[bias_var].sel(latitude=lat, longitude=lon, method="nearest")
+    n_doy = int(pt_q.sizes.get("dayofyear", 365))
+    out = np.array(values, dtype=np.float64, copy=True)
+    flat = np.atleast_1d(out)
+    for i, val in enumerate(flat):
+        di = int(np.clip(doys[i] - 1, 0, n_doy - 1))
+        q = np.asarray(pt_q.isel(dayofyear=di).values, dtype=np.float64)
+        b = np.asarray(pt_b.isel(dayofyear=di).values, dtype=np.float64)
+        flat[i] = _qdm_apply_scalar(val, q, b)
+    return out
 
 
 def _squeeze_celsius(values):
@@ -437,7 +632,7 @@ def _point_frame_from_master_ds(ds, lat, lon, start, end):
     n = len(days)
     tx = _squeeze_celsius(pt["tx"].values) if "tx" in pt else np.full(n, np.nan)
     tn = _squeeze_celsius(pt["tn"].values) if "tn" in pt else np.full(n, np.nan)
-    tg = _squeeze_celsius(pt["tg"].values) if "tg" in pt else (tx + tn) / 2.0
+    tg = _squeeze_celsius(pt["tg"].values) if "tg" in pt else np.full(n, np.nan)
     t850 = _squeeze_celsius(pt["t850"].values) if "t850" in pt else np.full(n, np.nan)
     z500 = _z500_to_dam(pt["z500"].values) if "z500" in pt else np.full(n, np.nan)
     return pd.DataFrame({"Date": days, "TX": tx, "TN": tn, "TG": tg, "T850": t850, "Z500": z500})
@@ -545,7 +740,7 @@ def _last_finite(series):
 
 
 @st.cache_data(show_spinner=False)
-def get_live_point_series(lat, lon, forecast_model=FORECAST_MODEL_IFS, _series_version=9):
+def get_live_point_series(lat, lon, forecast_model=FORECAST_MODEL_IFS, _series_version=12):
     """
     Point daily TX/TN/TG/T850/Z500 for the Point Meteogram. Does NOT open the maps
     spatial cube (load_global_datasets): that concatenates 2025+2026 and then
@@ -584,10 +779,17 @@ def get_live_point_series(lat, lon, forecast_model=FORECAST_MODEL_IFS, _series_v
             f_times = f_times[keep_fcst]
             f_days = f_days[keep_fcst]
             f_doys = etccdi_doy_365(f_days)
+            # IFS-vs-ERA5 transfer only. AIFS is trained on ERA5 — do not apply.
+            # T850 is free atmosphere and is never QDM-corrected.
+            apply_qdm = "AIFS" not in str(forecast_model)
+            def _corr(vals, var):
+                if not apply_qdm:
+                    return vals
+                return _qdm_correct_point(vals, lat, lon, f_doys, var)
             tx_name = "tx" if "tx" in pt_lf.data_vars else "mx2t"
             tn_name = "tn" if "tn" in pt_lf.data_vars else "mn2t"
             t850_vals = (
-                _squeeze_celsius(pt_lf["t850"].values) + _qdm_mean_bias(lat, lon, f_doys, "t850_bias")
+                _squeeze_celsius(pt_lf["t850"].values)
                 if "t850" in pt_lf.data_vars else np.full(len(f_days), np.nan)
             )
             z500_vals = (
@@ -597,15 +799,18 @@ def get_live_point_series(lat, lon, forecast_model=FORECAST_MODEL_IFS, _series_v
             if tx_name in pt_lf.data_vars and tn_name in pt_lf.data_vars:
                 tx_raw = _squeeze_celsius(pt_lf[tx_name].values)
                 tn_raw = _squeeze_celsius(pt_lf[tn_name].values)
-                tx_corr = tx_raw + _qdm_mean_bias(lat, lon, f_doys, "tx_bias")
-                dtr_corr = (tx_raw - tn_raw) + _qdm_mean_bias(lat, lon, f_doys, "dtr_bias")
-                tg_corr = (tx_raw + tn_raw) / 2.0 + _qdm_mean_bias(lat, lon, f_doys, "tg_bias")
+                tx_corr = _corr(tx_raw, "tx_bias")
+                dtr_corr = _corr(tx_raw - tn_raw, "dtr_bias")
+                if "tg" in pt_lf.data_vars:
+                    tg_corr = _corr(_squeeze_celsius(pt_lf["tg"].values), "tg_bias")
+                else:
+                    tg_corr = np.full(len(f_days), np.nan)
                 frames.append(pd.DataFrame({
                     "Date": f_days, "TX": tx_corr, "TN": tx_corr - dtr_corr, "TG": tg_corr,
                     "T850": t850_vals, "Z500": z500_vals,
                 }))
             elif "tg" in pt_lf.data_vars:
-                tg_corr = _squeeze_celsius(pt_lf["tg"].values) + _qdm_mean_bias(lat, lon, f_doys, "tg_bias")
+                tg_corr = _corr(_squeeze_celsius(pt_lf["tg"].values), "tg_bias")
                 frames.append(pd.DataFrame({
                     "Date": f_days, "TX": np.nan, "TN": np.nan, "TG": tg_corr,
                     "T850": t850_vals, "Z500": z500_vals,
@@ -643,8 +848,9 @@ def _archive_year_file(year: int) -> Path:
 def _archive_year_is_complete(year: int) -> bool:
     """True iff era5_master_daily_{year}.nc exists and its last covered day
     reaches 31 Dec of `year` with real (non-placeholder) ERA5/ERA5T data —
-    used to keep an in-progress or not-yet-downloaded year out of the
-    Meteogram's Archive Year selector."""
+    used to keep an in-progress year out of the *closed*-year ceiling of
+    the Meteogram Archive Year selector (the current year is appended
+    separately when the file exists)."""
     path = _archive_year_file(year)
     if not path.exists():
         return False
@@ -676,62 +882,128 @@ def _archive_year_is_complete(year: int) -> bool:
                 pass
 
 
-@st.cache_data(show_spinner=False)
+def _archive_year_mtime(year: int) -> float:
+    path = _archive_year_file(year)
+    try:
+        return float(path.stat().st_mtime) if path.exists() else 0.0
+    except OSError:
+        return 0.0
+
+
+def _last_finite_temp_day(df) -> pd.Timestamp | None:
+    """Latest calendar day with a real TX/TN/TG value (not an ERA5T placeholder)."""
+    if df is None or df.empty or "Date" not in df.columns:
+        return None
+    temp_cols = [c for c in ("TX", "TN", "TG") if c in df.columns]
+    if not temp_cols:
+        return None
+    dates = pd.to_datetime(df["Date"]).dt.tz_localize(None).dt.normalize()
+    finite = pd.DataFrame(
+        {c: pd.to_numeric(df[c], errors="coerce") for c in temp_cols},
+    ).notna().any(axis=1)
+    if not bool(finite.any()):
+        return None
+    return pd.Timestamp(dates[finite].max()).normalize()
+
+
 def get_archive_year_options(today_str: str):
-    """Meteogram Archive Year dropdown options: whole calendar years 1940
-    through the latest COMPLETE ERA5 master year.
+    """Meteogram Archive Year dropdown: complete ERA5 years plus the
+    in-progress current year when its master file exists.
 
-    `today_str` (e.g. ``pd.Timestamp.utcnow().strftime("%Y-%m-%d")``) is a
-    plain cache-key nonce — passing "today" explicitly (instead of calling
-    utcnow() inside this cached function) means a new day rolling over the
-    10-Jan cutoff, or a year's file finishing its download mid-day, actually
-    invalidates this cache instead of freezing the dropdown at whatever it
-    first returned this session.
+    ``today_str`` and the current-year file mtime are cache-key nonces so a
+    new day, the 10-Jan cutoff, or an ERA5T append actually refreshes the list.
+    """
+    today = pd.Timestamp(today_str)
+    return _cached_archive_year_options(
+        str(today_str), _archive_year_mtime(int(today.year)),
+    )
 
-    Year-release rule: `today.year - 1` is only ever a CANDIDATE ceiling once
-    the calendar day is >= 10 Jan (UTC); before that the ceiling is
-    `today.year - 2` (the prior year's ERA5T tail is not considered settled
-    yet). The ceiling then steps back one year at a time until it finds a
-    year whose master file exists and is complete through 31 Dec, so a late
-    file never leaves a gap in the list — it just lowers the ceiling.
+
+@st.cache_data(show_spinner=False)
+def _cached_archive_year_options(today_str: str, current_mtime: float, _version=2):
+    del current_mtime  # cache-key nonce for ERA5T appends of the current year
+    """Complete years 1940..last closed year, then any later year whose
+    ``era5_master_daily_{year}.nc`` exists (typically the current year).
+
+    Year-release rule for the *closed* ceiling: `today.year - 1` is only a
+    candidate once the calendar day is >= 10 Jan (UTC); before that the
+    ceiling is `today.year - 2` (the prior year's ERA5T tail is not considered
+    settled yet). The ceiling then steps back until a year is complete through
+    31 Dec. The current (or otherwise still-open) year is appended separately
+    if the file is on disk — its series is truncated to the last finite ERA5
+    day, never filled with IFS.
     """
     today = pd.Timestamp(today_str)
     candidate = today.year - 1 if (today.month > 1 or today.day >= 10) else today.year - 2
+    last_complete = None
     for year in range(candidate, 1939, -1):
         if _archive_year_is_complete(year):
-            return list(range(1940, year + 1))
-    return []
+            last_complete = year
+            break
+    years = list(range(1940, last_complete + 1)) if last_complete is not None else []
+    for year in range((last_complete or 1939) + 1, int(today.year) + 1):
+        if _archive_year_file(year).exists():
+            years.append(year)
+    return years
+
+
+def get_archive_year_point_series(lat, lon, year, _series_version=2):
+    """ERA5/ERA5T point series for one calendar year: no IFS/AIFS overlay.
+
+    Closed years are 1 Jan–31 Dec. The in-progress current year is read in a
+    child process (HDF5 abort safety) and truncated at the last finite ERA5
+    day. ``source_mtime`` is in the inner cache key so ERA5T appends refresh.
+    """
+    return _cached_archive_year_point_series(
+        float(lat), float(lon), int(year), _archive_year_mtime(int(year)), _series_version,
+    )
 
 
 @st.cache_data(show_spinner=False)
-def get_archive_year_point_series(lat, lon, year, _series_version=1):
-    """Closed calendar-year ERA5 point series (1 Jan - 31 Dec) for the
-    Meteogram's Archive Year selector: ERA5/ERA5T only, from the single
-    era5_master_daily_{year}.nc batch — no IFS/AIFS overlay, no forecast
-    model involved (the caller's `selected_forecast_model()` is ignored by
-    design; Archive Year always means ERA5/ERA5T at the point).
-
-    `isolate=False`: unlike `get_live_point_series`'s current-calendar-year
-    read, this always targets a CLOSED, already-settled historical batch
-    file (never the in-progress current year), so the subprocess-isolated
-    HDF5 read `get_live_point_series` needs is not required here.
-
-    Same Date/TX/TN/TG/T850/Z500 column contract as `get_live_point_series`,
-    reindexed onto the full 1 Jan - 31 Dec calendar so real ERA5 gaps stay
-    NaN rather than being interpolated. Returns an empty DataFrame (never
-    raises) when the year has no data at this point — the caller renders
-    `st.error(...)` instead of crashing.
-    """
+def _cached_archive_year_point_series(lat, lon, year, source_mtime, _series_version=2):
+    del source_mtime  # cache-key nonce; ERA5T appends change the file mtime
     path = _archive_year_file(year)
     start = pd.Timestamp(year=year, month=1, day=1)
-    end = pd.Timestamp(year=year, month=12, day=31)
-    df = _point_frame_from_master_file(path, lat, lon, start, end, isolate=False)
+    year_end = pd.Timestamp(year=year, month=12, day=31)
+    this_year = int(pd.Timestamp.utcnow().tz_localize(None).year)
+    isolate = int(year) == this_year
+    df = _point_frame_from_master_file(path, lat, lon, start, year_end, isolate=isolate)
     if df.empty:
         return df
     df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None).dt.normalize()
     df = df.sort_values("Date").drop_duplicates(subset=["Date"])
+    last = _last_finite_temp_day(df)
+    if last is None:
+        return pd.DataFrame()
+    end = min(year_end, last)
+    df = df[df["Date"] <= end]
     full_index = pd.date_range(start, end, freq="D")
     return df.set_index("Date").reindex(full_index).rename_axis("Date").reset_index()
+
+
+def get_archive_window_point_series(lat, lon, start, end):
+    """ERA5/ERA5T point series covering ``start``..``end`` (inclusive).
+
+    Concatenates cached whole-year frames so a Live-aligned seasonal window
+    that crosses 1 January does not require a new NetCDF path. Years without
+    a master file contribute nothing; a fully missing window is an empty
+    DataFrame.
+    """
+    start = pd.Timestamp(start).normalize()
+    end = pd.Timestamp(end).normalize()
+    if end < start:
+        start, end = end, start
+    frames = []
+    for year in range(int(start.year), int(end.year) + 1):
+        df = get_archive_year_point_series(lat, lon, year)
+        if df is not None and not df.empty:
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    out["Date"] = pd.to_datetime(out["Date"]).dt.tz_localize(None).dt.normalize()
+    out = out.drop_duplicates(subset=["Date"]).sort_values("Date")
+    return out.loc[(out["Date"] >= start) & (out["Date"] <= end)].reset_index(drop=True)
 
 
 def _array_has_finite(val) -> bool:
@@ -781,7 +1053,7 @@ def synoptic_source_mtime(date_str, forecast_model=FORECAST_MODEL_IFS) -> float:
 @st.cache_resource(show_spinner=False, max_entries=10)
 def fetch_cached_synoptic_data(
     date_str, anchor_date_str=None, forecast_model=FORECAST_MODEL_IFS,
-    needed_vars=None, source_mtime=0.0, _loader_version=11,
+    needed_vars=None, source_mtime=0.0, _loader_version=15,
 ):
     """
     `source_mtime` (Schritt C): hashable cache-key component, see
@@ -811,6 +1083,12 @@ def fetch_cached_synoptic_data(
             packed["_lats"] = np.asarray(sample.latitude.values)
         for key, val in data.items():
             packed[key] = _synoptic_array(val)
+        if meta.get("ifs_live") and "_lats" in packed and "_lons" in packed:
+            day = meta.get("actual_time") or pd.to_datetime(date_str)
+            packed["tx"], packed["tn"], packed["tg"] = _apply_ifs_mean_qdm(
+                packed.get("tx"), packed.get("tn"), packed.get("tg"),
+                packed["_lats"], packed["_lons"], day,
+            )
         meta["temps_available"] = any(
             _array_has_finite(packed.get(name)) for name in ("tx", "tn", "tg", "t850")
         )
@@ -818,7 +1096,10 @@ def fetch_cached_synoptic_data(
 
 
 @st.cache_data(show_spinner=False)
-def get_persistence_arrays(target_date_str, baseline_type, map_var="TG", anchor_date_str=None, forecast_model=FORECAST_MODEL_IFS):
+def get_persistence_arrays(
+    target_date_str, baseline_type, map_var="TG", anchor_date_str=None,
+    forecast_model=FORECAST_MODEL_IFS, _persist_version=4,
+):
     ref_clim = load_reference_climatology()
     if ref_clim is None: 
         return None
@@ -835,7 +1116,8 @@ def get_persistence_arrays(target_date_str, baseline_type, map_var="TG", anchor_
     payload, _meta = loaded
     daily_dates, tx_vals, tn_vals = payload[0], payload[1], payload[2]
     t850_vals = payload[3] if len(payload) > 3 else None
-    if tx_vals is None and tn_vals is None and t850_vals is None:
+    tg_vals = payload[4] if len(payload) > 4 else None
+    if tx_vals is None and tn_vals is None and t850_vals is None and tg_vals is None:
         return None
 
     def _to_celsius(arr):
@@ -848,10 +1130,11 @@ def get_persistence_arrays(target_date_str, baseline_type, map_var="TG", anchor_
         return hist
 
     tx_hist, tn_hist, t850_hist = _to_celsius(tx_vals), _to_celsius(tn_vals), _to_celsius(t850_vals)
+    tg_hist = _to_celsius(tg_vals)
     dates_dt = pd.to_datetime(daily_dates)
     doys = etccdi_doy_365(dates_dt)
     suffix = "A" if baseline_type == "A" else "B"
-    shape_src = next(a for a in (tx_hist, tn_hist, t850_hist) if a is not None)
+    shape_src = next(a for a in (tx_hist, tn_hist, t850_hist, tg_hist) if a is not None)
     n_days, n_lats, n_lons = shape_src.shape
     
     def safe_get(var_key, fallback=np.nan):
@@ -879,17 +1162,12 @@ def get_persistence_arrays(target_date_str, baseline_type, map_var="TG", anchor_
         v_p25, v_p10, v_p5 = safe_get(f't850_p25_doy_{suffix}'), safe_get(f't850_p10_doy_{suffix}'), safe_get(f't850_p5_doy_{suffix}')
         v_r_w, v_r_c = safe_get('t850_max_val'), safe_get('t850_min_val')
     else:
-        if tx_hist is None or tn_hist is None:
+        if tg_hist is None:
             return None
-        v_h = (tx_hist + tn_hist) / 2.0
-        v_p95 = (safe_get(f'tx_p95_doy_{suffix}') + safe_get(f'tn_p95_doy_{suffix}')) / 2
-        v_p90 = (safe_get(f'tx_p90_doy_{suffix}') + safe_get(f'tn_p90_doy_{suffix}')) / 2
-        v_p75 = (safe_get(f'tx_p75_doy_{suffix}') + safe_get(f'tn_p75_doy_{suffix}')) / 2
-        v_p25 = (safe_get(f'tx_p25_doy_{suffix}') + safe_get(f'tn_p25_doy_{suffix}')) / 2
-        v_p10 = (safe_get(f'tx_p10_doy_{suffix}') + safe_get(f'tn_p10_doy_{suffix}')) / 2
-        v_p5 = (safe_get(f'tx_p5_doy_{suffix}') + safe_get(f'tn_p5_doy_{suffix}')) / 2
-        v_r_w = (safe_get('tx_max_val') + safe_get('tn_max_val')) / 2
-        v_r_c = (safe_get('tx_min_val') + safe_get('tn_min_val')) / 2
+        v_h = tg_hist
+        v_p95, v_p90, v_p75 = safe_get(f'tg_p95_doy_{suffix}'), safe_get(f'tg_p90_doy_{suffix}'), safe_get(f'tg_p75_doy_{suffix}')
+        v_p25, v_p10, v_p5 = safe_get(f'tg_p25_doy_{suffix}'), safe_get(f'tg_p10_doy_{suffix}'), safe_get(f'tg_p5_doy_{suffix}')
+        v_r_w, v_r_c = safe_get('tg_max_val'), safe_get('tg_min_val')
 
     streaks = np.zeros((8, n_lats, n_lons), dtype=int)
     exc = np.zeros((8, n_days, n_lats, n_lons), dtype=bool)
@@ -957,7 +1235,11 @@ def get_map_historical_records_bundle(target_doys: tuple, cutoff_year: int):
 
     tx_all = sub["tx"].values.astype(np.float64) - 273.15
     tn_all = sub["tn"].values.astype(np.float64) - 273.15
-    tg_all = sub["tg"].values.astype(np.float64) - 273.15 if "tg" in sub.data_vars else (tx_all + tn_all) / 2.0
+    tg_all = (
+        sub["tg"].values.astype(np.float64) - 273.15
+        if "tg" in sub.data_vars
+        else np.full_like(tx_all, np.nan)
+    )
     doy_all = etccdi_doy_365(pd.to_datetime(sub.valid_time.values))
     yr_all = pd.to_datetime(sub.valid_time.values).year
 
@@ -992,8 +1274,8 @@ def point_clim_ladder(pt_clim, doys, meteo_var, epoch):
     * TX — TX percentiles / records
     * TN — TN percentiles / records
     * T850 — 850 hPa temperature percentiles / records
-    * TG — mean of the TX and TN ladders (same proxy the Map Tracker uses);
-      ``tg_max_val`` / ``tg_min_val`` when present, else mean of TX+TN records
+    * TG — native TG percentiles / records (`tg_p*_doy_*`, `tg_max_val` /
+      `tg_min_val`). Never the mean of the TX and TN ladders.
 
     ``c_base`` is the midpoint of that variable's Moderate-warm and
     Moderate-cold bounds (the "average" the Above/Below-avg fills sit on).
@@ -1003,9 +1285,6 @@ def point_clim_ladder(pt_clim, doys, meteo_var, epoch):
 
     def a(key):
         return _clim_doy_arr(pt_clim, key, doys)
-
-    def avg(k1, k2):
-        return (a(k1) + a(k2)) / 2.0
 
     code = meteo_var_code(meteo_var)
     if code == "TX":
@@ -1024,14 +1303,10 @@ def point_clim_ladder(pt_clim, doys, meteo_var, epoch):
         p25, p10, p5 = a(f"t850_p25_doy_{ep}"), a(f"t850_p10_doy_{ep}"), a(f"t850_p5_doy_{ep}")
         rec_c = a("t850_min_val")
     else:
-        p75 = avg(f"tx_p75_doy_{ep}", f"tn_p75_doy_{ep}")
-        p90 = avg(f"tx_p90_doy_{ep}", f"tn_p90_doy_{ep}")
-        p95 = avg(f"tx_p95_doy_{ep}", f"tn_p95_doy_{ep}")
-        rec_w = a("tg_max_val") if "tg_max_val" in pt_clim.variables else avg("tx_max_val", "tn_max_val")
-        p25 = avg(f"tx_p25_doy_{ep}", f"tn_p25_doy_{ep}")
-        p10 = avg(f"tx_p10_doy_{ep}", f"tn_p10_doy_{ep}")
-        p5 = avg(f"tx_p5_doy_{ep}", f"tn_p5_doy_{ep}")
-        rec_c = a("tg_min_val") if "tg_min_val" in pt_clim.variables else avg("tx_min_val", "tn_min_val")
+        p75, p90, p95 = a(f"tg_p75_doy_{ep}"), a(f"tg_p90_doy_{ep}"), a(f"tg_p95_doy_{ep}")
+        rec_w = a("tg_max_val")
+        p25, p10, p5 = a(f"tg_p25_doy_{ep}"), a(f"tg_p10_doy_{ep}"), a(f"tg_p5_doy_{ep}")
+        rec_c = a("tg_min_val")
     c_base = (p75 + p25) / 2.0
     return c_base, p75, p90, p95, rec_w, p25, p10, p5, rec_c
 

@@ -21,9 +21,8 @@ import xarray as xr
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import re
 import streamlit as st
-
-from config import MAP_VIEW_PERSISTENCE
 
 DATA_DIR = Path("ERA5_ClimateTool/Master_Batches")
 LIVE_DIR = Path("ERA5_ClimateTool/Live_Forecasts")
@@ -206,9 +205,58 @@ def _master_files_covering(start: pd.Timestamp, end: pd.Timestamp) -> list[Path]
     return files
 
 
-def _latest_ifs_forecast_path() -> Path | None:
-    files = sorted(LIVE_DIR.glob("ifs_daily_forecast_*.nc"))
+def latest_live_forecast_path(forecast_model: str | None = None) -> Path | None:
+    """Newest on-disk daily forecast file for the selected model (IFS or AIFS)."""
+    pattern = "aifs_daily_forecast_*.nc" if _want_aifs(forecast_model) else "ifs_daily_forecast_*.nc"
+    files = sorted(LIVE_DIR.glob(pattern))
     return files[-1] if files else None
+
+
+def _latest_ifs_forecast_path() -> Path | None:
+    return latest_live_forecast_path("IFS (Physics-based)")
+
+
+def latest_forecast_cycle_label(forecast_model: str | None = None) -> str:
+    """Init time of the live forecast file, e.g. '15.09.2026 12 UTC'.
+
+    Parsed from ``ifs_daily_forecast_YYYYMMDD_HHz.nc`` / AIFS equivalent —
+    never wall-clock 'today'. Empty string if no forecast file is present.
+    """
+    path = latest_live_forecast_path(forecast_model)
+    if path is None:
+        return ""
+    match = re.search(r"(\d{8})_(\d{2})z", path.name, flags=re.IGNORECASE)
+    if not match:
+        return path.stem
+    day = pd.to_datetime(match.group(1), format="%Y%m%d")
+    hour = int(match.group(2))
+    return f"{day.strftime('%d.%m.%Y')} {hour:02d} UTC"
+
+
+def live_forecast_dates(forecast_model: str | None = None) -> set:
+    """Calendar days actually present in the selected model's overlay file.
+
+    Empty for AIFS when the caller only wants IFS-QDM days; this returns
+    whatever the open live dataset covers. Callers that must skip AIFS
+    should check ``_want_aifs`` themselves.
+    """
+    live = _open_live_forecast_ds(forecast_model)
+    if live is None:
+        return set()
+    live = _live_overlay_slice(live)
+    tdim = "valid_time" if "valid_time" in live.dims else ("time" if "time" in live.dims else None)
+    if tdim is None or live.sizes.get(tdim, 0) == 0:
+        return set()
+    times = pd.DatetimeIndex(pd.to_datetime(live[tdim].values))
+    if times.tz is not None:
+        times = times.tz_convert("UTC").tz_localize(None)
+    return set(times.normalize())
+
+
+def live_forecast_covers_day(date_str, forecast_model: str | None = None) -> bool:
+    """True when the IFS/AIFS overlay file contains this calendar day."""
+    target = pd.Timestamp(date_str).normalize()
+    return target in live_forecast_dates(forecast_model)
 
 
 def _drop_truncated_last_day(ds: xr.Dataset) -> xr.Dataset:
@@ -508,7 +556,11 @@ def synoptic_vars_for_map(
     toggles: dict | None = None,
     view_mode: str | None = None,
 ) -> tuple[str, ...]:
-    """Hashable field list for the current Map Tracker view."""
+    """Hashable field list for the current Map Tracker view.
+
+    Persistence hatching loads its own cube via ``get_persistence_arrays``;
+    ``view_mode`` is accepted so callers can pass it without a second field list.
+    """
     toggles = toggles or {}
     code = str(map_var or "TG").upper()
     wanted: list[str] = []
@@ -519,7 +571,7 @@ def synoptic_vars_for_map(
     elif code == "T850":
         wanted.append("t850")
     else:
-        wanted.extend(("tg", "tx", "tn"))
+        wanted.append("tg")
     if toggles.get("mslp") or toggles.get("mslp_anom"):
         wanted.append("mslp")
     if toggles.get("z500") or toggles.get("z500_anom"):
@@ -528,11 +580,6 @@ def synoptic_vars_for_map(
         # 300 hPa wind quiver overlay (Expert only, default off) -- both
         # components are needed together or not at all.
         wanted.extend(("u300", "v300"))
-    if toggles.get("hatching") or view_mode == MAP_VIEW_PERSISTENCE:
-        if code == "T850":
-            wanted.append("t850")
-        else:
-            wanted.extend(("tx", "tn"))
     seen: set[str] = set()
     out: list[str] = []
     for name in wanted:
@@ -589,6 +636,12 @@ def get_synoptic_map_data(
         "requested": target_dt.normalize(),
         "available": actual_time is not None,
         "actual_time": pd.Timestamp(actual_time).normalize() if actual_time is not None else None,
+        # IFS overlay day (not ERA5 archive, not AIFS) — map QDM applies only here.
+        "ifs_live": (
+            not _want_aifs(forecast_model)
+            and actual_time is not None
+            and pd.Timestamp(actual_time).normalize() in live_forecast_dates(forecast_model)
+        ),
     }
 
     field_names = _requested_synoptic_fields(needed_vars)
@@ -625,13 +678,5 @@ def get_synoptic_map_data(
         if bounds is not None:
             da = _mask_implausible(da, bounds)
         clean_slices[name] = da
-
-    # IFS-only fallback: alias TG onto missing TX/TN so TG maps still render.
-    # AIFS has no native diurnal extremes — do not fabricate TX/TN from TG.
-    if not _want_aifs(forecast_model) and "tg" in clean_slices:
-        if "tx" not in clean_slices:
-            clean_slices["tx"] = clean_slices["tg"]
-        if "tn" not in clean_slices:
-            clean_slices["tn"] = clean_slices["tg"]
 
     return clean_slices
