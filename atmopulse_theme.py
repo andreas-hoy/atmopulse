@@ -535,12 +535,48 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
 [class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
     box-shadow: inset -2px 0 0 0 {_hex_to_rgba(brand['primary'], 0.55)} !important;
 }}
-[class*="st-key-atmopulse_split"] [data-testid="stDataFrame"] {{
-    width: 100% !important;
+/* Extra air before the divider belongs on the table row only. The map
+   columns keep equal padding so the two frames stay the same size. */
+.st-key-atmopulse_split_map_tables [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
+.st-key-atmopulse_split_map_tables [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child,
+.st-key-atmopulse_split_map_tables_overlay [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
+.st-key-atmopulse_split_map_tables_overlay [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
+    padding-right: 28px !important;
+}}
+/* Press buttons are a nested row. Keep them content-sized; the 50% column
+   rule and the table gap must not spread SVG / PDF / CSV apart. */
+[class*="st-key-atmopulse_split"] div[class*="st-key-press-row"],
+[class*="st-key-atmopulse_split"] div[class*="st-key-press-row"][data-testid="stHorizontalBlock"],
+[class*="st-key-atmopulse_split"] div[class*="st-key-press-row"] [data-testid="stHorizontalBlock"] {{
+    gap: 0.35rem !important;
+    flex-wrap: nowrap !important;
+    justify-content: flex-start !important;
+    align-items: center !important;
+    width: fit-content !important;
     max-width: 100% !important;
 }}
+[class*="st-key-atmopulse_split"] div[class*="st-key-press-row"] [data-testid="stHorizontalBlock"] > *,
+[class*="st-key-atmopulse_split"] div[class*="st-key-press-row"][data-testid="stHorizontalBlock"] > * {{
+    flex: 0 0 auto !important;
+    width: auto !important;
+    max-width: max-content !important;
+    min-width: 0 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    box-shadow: none !important;
+}}
+/* Warm/Cold sit in a nested row. The divider belongs between the two maps, not between those tables. */
+[class*="st-key-atmopulse_split"] [data-testid="stColumn"] [data-testid="stHorizontalBlock"] {{
+    gap: 22px !important;
+}}
+[class*="st-key-atmopulse_split"] [data-testid="stColumn"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
+[class*="st-key-atmopulse_split"] [data-testid="stColumn"] [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
+    box-shadow: none !important;
+    padding-right: 10px !important;
+}}
+[class*="st-key-atmopulse_split"] [data-testid="stDataFrame"],
 [class*="st-key-atmopulse_split"] [data-testid="stDataFrame"] > div {{
-    width: 100% !important;
+    width: max-content !important;
     max-width: 100% !important;
 }}
 @media (max-width: 900px) {{
@@ -563,6 +599,12 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
         margin-bottom: 12px !important;
         width: 100% !important;
         max-width: 100% !important;
+    }}
+    [class*="st-key-atmopulse_split"] [data-testid="stColumn"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
+    [class*="st-key-atmopulse_split"] [data-testid="stColumn"] [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
+        border-bottom: none !important;
+        padding-bottom: 0 !important;
+        margin-bottom: 0 !important;
     }}
     [class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child,
     [class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="column"]:last-child {{
@@ -645,8 +687,50 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     font-size: 18px !important;
     font-weight: 600 !important;
     color: {brand['primary']} !important;
-    margin: 8px 0 8px 0 !important;
+    margin: 8px 0 4px 0 !important;
     line-height: 1.25 !important;
+    white-space: nowrap !important;
+}}
+.atmopulse-map-credit,
+.atmopulse-chart-credit {{
+    font-family: {o} !important;
+    font-size: 14px !important;
+    font-weight: {uw} !important;
+    color: rgba(49, 51, 63, 0.6) !important;
+    line-height: 1.3 !important;
+}}
+.atmopulse-map-credit {{
+    margin: -2px 0 10px 0 !important;
+}}
+.atmopulse-chart-credit {{
+    margin: -18px 0 6px 0 !important;
+}}
+/* Markdown help icons are pinned to the right of a full-width element.
+   Shrink that element to the title so the icon sits directly after the text. */
+.st-key-swipe_map_title [data-testid="stElementContainer"],
+.st-key-map_opacity_title [data-testid="stElementContainer"] {{
+    display: flex !important;
+    flex-direction: row !important;
+    align-items: center !important;
+    justify-content: center !important;
+    width: fit-content !important;
+    max-width: 100% !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
+    gap: 0.35rem !important;
+    position: relative !important;
+}}
+.st-key-swipe_map_title [data-testid="stTooltipIcon"],
+.st-key-map_opacity_title [data-testid="stTooltipIcon"] {{
+    position: static !important;
+    top: auto !important;
+    right: auto !important;
+    margin: 0 !important;
+    transform: none !important;
+}}
+.st-key-swipe_map_title .atmopulse-map-title,
+.st-key-map_opacity_title .atmopulse-map-title {{
+    margin: 0 !important;
 }}
 .st-key-map_a,
 .st-key-map_b,
@@ -658,13 +742,14 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     max-width: 100% !important;
     overflow: hidden !important;
 }}
-/* Slider maps keep a slightly shorter frame so the Plotly layout slider
-   sits under the map instead of overlapping Europe. */
+/* Same Europe frame as Flicker (70:42). Percentage padding is of the width,
+   so the map stays 42/70 tall and the extra 68px holds the cross-fade slider. */
 .st-key-map_opacity {{
     position: relative !important;
-    aspect-ratio: 70 / 34 !important;
     width: 100% !important;
-    height: auto !important;
+    height: 0 !important;
+    padding-top: calc(60% + 68px) !important;
+    aspect-ratio: auto !important;
     max-width: 100% !important;
     overflow: hidden !important;
 }}
@@ -696,24 +781,37 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     max-height: 100% !important;
 }}
 
-/* Compact left-aligned press-export buttons; stay on one row. */
+/* Compact left-aligned press-export buttons; SVG, PDF, and CSV sit together. */
+div[class*="st-key-press-row"],
+div[class*="st-key-press-row"][data-testid="stHorizontalBlock"],
 div[class*="st-key-press-row"] [data-testid="stHorizontalBlock"] {{
     flex-wrap: nowrap !important;
     align-items: center !important;
+    justify-content: flex-start !important;
     gap: 0.35rem !important;
+    width: fit-content !important;
+    max-width: 100% !important;
 }}
-div[class*="st-key-press-row"] [data-testid="stHorizontalBlock"] > div:not(:last-child) {{
+div[class*="st-key-press-row"] [data-testid="stHorizontalBlock"] > *,
+div[class*="st-key-press-row"][data-testid="stHorizontalBlock"] > * {{
     flex: 0 0 auto !important;
     width: auto !important;
     min-width: 0 !important;
+    max-width: max-content !important;
+    padding: 0 !important;
 }}
 div[class*="st-key-press-row"] [data-testid="stDownloadButton"] button,
+div[class*="st-key-press-row"] [data-testid="stButton"] button,
 div[class*="st-key-press-row"] button {{
+    width: auto !important;
     min-height: 1.65rem !important;
     padding: 0.12rem 0.7rem !important;
     font-size: 12px !important;
     line-height: 1.2 !important;
     white-space: nowrap !important;
+}}
+div[class*="st-key-press-row-map_"] {{
+    margin-bottom: 1rem !important;
 }}
 .atmopulse-meteo-yearly-gap {{
     height: 1.75rem !important;
@@ -746,6 +844,26 @@ section[data-testid="stSidebar"] div[data-testid="stMarkdownContainer"] {{
 }}
 section[data-testid="stSidebar"] .stRadio > div {{ 
     gap: 0rem; 
+}}
+/* Live and Archive need a visible gap; the rule above collapses every sidebar radio. */
+.st-key-map_archive_mode [data-testid="stRadio"] div[role="radiogroup"] {{
+    gap: 1.35rem !important;
+}}
+/* Help icons sit on the label text, not at the far end of the date field. */
+.st-key-map_archive_date [data-testid="stWidgetLabel"],
+.st-key-map_compare_date [data-testid="stWidgetLabel"],
+.st-key-met_archive_year [data-testid="stWidgetLabel"],
+.st-key-wave_drill_ms [data-testid="stWidgetLabel"] {{
+    width: fit-content !important;
+    max-width: 100% !important;
+    justify-content: flex-start !important;
+    gap: 0.35rem !important;
+}}
+.st-key-met_archive_year [data-testid="stTooltipIcon"],
+.st-key-wave_drill_ms [data-testid="stTooltipIcon"] {{
+    position: static !important;
+    top: auto !important;
+    right: auto !important;
 }}
 section[data-testid="stSidebar"] div[data-testid="stRadio"] label p,
 section[data-testid="stSidebar"] [data-testid="stCheckbox"] label,

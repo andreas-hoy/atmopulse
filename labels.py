@@ -41,8 +41,8 @@ HELP: dict[str, str] = {
         "Shifts the live map date relative to today (negative = recent past, "
         "positive = forecast). The last ~6 days and the forecast use the selected "
         "IFS/AIFS overlay; older days stay on ERA5. Inactive while Map date is "
-        "Date. Stays active when Map date is Live, including Dates compare "
-        "(left panel)."
+        "Archive. Stays active when Map date is Live, including Two dates "
+        "(left map)."
     ),
     "forecast_model": (
         "IFS (Physics-based): ECMWF HRES with native diurnal TX/TN extremes.\n\n"
@@ -53,23 +53,32 @@ HELP: dict[str, str] = {
     # --- Map Tracker ---
     "map_archive_date": (
         "Live (default): unchanged Forecast Offset (-7...+3) with the IFS/AIFS overlay. "
-        "Date: a single historical calendar day, read straight from that year's ERA5 "
-        "archive batch only — no forecast model involved, and the Forecast Offset "
-        "below is inactive. Available from 1 Jan 1940 through the most recent "
-        "settled ERA5 day. In Dates compare this is the left panel; the partner "
-        "date is Compare with on the map."
+        "Archive: a single historical calendar day, chosen above the map and read straight "
+        "from that year's ERA5 archive batch only — no forecast model involved, and the "
+        "Forecast Offset is inactive. Available from 1 Jan 1940 through 5 days before today "
+        "(ERA5T included). "
+        "In Two dates this is the left map; the partner date is "
+        "Compare with above the right map."
+    ),
+    "map_live_clock": (
+        "To choose an archive date, click Archive in the Control Panel."
+    ),
+    "map_archive_clock": (
+        "For live data (7 days back through 3 days ahead), click Live in the Control Panel."
     ),
     "map_compare_axis": (
         "Reference periods: both panels show the same map date against 1961–1990 (left) "
-        "and 1996–2025 (right). Dates: both panels use the same climatology (Colour against; "
+        "and 1996–2025 (right). Two dates: both panels use the same climatology (Colour against; "
         "default 1996–2025). Left follows Map date (Live from Forecast Offset, or an "
-        "Archive Date); right is Compare with (ERA5 only). Two archive dates are both ERA5. "
+        "archive day above the left map); right is Compare with above the right map (ERA5 only). "
+        "Two archive dates are both ERA5. "
         "Layout (side-by-side, flicker, opacity, swipe) then applies to whichever comparison is active."
     ),
     "map_compare_date": (
-        "Partner ERA5 calendar day for Dates compare (right panel). Default is the same "
+        "Partner ERA5 calendar day for Two dates. Above the right map in side-by-side; "
+        "beside the left date when flicker, opacity, or swipe shows one map. Default is the same "
         "month/day one year earlier than the left date. No forecast overlay — archive only. "
-        "Available from 1 Jan 1940 through the most recent settled ERA5 day."
+        "Available from 1 Jan 1940 through 5 days before today."
     ),
     "map_date_epoch": (
         "Climatology used to colour both dates. Default is the recent 1996–2025 baseline "
@@ -170,18 +179,18 @@ HELP: dict[str, str] = {
         "choice is ignored. Closed years are 1 Jan–31 Dec. The current year runs from 1 Jan "
         "through the last settled ERA5/ERA5T day, so it ends a few days before Live "
         "(Live continues with IFS/AIFS; archive is never filled with forecast). "
-        "In Live vs Year this is the left series; the partner year is Compare year on the right."
+        "In Two dates this is the left series; the partner year is Compare year on the right."
     ),
     "meteo_compare_axis": (
         "Reference periods: both panels show the same series against 1961–1990 and 1996–2025. "
-        "Live vs Year: both panels use the same climatology (Colour against; default 1996–2025). "
+        "Two dates: both panels use the same climatology (Colour against; default 1996–2025). "
         "Left follows Archive Year (Live window, or a calendar year). Right is Compare year "
         "(ERA5/ERA5T). Live vs a year uses the same season as the Live window (including the "
         "previous year if Live crosses 1 January); two archive years are calendar years "
         "(the current year only as far as ERA5/ERA5T has landed)."
     ),
     "meteo_compare_year": (
-        "Partner year for Live vs Year (right panel). Against Live: the same season as the "
+        "Partner year for Two dates (right panel). Against Live: the same season as the "
         "Live window (including the preceding year if the window crosses 1 January). Against "
         "another archive year: ERA5/ERA5T for that calendar year. The current year ends a few "
         "days before Live because it is ERA5/ERA5T only — no IFS/AIFS fill. Default is one year "

@@ -41,18 +41,22 @@ FORECAST_MODEL_OPTIONS = (FORECAST_MODEL_IFS, FORECAST_MODEL_AIFS)
 MAP_VIEW_DAILY = "Daily snapshot"
 MAP_VIEW_PERSISTENCE = "Persistence duration"
 
-LAYOUT_SIDE_BY_SIDE = "Side-by-Side Compare"
-LAYOUT_FLICKER = "Single Map Flicker"
-LAYOUT_OPACITY = "Opacity Slider Compare"
-LAYOUT_SWIPE = "Swipe Slider Compare"
+# Map Tracker offers all four. Meteogram and Wavogram offer the chart pair.
+# Single Map / Single chart is the opening view (recent baseline 1996–2025).
+LAYOUT_SINGLE_MAP = "Single Map"
+LAYOUT_SINGLE_CHART = "Single chart"
+LAYOUT_SIDE_BY_SIDE = "Side by side"
+LAYOUT_SWIPE = "Swipe"
+LAYOUT_OPACITY = "Opacity"
 
 # Comparison *axis* (orthogonal to LAYOUT_*): climatology A vs B at one time,
 # or two times against one climatology. Map Tracker uses COMPARE_DATES
 # (Live or Archive left, Archive right). Meteogram uses COMPARE_YEARS
-# (Live or a calendar year left, partner year right).
+# (Live or a calendar year left, partner year right). Both radios read
+# "Two dates".
 COMPARE_EPOCHS = "Reference periods"
-COMPARE_DATES = "Dates (Live vs Archive)"
-COMPARE_YEARS = "Live vs Year"
+COMPARE_DATES = "Two dates"
+COMPARE_YEARS = "Two dates"
 
 AIFS_TXTN_WARNING = (
     "Diurnal extreme analytics (TX/TN and associated Wave Tracking) are currently unavailable "
@@ -85,7 +89,6 @@ EXPERT_FEATURES = frozenset({
     "utci",
     "meteo_tx_tn",
     "meteo_envelope",
-    "flicker_layout",
     "forecast_model",
     "meteo_wsdi_csdi",
     "wave_annual_cycle",
@@ -125,7 +128,8 @@ STANDARD_DEFAULTS = {
     "meteo_count": METEO_COUNT_ALL,
     "wave_thresh": "Strong",
     "wave_z500_outline": False,
-    "map_layout": LAYOUT_SIDE_BY_SIDE,
+    "map_layout": LAYOUT_SINGLE_MAP,
+    "chart_layout": LAYOUT_SINGLE_CHART,
     "map_compare": COMPARE_EPOCHS,
     "meteo_compare": COMPARE_EPOCHS,
 }

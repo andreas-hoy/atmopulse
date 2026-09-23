@@ -19,10 +19,10 @@ from backend_narrative import EPOCH_LABELS, epoch_period_label, epoch_from_label
 from atmopulse_theme import ATMOPULSE_BRAND, ATMOPULSE_FONTS, ATMOPULSE_OVERLAY, legend_badge_style
 from labels import HELP
 from config import (
+    LAYOUT_SINGLE_MAP,
     LAYOUT_SIDE_BY_SIDE,
-    LAYOUT_FLICKER,
-    LAYOUT_OPACITY,
     LAYOUT_SWIPE,
+    LAYOUT_OPACITY,
     COMPARE_EPOCHS,
     COMPARE_DATES,
     AIFS_TXTN_WARNING,
@@ -305,6 +305,113 @@ def map_compare_next_day():
     _shift_map_compare_date(1)
 
 
+_MAP_DATE_MIN = pd.Timestamp(1940, 1, 1).date()
+
+
+def _map_date_max():
+    return latest_era5_archive_date().date()
+
+
+def _shift_map_archive_date(days: int) -> None:
+    current = st.session_state.get("map_archive_date")
+    if current is None:
+        return
+    new_d = (pd.Timestamp(current) + pd.Timedelta(days=int(days))).date()
+    st.session_state.map_archive_date = min(max(new_d, _MAP_DATE_MIN), _map_date_max())
+
+
+def map_archive_prev_day():
+    _shift_map_archive_date(-1)
+
+
+def map_archive_next_day():
+    _shift_map_archive_date(1)
+
+
+def _render_day_buttons(prev_key, next_key, on_prev, on_next, current, max_d):
+    c1, c2, _rest = st.columns([1, 1, 1.35], gap="small")
+    with c1:
+        st.button(
+            "← Day before", key=prev_key, on_click=on_prev,
+            use_container_width=True, disabled=current <= _MAP_DATE_MIN,
+        )
+    with c2:
+        st.button(
+            "Day after →", key=next_key, on_click=on_next,
+            use_container_width=True, disabled=current >= max_d,
+        )
+
+
+def _render_archive_date_picker():
+    """Archive calendar above the map it drives. Key matches the sidebar seed."""
+    max_d = _map_date_max()
+    st.date_input(
+        "Archive date:",
+        min_value=_MAP_DATE_MIN,
+        max_value=max_d,
+        key="map_archive_date",
+        format="DD.MM.YYYY",
+        help=HELP["map_archive_clock"],
+    )
+    st.session_state["_active_map_archive_date"] = st.session_state.map_archive_date
+    _render_day_buttons(
+        "map_archive_prev_btn", "map_archive_next_btn",
+        map_archive_prev_day, map_archive_next_day,
+        st.session_state.map_archive_date, max_d,
+    )
+
+
+def _render_compare_date_picker():
+    max_d = _map_date_max()
+    st.date_input(
+        "Compare with:",
+        min_value=_MAP_DATE_MIN,
+        max_value=max_d,
+        key="map_compare_date",
+        format="DD.MM.YYYY",
+        help=HELP["map_compare_date"],
+    )
+    _render_day_buttons(
+        "map_compare_prev_btn", "map_compare_next_btn",
+        map_compare_prev_day, map_compare_next_day,
+        st.session_state.map_compare_date, max_d,
+    )
+
+
+def _render_map_date_controls(map_is_archive, compare_dates, map_layout, live_label, arch_label):
+    """Date clocks above the figures they belong to.
+
+    Two dates: one clock per side (left is Live or an archive day, right is
+    always ERA5). Reference periods share a single archive day. Flicker,
+    opacity, and swipe keep both clocks above the one map.
+    """
+    if compare_dates:
+        left, right = st.columns(2, gap="small")
+        with left:
+            if map_is_archive:
+                _render_archive_date_picker()
+            elif live_label:
+                st.markdown(f"**{live_label}**", help=HELP["map_live_clock"])
+        with right:
+            _render_compare_date_picker()
+        if map_layout == LAYOUT_SINGLE_MAP and live_label and arch_label:
+            if st.session_state.get("map_flicker_date") not in (live_label, arch_label):
+                st.session_state.map_flicker_date = live_label
+            st.radio(
+                "Show date:",
+                (live_label, arch_label),
+                horizontal=True,
+                key="map_flicker_date",
+            )
+        return
+    if map_is_archive:
+        if map_layout != LAYOUT_SINGLE_MAP:
+            st.caption("Same day for both panels.")
+        col, _rest = st.columns(2, gap="small")
+        with col:
+            _render_archive_date_picker()
+
+
 def _fmt_area_pct(pct: float) -> str:
     return f"{pct:.1f}"
 
@@ -446,6 +553,12 @@ def render_map_tracker(
     # or two dates at one climatology. Layout then applies to that pair.
     if "map_compare_axis" not in st.session_state:
         st.session_state.map_compare_axis = STANDARD_DEFAULTS["map_compare"]
+    elif st.session_state.map_compare_axis not in (COMPARE_EPOCHS, COMPARE_DATES):
+        # Session still holding the old "Dates (Live vs Archive)" label.
+        st.session_state.map_compare_axis = COMPARE_DATES
+    _map_layouts = (LAYOUT_SINGLE_MAP, LAYOUT_SIDE_BY_SIDE, LAYOUT_SWIPE, LAYOUT_OPACITY)
+    if st.session_state.get("map_layout") not in _map_layouts:
+        st.session_state.map_layout = LAYOUT_SINGLE_MAP
     top1, top2 = st.columns([1.05, 2.15])
     with top1:
         compare_axis = st.radio(
@@ -458,8 +571,9 @@ def render_map_tracker(
     with top2:
         map_layout = st.radio(
             "Map Layout:",
-            (LAYOUT_SIDE_BY_SIDE, LAYOUT_FLICKER, LAYOUT_OPACITY, LAYOUT_SWIPE),
+            _map_layouts,
             horizontal=True,
+            key="map_layout",
         )
     compare_dates = compare_axis == COMPARE_DATES
     date_epoch = "B"
@@ -478,72 +592,44 @@ def render_map_tracker(
                 st.session_state.map_compare_date, _max_archive.date(),
             )
         if is_expert_mode():
-            d1, d2 = st.columns([1.25, 1.15])
-            with d1:
-                st.date_input(
-                    "Compare with:",
-                    min_value=_min_archive.date(),
-                    max_value=_max_archive.date(),
-                    key="map_compare_date",
-                    format="DD.MM.YYYY",
-                    help=HELP["map_compare_date"],
-                )
-            with d2:
-                if "map_date_epoch" not in st.session_state:
-                    st.session_state.map_date_epoch = epoch_period_label("B")
-                date_epoch = epoch_from_label(st.radio(
-                    "Colour against:",
-                    (epoch_period_label("A"), epoch_period_label("B")),
-                    horizontal=True,
-                    key="map_date_epoch",
-                    help=HELP["map_date_epoch"],
-                ))
-        else:
-            st.date_input(
-                "Compare with:",
-                min_value=_min_archive.date(),
-                max_value=_max_archive.date(),
-                key="map_compare_date",
-                format="DD.MM.YYYY",
-                help=HELP["map_compare_date"],
-            )
-            date_epoch = "B"
-        dc1, dc2 = st.columns(2)
-        with dc1:
-            st.button(
-                "← Prev Day", key="map_compare_prev_btn",
-                on_click=map_compare_prev_day, use_container_width=True,
-                disabled=st.session_state.map_compare_date <= _min_archive.date(),
-            )
-        with dc2:
-            st.button(
-                "Next Day →", key="map_compare_next_btn",
-                on_click=map_compare_next_day, use_container_width=True,
-                disabled=st.session_state.map_compare_date >= _max_archive.date(),
-            )
+            if "map_date_epoch" not in st.session_state:
+                st.session_state.map_date_epoch = epoch_period_label("B")
+            date_epoch = epoch_from_label(st.radio(
+                "Colour against:",
+                (epoch_period_label("A"), epoch_period_label("B")),
+                horizontal=True,
+                key="map_date_epoch",
+                help=HELP["map_date_epoch"],
+            ))
         compare_date = pd.Timestamp(st.session_state.map_compare_date)
-        left_kind = "Archive" if map_is_archive else "Live"
-        live_label = f"{left_kind} ({pd.Timestamp(target_date).strftime('%d.%m.%Y')})"
-        arch_label = f"Compare ({compare_date.strftime('%d.%m.%Y')})"
+        left_when = pd.Timestamp(target_date).strftime("%d.%m.%Y")
+        right_when = compare_date.strftime("%d.%m.%Y")
+        # Map titles and the flicker switch show the calendar day only.
+        # Identical days need a side marker so the radio options stay unique.
+        if left_when == right_when:
+            live_label = f"{left_when} (left)"
+            arch_label = f"{right_when} (right)"
+        else:
+            live_label = left_when
+            arch_label = right_when
+
+    _render_map_date_controls(
+        map_is_archive, compare_dates, map_layout, live_label, arch_label,
+    )
 
     flicker_epoch = None
     flicker_date_choice = None
-    if map_layout == LAYOUT_FLICKER:
+    if map_layout == LAYOUT_SINGLE_MAP:
         if compare_dates:
-            if st.session_state.get("map_flicker_date") not in (live_label, arch_label):
-                st.session_state.map_flicker_date = live_label
-            flicker_date_choice = st.radio(
-                "Show date:",
-                (live_label, arch_label),
-                horizontal=True,
-                key="map_flicker_date",
-            )
+            flicker_date_choice = st.session_state.get("map_flicker_date", live_label)
         else:
+            if "map_flicker_epoch" not in st.session_state:
+                st.session_state.map_flicker_epoch = epoch_period_label("B")
             flicker_epoch = st.radio(
                 "Select Reference Period:",
                 (epoch_period_label("A"), epoch_period_label("B")),
                 horizontal=True,
-                index=1,
+                key="map_flicker_epoch",
             )
 
     if not is_daily_map_view(view_mode):
@@ -581,26 +667,30 @@ def render_map_tracker(
         st.dataframe(
             df,
             column_config={
-                "Country": st.column_config.TextColumn("Country", width="small"),
+                "Country": st.column_config.TextColumn("Country", width=120),
                 impact_col: st.column_config.ProgressColumn(
-                    "Area %", format="%.1f%%", min_value=0, max_value=100, width="small"
+                    "Area %", format="%.1f%%", min_value=0, max_value=100, width=160
                 ),
             },
             hide_index=True,
-            use_container_width=True,
+            use_container_width=False,
         )
 
     def render_top10_period(df_h, df_c, period_label=None):
         if period_label:
             st.markdown(f"**{period_label}**")
-        wcol, ccol = st.columns(2, gap="small")
+        wcol, ccol = st.columns(2, gap="medium")
         with wcol:
             _render_impact_table("Warm", df_h, "Warm Impact (%)")
         with ccol:
             _render_impact_table("Cold", df_c, "Cold Impact (%)")
 
     def render_top10_tables(df_h, df_c):
-        render_top10_period(df_h, df_c)
+        # Same adjacency as one panel of the side-by-side compare: Warm and
+        # Cold share the left half instead of sitting at opposite page edges.
+        pair, _rest = st.columns([1, 1], gap="small")
+        with pair:
+            render_top10_period(df_h, df_c)
 
     # AIFS restrictions only make sense for the live forecast path — an
     # Archive Date always reads plain ERA5 (native TX/TN, no forecast model
@@ -631,8 +721,7 @@ def render_map_tracker(
             def _unavailable_warning(date, *, archive: bool) -> None:
                 if archive:
                     st.warning(
-                        f"No ERA5 archive data for **{pd.Timestamp(date).strftime('%d.%m.%Y')}** "
-                        f"in era5_master_daily_{pd.Timestamp(date).year}.nc — try another Archive date."
+                        f"Archive data is not yet available for **{pd.Timestamp(date).strftime('%d.%m.%Y')}**."
                     )
                 else:
                     st.warning(
@@ -710,7 +799,7 @@ def render_map_tracker(
                         source_mtime=mtime,
                     )
 
-                if map_layout == LAYOUT_FLICKER:
+                if map_layout == LAYOUT_SINGLE_MAP:
                     if compare_dates:
                         use_live = flicker_date_choice == live_label
                         footprint_single = _fp(
@@ -768,13 +857,17 @@ def render_map_tracker(
                     sev_change = True
                     sev_help = "europe_share_table"
                     if compare_dates:
-                        sev_headers = ("", live_label, arch_label)
+                        sev_headers = (
+                            "",
+                            pd.Timestamp(target_date).strftime("%d.%m.%Y"),
+                            pd.Timestamp(compare_date).strftime("%d.%m.%Y"),
+                        )
                         sev_change = False
                         sev_help = "europe_share_table_dates"
                     _render_expert_severity(
                         footprint_a=footprint_a, footprint_b=footprint_b,
                         footprint_single=footprint_single, active_tier=active_tier,
-                        compare=map_layout != LAYOUT_FLICKER,
+                        compare=map_layout != LAYOUT_SINGLE_MAP,
                         headers=sev_headers, with_change=sev_change,
                         help_key=sev_help,
                     )
@@ -858,15 +951,37 @@ def render_map_tracker(
                     full_width=True,
                 )
                 if map_layout == LAYOUT_SWIPE:
+                    if compare_dates:
+                        swipe_title = (
+                            f"Swipe: {left_title} (left) | {right_title} (right)"
+                        )
+                        swipe_help = "Drag the map or the slider to compare the two dates."
+                    else:
+                        swipe_title = (
+                            "Swipe: Historical Reference Period (left) | "
+                            "Recent Reference Period (right)"
+                        )
+                        swipe_help = (
+                            "Drag the map or the slider: left is 1961–1990, right is 1996–2025."
+                        )
                     render_swipe_compare_map(
                         fig_a, fig_b,
+                        title=swipe_title,
+                        help_text=swipe_help,
                         export_title_a=_title_for(left_title, left_date),
                         export_title_b=_title_for(right_title, right_date),
                     )
                 else:
+                    opacity_help = (
+                        "Drag the slider under the map to cross-fade between the two dates."
+                        if compare_dates else
+                        "Drag the slider under the map to cross-fade between the two reference periods."
+                    )
                     _render_synoptic_map(
-                        build_opacity_slider_map(fig_a, fig_b),
-                        f"Opacity Slider Compare: {left_title} ↔ {right_title}",
+                        build_opacity_slider_map(
+                            fig_a, fig_b, label_a=left_title, label_b=right_title,
+                        ),
+                        f"Opacity: {left_title} ↔ {right_title}",
                         "map_opacity",
                         bottom_margin=60,
                         export_title=map_export_title(
@@ -874,10 +989,7 @@ def render_map_tracker(
                             f"{left_title} ↔ {right_title}",
                             left_date, persist_metric,
                         ),
-                    )
-                    st.caption(
-                        "Drag the slider under the map to cross-fade between "
-                        + ("the two dates." if compare_dates else "the two reference periods.")
+                        help_text=opacity_help,
                     )
                 with st.container(key="atmopulse_split_map_tables_overlay"):
                     map_col1, map_col2 = st.columns(2, gap="small")

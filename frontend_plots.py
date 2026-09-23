@@ -590,7 +590,7 @@ def _kaleido_image(fig: go.Figure, fmt: str) -> bytes:
 
 def _press_vector_slot(fig: go.Figure, stem: str, fmt: str, label: str, mime: str) -> None:
     """One click renders the vector and starts the browser download."""
-    if st.button(label, key=f"press_go_{fmt}_{stem}"):
+    if st.button(label, key=f"press_go_{fmt}_{stem}", width="content"):
         try:
             with st.spinner(f"Rendering {label}…"):
                 blob = _kaleido_image(fig, fmt)
@@ -617,20 +617,23 @@ def render_press_export(
             csv_text = meta.get("press_csv")
     press_fig = _fig_for_press(fig, export_title=export_title)
     stem = _press_stem(stem)
-    n = 3 if csv_text else 2
-    with st.container(key=f"press-row-{stem}"):
-        cols = st.columns([1] * n + [10], gap="small")
-        with cols[0]:
-            _press_vector_slot(press_fig, stem, "svg", "SVG", "image/svg+xml")
-        with cols[1]:
-            _press_vector_slot(press_fig, stem, "pdf", "PDF", "application/pdf")
+    with st.container(
+        key=f"press-row-{stem}",
+        horizontal=True,
+        horizontal_alignment="left",
+        vertical_alignment="center",
+        gap="xsmall",
+        width="content",
+    ):
+        _press_vector_slot(press_fig, stem, "svg", "SVG", "image/svg+xml")
+        _press_vector_slot(press_fig, stem, "pdf", "PDF", "application/pdf")
         if csv_text:
-            with cols[2]:
-                st.download_button(
-                    "CSV", data=csv_text.encode("utf-8"),
-                    file_name=f"AtmoPulse_{stem}.csv", mime="text/csv",
-                    key=f"press_{stem}_csv",
-                )
+            st.download_button(
+                "CSV", data=csv_text.encode("utf-8"),
+                file_name=f"AtmoPulse_{stem}.csv", mime="text/csv",
+                key=f"press_{stem}_csv",
+                width="content",
+            )
 
 
 def st_plotly_press(
@@ -655,14 +658,17 @@ def st_plotly_press(
     if key is not None:
         plot_kwargs["key"] = key
     event = st.plotly_chart(fig, **plot_kwargs)
-    st.caption(_output_credit_text())
+    st.markdown(
+        f"<p class='atmopulse-chart-credit'>{_output_credit_text()}</p>",
+        unsafe_allow_html=True,
+    )
     render_press_export(fig, stem, csv_text=csv_text, export_title=export_title)
     return event
 
 
 def _render_synoptic_map(
     fig, title: str, key: str, *, bottom_margin: int = 0,
-    export_title: str | None = None,
+    export_title: str | None = None, help_text: str | None = None,
 ) -> None:
     """Render one synoptic map: Streamlit title above a CSS 70:42 frame.
 
@@ -673,7 +679,12 @@ def _render_synoptic_map(
     `bottom_margin` reserves room below the map (e.g. for a Plotly
     layout slider) without affecting the default zero-margin callers.
     """
-    st.markdown(f"<p class='atmopulse-map-title'>{title}</p>", unsafe_allow_html=True)
+    title_html = f"<p class='atmopulse-map-title'>{title}</p>"
+    if help_text:
+        with st.container(key=f"{key}_title"):
+            st.markdown(title_html, unsafe_allow_html=True, help=help_text, width="content")
+    else:
+        st.markdown(title_html, unsafe_allow_html=True)
     fig.update_layout(
         **plotly_typography(),
         uirevision="map_sync_state",
@@ -691,7 +702,10 @@ def _render_synoptic_map(
             config=SYNOPTIC_MAP_CONFIG,
             key=f"plotly_{key}",
         )
-    st.caption(_output_credit_text())
+    st.markdown(
+        f"<p class='atmopulse-map-credit'>{_output_credit_text()}</p>",
+        unsafe_allow_html=True,
+    )
     render_press_export(
         fig, f"map_{key}", heavy=True,
         export_title=export_title or title,
@@ -1530,7 +1544,8 @@ def build_opacity_slider_map(
 
 
 def render_swipe_compare_map(
-    fig_a, fig_b, *, export_title_a: str | None = None, export_title_b: str | None = None,
+    fig_a, fig_b, *, title: str, help_text: str,
+    export_title_a: str | None = None, export_title_b: str | None = None,
 ) -> None:
     """One map, two Plotly.js instances drawn inside a single self-owned
     iframe, with the top layer clipped by a CSS custom property.
@@ -1569,10 +1584,13 @@ def render_swipe_compare_map(
     fig_bottom.update_layout(**common_layout, xaxis=_map_xaxis_kwargs(), yaxis=_map_yaxis_kwargs())
     fig_top.update_layout(**common_layout, xaxis=_map_xaxis_kwargs(), yaxis=_map_yaxis_kwargs())
 
-    st.markdown(
-        "<p class='atmopulse-map-title'>Swipe Compare: Historical (left) | Recent (right)</p>",
-        unsafe_allow_html=True,
-    )
+    with st.container(key="swipe_map_title"):
+        st.markdown(
+            f"<p class='atmopulse-map-title'>{title}</p>",
+            unsafe_allow_html=True,
+            help=help_text,
+            width="content",
+        )
 
     primary = ATMOPULSE_BRAND["primary"]
     json_a = fig_bottom.to_json()
@@ -1766,8 +1784,10 @@ def render_swipe_compare_map(
 </script>
 """
     components.html(html, height=900, scrolling=False)
-    st.caption("Drag the map or the slider: left is 1961–1990, right is 1996–2025.")
-    st.caption(_output_credit_text())
+    st.markdown(
+        f"<p class='atmopulse-map-credit'>{_output_credit_text()}</p>",
+        unsafe_allow_html=True,
+    )
     e1, e2 = st.columns(2)
     with e1:
         render_press_export(
@@ -2281,7 +2301,7 @@ def build_yearly_extremes_chart(
         **plotly_typography(),
         barmode="stack",
         hovermode="x",
-        title=f"Days exceeding thresholds | {epoch_period_label(epoch)}",
+        title="Days exceeding thresholds",
         height=620,
         margin=dict(t=56, b=80, l=50, r=20),
         template="plotly_white",

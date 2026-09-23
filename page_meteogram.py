@@ -30,8 +30,8 @@ from atmopulse_theme import (
     plotly_typography,
 )
 from config import (
+    LAYOUT_SINGLE_CHART,
     LAYOUT_SIDE_BY_SIDE,
-    LAYOUT_FLICKER,
     COMPARE_EPOCHS,
     COMPARE_YEARS,
     STANDARD_DEFAULTS,
@@ -294,6 +294,9 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
 
     if "met_compare_axis" not in st.session_state:
         st.session_state.met_compare_axis = STANDARD_DEFAULTS["meteo_compare"]
+    elif st.session_state.met_compare_axis not in (COMPARE_EPOCHS, COMPARE_YEARS):
+        # Session still holding the old "Live vs Year" label.
+        st.session_state.met_compare_axis = COMPARE_YEARS
     compare_years_pending = st.session_state.met_compare_axis == COMPARE_YEARS
     if compare_years_pending:
         left_pending = st.session_state.get("met_archive_year") or st.session_state.get(
@@ -322,23 +325,11 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
     else:
         compare_help = HELP["meteo_compare_axis"]
 
-    show_layout = show_expert("flicker_layout")
-    if show_layout:
-        top1, top2 = st.columns([1.15, 1.35])
-        with top1:
-            compare_axis = st.radio(
-                "Compare:",
-                (COMPARE_EPOCHS, COMPARE_YEARS),
-                horizontal=True,
-                key="met_compare_axis",
-                help=compare_help,
-            )
-        with top2:
-            map_layout = st.radio(
-                "Layout:", (LAYOUT_SIDE_BY_SIDE, LAYOUT_FLICKER),
-                horizontal=True, key="met_layout",
-            )
-    else:
+    _chart_layouts = (LAYOUT_SINGLE_CHART, LAYOUT_SIDE_BY_SIDE)
+    if st.session_state.get("met_layout") not in _chart_layouts:
+        st.session_state.met_layout = LAYOUT_SINGLE_CHART
+    top1, top2 = st.columns([1.15, 1.35])
+    with top1:
         compare_axis = st.radio(
             "Compare:",
             (COMPARE_EPOCHS, COMPARE_YEARS),
@@ -346,7 +337,13 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
             key="met_compare_axis",
             help=compare_help,
         )
-        map_layout = STANDARD_DEFAULTS["map_layout"]
+    with top2:
+        map_layout = st.radio(
+            "Layout:",
+            _chart_layouts,
+            horizontal=True,
+            key="met_layout",
+        )
     compare_years = compare_axis == COMPARE_YEARS
 
     is_archive = False
@@ -413,7 +410,7 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
             year_panel = f"{year_panel} (right)"
         if st.session_state.get("met_year_pick") not in (live_panel, year_panel):
             st.session_state.met_year_pick = live_panel
-        if map_layout == LAYOUT_FLICKER:
+        if map_layout == LAYOUT_SINGLE_CHART:
             met_year_pick = st.session_state.get("met_year_pick", live_panel)
         else:
             met_year_pick = live_panel
@@ -431,7 +428,7 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
         st.session_state["_active_met_archive_year"] = archive_choice
         is_archive = archive_choice != "Live"
         archive_year = int(archive_choice) if is_archive else None
-        if map_layout == LAYOUT_FLICKER:
+        if map_layout == LAYOUT_SINGLE_CHART:
             met_active_epoch = epoch_from_label(st.session_state.get("met_ep", epoch_period_label("B")))
     live_blocked = (not is_archive) and is_aifs_model() and meteo_var_code(meteo_var) in ("TX", "TN")
     if live_blocked:
@@ -494,7 +491,7 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
             live_s = pd.Timestamp(left_when).strftime("%d.%m.%Y")
             arch_s = analog_target.strftime("%d.%m.%Y")
             left_verb = "was" if is_archive else "is"
-            if map_layout == LAYOUT_FLICKER:
+            if map_layout == LAYOUT_SINGLE_CHART:
                 show_live = met_year_pick != year_panel
                 if show_live and cat_live is not None:
                     chip = _severity_phrase_html(cat_live, dir_live, point_condition_phrase(cat_live, dir_live))
@@ -701,7 +698,7 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
                         cat_a, dir_a = classify_point_severity(value_now, *percentiles_a)
                         cat_b, dir_b = classify_point_severity(value_now, *percentiles_b)
                         addr = html.escape(location.address)
-                        if map_layout == LAYOUT_FLICKER:
+                        if map_layout == LAYOUT_SINGLE_CHART:
                             cat_x, dir_x = (cat_a, dir_a) if met_active_epoch == "A" else (cat_b, dir_b)
                             chip = _severity_phrase_html(cat_x, dir_x, point_condition_phrase(cat_x, dir_x))
                             lead = html.escape(baseline_against_lead(met_active_epoch))
@@ -751,8 +748,8 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
             vline_x = tgt_dt_norm.timestamp() * 1000
             if is_archive and not _archive_day_available(df_live, plot_target_date):
                 vline_x = None
-            title_a = f"{epoch_period_label('A').replace(' (', '<br>(')}"
-            title_b = f"{epoch_period_label('B').replace(' (', '<br>(')}"
+            title_a = epoch_period_label("A")
+            title_b = epoch_period_label("B")
 
             # Five warm + five cold chips. Moderate/Strong/Extreme/Record share
             # the Map Tracker palette; Above/Below average are the pale extras.

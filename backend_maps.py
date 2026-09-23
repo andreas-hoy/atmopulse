@@ -362,15 +362,13 @@ LIVE_OVERLAY_PAST_DAYS = 6
 def latest_era5_archive_date() -> pd.Timestamp:
     """Latest calendar day the Map Tracker's Archive date picker may offer.
 
-    Kept comfortably clear of the IFS/AIFS live-forecast overlay window
-    (LIVE_OVERLAY_PAST_DAYS, but never less than 10 days back from today) so
-    an "Archive" pick never lands inside the hybrid live window, and capped
-    to a day that actually falls inside an on-disk era5_master_daily_{year}.nc
-    (steps back to 31 Dec of the closest earlier year that has one otherwise).
-    Best-effort only: get_synoptic_map_data()'s own "no data" warning is the
-    real safety net if this day still turns out to be missing/incomplete.
+    Five days before today, so the picker reaches ERA5T. Capped to a day that
+    actually falls inside an on-disk era5_master_daily_{year}.nc (steps back
+    to 31 Dec of the closest earlier year that has one otherwise).
+    Best-effort only: the map page's own "no data" warning is the real safety
+    net if this day still turns out to be missing.
     """
-    cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=max(LIVE_OVERLAY_PAST_DAYS, 10))
+    cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=5)
     for year in range(cutoff.year, 1939, -1):
         if (DATA_DIR / f"era5_master_daily_{year}.nc").exists():
             return cutoff if year == cutoff.year else pd.Timestamp(year=year, month=12, day=31)

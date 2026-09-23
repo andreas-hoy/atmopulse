@@ -46,8 +46,8 @@ from config import (
     FORECAST_MODEL_OPTIONS,
     MAP_VIEW_DAILY,
     MAP_VIEW_PERSISTENCE,
+    LAYOUT_SINGLE_CHART,
     LAYOUT_SIDE_BY_SIDE,
-    LAYOUT_FLICKER,
     AIFS_TXTN_WARNING,
     NAV_WELCOME,
     NAV_MAP,
@@ -149,9 +149,8 @@ def fetch_aligned_wave_figs(
 # stack. The swap dropdown's labels double as the event list (Rank, Start,
 # End, Duration, Intensity) — no separate table. Ranking/selection state
 # lives here (app.py); reads only the already-detected `waves_data` from
-# one of the A/B payloads — user-selectable via the in-block Reference
-# toggle (default: epoch "B") — no Kyselý-detection change, no
-# ridge-geometry change, no second stats chart.
+# the period chosen at the top of the wavogram (Side by side: recent
+# period). No second period switch in this block.
 def _wave_event_label(w: dict) -> str:
     # Rank, Start, End, Duration, Intensity — the compact event table used to
     # show these as columns; now folded into the dropdown label itself since
@@ -168,6 +167,23 @@ def _wave_section_spacer(px: int = 28) -> None:
     # (ridge -> drill-down -> intensity -> frequency) — no divider line,
     # just vertical margin, so the sections read as distinct blocks.
     st.markdown(f"<div style='margin-top:{px}px'></div>", unsafe_allow_html=True)
+
+
+def _year_ago_archive_date():
+    """Calendar day one year before today, clamped to the archive picker."""
+    max_d = latest_era5_archive_date().date()
+    min_d = pd.Timestamp(1940, 1, 1).date()
+    year_ago = (pd.Timestamp.now().normalize() - pd.DateOffset(years=1)).date()
+    return min(max(year_ago, min_d), max_d)
+
+
+def _on_map_date_mode_change():
+    """Selecting Date jumps the archive calendar to the same day last year."""
+    if st.session_state.get("map_archive_mode") != "Archive":
+        return
+    picked = _year_ago_archive_date()
+    st.session_state.map_archive_date = picked
+    st.session_state["_active_map_archive_date"] = picked
 
 
 def _open_wave_event_on_map(start_date):
@@ -187,7 +203,7 @@ def _open_wave_event_on_map(start_date):
     start_ts = pd.Timestamp(start_date)
     min_d = pd.Timestamp(1940, 1, 1).date()
     max_d = latest_era5_archive_date().date()
-    st.session_state.map_archive_mode = "Date"
+    st.session_state.map_archive_mode = "Archive"
     st.session_state.map_archive_date = min(max(start_ts.date(), min_d), max_d)
 
     archive_years = get_archive_year_options(pd.Timestamp.utcnow().strftime("%Y-%m-%d"))
@@ -205,7 +221,7 @@ def _open_wave_event_on_map(start_date):
     st.session_state.atmopulse_top_nav = NAV_MAP
 
 
-def _render_wave_drilldown(payload_a, payload_b, stack_metric, ctx_key, click_events=()):
+def _render_wave_drilldown(payload_a, payload_b, stack_metric, ctx_key, click_events=(), epoch: str | None = None):
     payloads = {"A": payload_a, "B": payload_b}
     avail_epochs = [
         ep for ep in ("A", "B")
@@ -215,31 +231,15 @@ def _render_wave_drilldown(payload_a, payload_b, stack_metric, ctx_key, click_ev
         return  # no waves in either reference period: the existing empty-state elsewhere already covers this
     _wave_section_spacer()
 
-    # Which reference period's events get ranked/shown here — independent of
-    # the ridge/intensity column layout (both A and B are always visible in
-    # Side-by-Side); defaults to B (Recent) to match the old fixed behaviour.
-    ep_key = "wave_drill_epoch"
-    default_epoch = "B" if "B" in avail_epochs else avail_epochs[0]
-    epoch = st.session_state.get(ep_key, default_epoch)
+    # The period is chosen once, at the top of the wavogram. This block only
+    # names it. Side by side has no single choice, so it uses the recent period.
     if epoch not in avail_epochs:
-        epoch = default_epoch
-
-    head_col, toggle_col = st.columns([3, 2])
-    with head_col:
-        st.markdown(
-            f"**Event Drill-down** \u00b7 Reference: {epoch_period_label(epoch)}",
-            help=HELP["wave_drilldown"],
-        )
-    if len(avail_epochs) > 1:
-        with toggle_col:
-            ep_labels = [epoch_period_label(ep) for ep in avail_epochs]
-            chosen_label = st.radio(
-                "Ranking basis:", ep_labels, index=avail_epochs.index(epoch),
-                horizontal=True, key=f"{ep_key}_radio", label_visibility="collapsed",
-                help=HELP["wave_drilldown_epoch"],
-            )
-            epoch = avail_epochs[ep_labels.index(chosen_label)]
-    st.session_state[ep_key] = epoch
+        epoch = "B" if "B" in avail_epochs else avail_epochs[0]
+    st.session_state["wave_drill_epoch"] = epoch
+    st.markdown(
+        f"**Event Drill-down | {epoch_period_label(epoch)}**",
+        help=HELP["wave_drilldown"],
+    )
     payload_b = payloads[epoch]  # reuse the name below — rest of the function is unchanged
 
     ranked = rank_waves_by_metric(payload_b["waves_data"], stack_metric)
@@ -531,21 +531,6 @@ def sub_day():
     if st.session_state.offset_slider > FORECAST_OFFSET_MIN:
         st.session_state.offset_slider -= 1
 
-def _shift_map_archive_date(days: int):
-    current = st.session_state.get("map_archive_date")
-    if current is None:
-        return
-    min_d = pd.Timestamp(1940, 1, 1).date()
-    max_d = latest_era5_archive_date().date()
-    new_d = (pd.Timestamp(current) + pd.Timedelta(days=days)).date()
-    st.session_state.map_archive_date = min(max(new_d, min_d), max_d)
-
-def map_archive_prev_day():
-    _shift_map_archive_date(-1)
-
-def map_archive_next_day():
-    _shift_map_archive_date(1)
-
 def toggle_warm_state():
     current = any(st.session_state.toggles_warm.values())
     for k in st.session_state.toggles_warm: 
@@ -623,61 +608,44 @@ with st.sidebar:
     if nav_selection in NAV_ANALYTICS:
         st.header("Control Panel")
 
-        # --- Map Tracker only: Live vs. a single historical ERA5 calendar
-        # day ("Archive"). Map-local state (map_archive_mode / map_archive_date
-        # widget keys below) — independent of the Meteogram Archive Year
-        # (met_archive_year, untouched) and of the Forecast Offset slider:
-        # picking an Archive date here never writes offset_slider, and the
-        # Wavogram/Meteogram never see this block (nav_selection-gated).
+        # --- Map Tracker only: Live vs. a historical ERA5 calendar day.
+        # The calendar and Prev/Next sit above the map (page_map_tracker),
+        # not in this panel. Map-local state (map_archive_mode /
+        # map_archive_date) is independent of the Meteogram Archive Year
+        # and of the Forecast Offset slider. The date widget is created
+        # later on the map page; seed/clamp the key here first and never
+        # also pass value= on that widget.
         map_is_archive = False
         if nav_selection == NAV_MAP:
+            if st.session_state.get("_active_map_archive_mode") == "Date":
+                st.session_state["_active_map_archive_mode"] = "Archive"
             if "map_archive_mode" not in st.session_state:
                 st.session_state["map_archive_mode"] = st.session_state.get(
                     "_active_map_archive_mode", "Live",
                 )
+            elif st.session_state.get("map_archive_mode") == "Date":
+                st.session_state["map_archive_mode"] = "Archive"
             st.radio(
                 "Map date:",
-                ("Live", "Date"),
+                ("Live", "Archive"),
                 horizontal=True,
                 key="map_archive_mode",
                 help=HELP["map_archive_date"],
+                on_change=_on_map_date_mode_change,
             )
             st.session_state["_active_map_archive_mode"] = st.session_state.map_archive_mode
-            map_is_archive = st.session_state.get("map_archive_mode") == "Date"
+            map_is_archive = st.session_state.get("map_archive_mode") == "Archive"
             if map_is_archive:
                 _max_archive = latest_era5_archive_date().date()
-                # Pre-seed/clamp session_state BEFORE creating the widget, and
-                # never also pass `value=` below — passing both a `value` and
-                # a `key` that's already present in session_state is exactly
-                # the combination that trips Streamlit's yellow
-                # "created with a default value but also had its value set
-                # via the Session State API" warning.
+                _min_archive = pd.Timestamp(1940, 1, 1).date()
                 if "map_archive_date" not in st.session_state:
                     st.session_state.map_archive_date = st.session_state.get(
-                        "_active_map_archive_date", _max_archive,
+                        "_active_map_archive_date", _year_ago_archive_date(),
                     )
-                st.session_state.map_archive_date = min(st.session_state.map_archive_date, _max_archive)
-                st.date_input(
-                    "Archive date:",
-                    min_value=pd.Timestamp(1940, 1, 1).date(),
-                    max_value=_max_archive,
-                    key="map_archive_date",
-                    format="DD.MM.YYYY",
+                st.session_state.map_archive_date = min(
+                    max(st.session_state.map_archive_date, _min_archive), _max_archive,
                 )
                 st.session_state["_active_map_archive_date"] = st.session_state.map_archive_date
-                _arch_col1, _arch_col2 = st.columns(2)
-                with _arch_col1:
-                    st.button(
-                        "← Prev Day", key="map_archive_prev_btn",
-                        on_click=map_archive_prev_day, use_container_width=True,
-                        disabled=st.session_state.map_archive_date <= pd.Timestamp(1940, 1, 1).date(),
-                    )
-                with _arch_col2:
-                    st.button(
-                        "Next Day →", key="map_archive_next_btn",
-                        on_click=map_archive_next_day, use_container_width=True,
-                        disabled=st.session_state.map_archive_date >= _max_archive,
-                    )
             st.markdown("---")
 
         if show_expert("forecast_model"):
@@ -701,11 +669,11 @@ with st.sidebar:
         )
 
         # Forecast Offset / Prev-Next-Day step the LIVE target date only.
-        # An active Map Archive date ignores the offset entirely (chosen
-        # variant: offset controls disabled rather than re-purposed to step
-        # the archive date, so the Live slider is never silently bent).
+        # An active Map Archive date ignores the offset entirely (the
+        # archive day is stepped above the map, so the Live slider is
+        # never silently bent).
         if map_is_archive:
-            st.caption("Forecast Offset is inactive while a Map Archive date is selected above.")
+            st.caption("Forecast Offset is inactive while Map date is set to Archive.")
         else:
             st.slider("Forecast Offset (Days):", FORECAST_OFFSET_MIN, FORECAST_OFFSET_MAX, key="offset_slider", help=HELP["forecast_offset"])
             # Native -7 / +3 tick labels are forced permanently visible via CSS
@@ -722,13 +690,12 @@ with st.sidebar:
             )
             btn_col1, btn_col2 = st.columns(2)
             with btn_col1: 
-                st.button("← Prev Day", on_click=sub_day, use_container_width=True)
+                st.button("← Day before", on_click=sub_day, use_container_width=True)
             with btn_col2: 
-                st.button("Next Day →", on_click=add_day, use_container_width=True)
+                st.button("Day after →", on_click=add_day, use_container_width=True)
 
         if map_is_archive:
             target_date = pd.Timestamp(st.session_state.map_archive_date)
-            st.info(f"Archive Date: **{target_date.strftime('%d.%m.%Y')}** (ERA5 master)")
         else:
             target_date = default_date + pd.Timedelta(days=st.session_state.offset_slider)
             st.info(f"Target Date: **{target_date.strftime('%d.%m.%Y')}**")
@@ -1072,10 +1039,15 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
             )
 
         elif nav_selection == NAV_WAVE:
-            if show_expert("flicker_layout"):
-                map_layout = st.radio("Layout:", (LAYOUT_SIDE_BY_SIDE, LAYOUT_FLICKER), horizontal=True, key="wave_layout")
-            else:
-                map_layout = STANDARD_DEFAULTS["map_layout"]
+            _chart_layouts = (LAYOUT_SINGLE_CHART, LAYOUT_SIDE_BY_SIDE)
+            if st.session_state.get("wave_layout") not in _chart_layouts:
+                st.session_state.wave_layout = LAYOUT_SINGLE_CHART
+            map_layout = st.radio(
+                "Layout:",
+                _chart_layouts,
+                horizontal=True,
+                key="wave_layout",
+            )
             param_code = meteo_var_code(wave_var)
             if is_aifs_model() and param_code in ("TX", "TN"):
                 st.warning(AIFS_TXTN_WARNING)
@@ -1133,15 +1105,16 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                                 fig_m_b, "wavogram_ridge_recent",
                                 on_select="rerun", selection_mode=("points",), key="wave_ridge_click_b",
                             )
-                    # One Event Drill-down block under both ridges, not a
-                    # 5+5 split — a Reference-period toggle inside picks
-                    # which epoch's events are ranked/shown (default: B).
+                    # One Event Drill-down block under both ridges. Side by side
+                    # shows both periods in the ridges; the drill-down follows
+                    # the recent period and names it in the heading.
                     _render_wave_drilldown(
                         wave_payload_a, wave_payload_b, wave_stack_metric, wave_drill_ctx,
                         click_events=(
                             ("wave_ridge_click_a", click_a),
                             ("wave_ridge_click_b", click_b),
                         ),
+                        epoch="B",
                     )
                     # Fresh column pair for the stack row: reusing w_col1/
                     # w_col2 here would silently push the drill-down block
@@ -1154,7 +1127,7 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                         st_col1, st_col2 = st.columns(2, gap="small")
                         with st_col1:
                             st.markdown(
-                                f"**{stack_heading} | {epoch_period_label('A')}**",
+                                f"**{stack_heading}**",
                                 help=HELP["wave_annual_stack"],
                             )
                             st_plotly_press(
@@ -1173,7 +1146,7 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                                 )
                         with st_col2:
                             st.markdown(
-                                f"**{stack_heading} | {epoch_period_label('B')}**",
+                                f"**{stack_heading}**",
                                 help=HELP["wave_annual_stack"],
                             )
                             st_plotly_press(
@@ -1205,9 +1178,10 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                     _render_wave_drilldown(
                         wave_payload_a, wave_payload_b, wave_stack_metric, wave_drill_ctx,
                         click_events=((f"wave_ridge_click_{ep}", click_ep),),
+                        epoch=ep,
                     )
                     st.markdown(
-                        f"**{stack_heading} | {epoch_period_label(ep)}**",
+                        f"**{stack_heading}**",
                         help=HELP["wave_annual_stack"],
                     )
                     st_plotly_press(
