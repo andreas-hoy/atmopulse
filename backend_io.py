@@ -1098,12 +1098,10 @@ def fetch_cached_synoptic_data(
 @st.cache_data(show_spinner=False)
 def get_persistence_arrays(
     target_date_str, baseline_type, map_var="TG", anchor_date_str=None,
-    forecast_model=FORECAST_MODEL_IFS, _persist_version=4,
+    forecast_model=FORECAST_MODEL_IFS, _persist_version=5,
 ):
     ref_clim = load_reference_climatology()
     if ref_clim is None: 
-        return None
-    if "AIFS" in str(forecast_model) and map_var in ("TX", "TN"):
         return None
     end_date = pd.to_datetime(target_date_str)
     start_date = end_date - pd.Timedelta(days=PERSISTENCE_MAX_DAYS + PERSISTENCE_LOOKBACK_PAD)

@@ -38,6 +38,7 @@ from config import (
     AIFS_TXTN_WARNING,
     analog_calendar_date,
     analog_date_in_year,
+    epoch_short_label,
     is_aifs_model,
     is_expert_mode,
     selected_forecast_model,
@@ -71,6 +72,33 @@ def _severity_phrase_html(cat: str, direction: str | None, phrase: str) -> str:
     else:
         cls = f"atmopulse-narrative-chip atmopulse-sev-{direction}-{cat}"
     return f'<span class="{cls}">{safe}</span>'
+
+
+def _is_normal_condition(cat, direction) -> bool:
+    return (not direction) or cat == "normal"
+
+
+def _point_note(
+    addr: str, verb: str, lead: str, cat, direction, *,
+    when: str | None = None, force_lead: bool = False,
+) -> str:
+    """Short while the place is in the normal range; the baseline lead returns outside it.
+
+    Side-by-side passes ``force_lead`` so each half still names its baseline.
+    """
+    phrase = point_condition_phrase(cat, direction)
+    chip = _severity_phrase_html(cat, direction, phrase)
+    if _is_normal_condition(cat, direction) and not force_lead:
+        body = (
+            f"On {when} the area of {addr} {verb} {chip}."
+            if when else
+            f"The area of {addr} {verb} {chip}."
+        )
+    elif when:
+        body = f"{lead}, on {when} the area of {addr} {verb} {chip}."
+    else:
+        body = f"{lead}, the area of {addr} {verb} {chip}."
+    return f"<div class='atmopulse-narrative-banner is-under-figure'>{body}</div>"
 
 
 def _meteo_export_title(heading: str, epoch: str, when, panel: str | None = None) -> str:
@@ -116,23 +144,37 @@ def _seasonal_archive_frame(df_live, year, lat, lon):
     return df, analog_start, analog_end, year_shift
 
 
+def _mark_chart_date(fig, vline_x) -> None:
+    """Vertical date marker. Stops in the x-axis month band, above the legend."""
+    if vline_x is None:
+        return
+    fig.add_shape(
+        type="line",
+        xref="x", yref="paper",
+        x0=vline_x, x1=vline_x,
+        y0=-0.045, y1=1,
+        line=dict(color="rgba(49, 51, 63, 0.75)", width=1.2, dash="dash"),
+        layer="above",
+    )
+
+
 def _build_meteogram_panel(traces, title: str, y_min: float, y_max: float, vline_x) -> go.Figure:
     """One reference-period meteogram. Never a shared-y subplot — the right
     panel must keep its own ticks and can carry its own license/export."""
     fig = go.Figure(data=list(traces))
-    if vline_x is not None:
-        fig.add_vline(x=vline_x, line_dash="dash", line_color="gray", opacity=0.8)
+    _mark_chart_date(fig, vline_x)
     fig.update_yaxes(
         range=[y_min, y_max],
         title_text="°C",
         showticklabels=True, ticks="outside", automargin=True,
         showgrid=True, gridcolor=ATMOPULSE_OVERLAY["grid"],
         zeroline=False, visible=True, side="left",
+        showspikes=False,
     )
     fig.update_xaxes(
         dtick="M2", tickformat="%b\n%Y", hoverformat="%d.%m.%Y",
         showgrid=True, gridcolor=ATMOPULSE_OVERLAY["grid"],
-        ticks="outside", automargin=True,
+        ticks="outside", automargin=True, showspikes=False,
     )
     fig.update_layout(
         **plotly_typography(), title=title,
@@ -144,8 +186,7 @@ def _build_meteogram_panel(traces, title: str, y_min: float, y_max: float, vline
 
 def _build_z500_panel(traces, y_lim, vline_x) -> go.Figure:
     fig = go.Figure(data=list(traces))
-    if vline_x is not None:
-        fig.add_vline(x=vline_x, line_dash="dash", line_color="gray", opacity=0.8)
+    _mark_chart_date(fig, vline_x)
     fig.update_yaxes(
         range=list(y_lim),
         title_text="Z500 anom. (dam)",
@@ -153,11 +194,12 @@ def _build_z500_panel(traces, y_lim, vline_x) -> go.Figure:
         showgrid=True, gridcolor=ATMOPULSE_OVERLAY["grid"],
         zeroline=True, zerolinecolor="rgba(0,0,0,0.45)",
         visible=True, side="left",
+        showspikes=False,
     )
     fig.update_xaxes(
         dtick="M2", tickformat="%b\n%Y", hoverformat="%d.%m.%Y",
         showgrid=True, gridcolor=ATMOPULSE_OVERLAY["grid"],
-        ticks="outside", automargin=True,
+        ticks="outside", automargin=True, showspikes=False,
     )
     fig.update_layout(
         **plotly_typography(), hovermode="x", height=280,
@@ -274,6 +316,28 @@ def _meteo_compare_help(
     return " ".join(bits)
 
 
+def _temp_legend_html() -> str:
+    """Colour key for the temperature chart. Sits under the chart, above the credit."""
+    return (
+        f"<div class='atmopulse-map-legend atmopulse-subsection-label' "
+        f"style='margin-top: -2px; margin-bottom: 2px; white-space: nowrap;'>"
+        f"<b>Legend.</b> "
+        f"<span style='padding-left: 4px;'>Warm:</span> "
+        f"<span style='{legend_badge_style('warm', 'above')}'>Above average</span> "
+        f"<span style='{legend_badge_style('warm', 'moderate')}'>Moderate</span> "
+        f"<span style='{legend_badge_style('warm', 'strong')}'>Strong</span> "
+        f"<span style='{legend_badge_style('warm', 'extreme')}'>Extreme</span> "
+        f"<span style='{legend_badge_style('warm', 'record')}'>Record</span>"
+        f"<span style='padding-left: 12px;'>Cold:</span> "
+        f"<span style='{legend_badge_style('cold', 'below')}'>Below average</span> "
+        f"<span style='{legend_badge_style('cold', 'moderate')}'>Moderate</span> "
+        f"<span style='{legend_badge_style('cold', 'strong')}'>Strong</span> "
+        f"<span style='{legend_badge_style('cold', 'extreme')}'>Extreme</span> "
+        f"<span style='{legend_badge_style('cold', 'record')}'>Record</span>"
+        f"</div>"
+    )
+
+
 def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, target_date, meteo_spell=False):
     ref_clim = load_reference_climatology()
     if ref_clim is None:
@@ -325,25 +389,102 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
     else:
         compare_help = HELP["meteo_compare_axis"]
 
+    if "met_archive_year" not in st.session_state:
+        st.session_state["met_archive_year"] = st.session_state.get(
+            "_active_met_archive_year", "Live",
+        )
+    archive_choice = st.session_state["met_archive_year"]
     _chart_layouts = (LAYOUT_SINGLE_CHART, LAYOUT_SIDE_BY_SIDE)
     if st.session_state.get("met_layout") not in _chart_layouts:
         st.session_state.met_layout = LAYOUT_SINGLE_CHART
-    top1, top2 = st.columns([1.15, 1.35])
-    with top1:
-        compare_axis = st.radio(
-            "Compare:",
-            (COMPARE_EPOCHS, COMPARE_YEARS),
-            horizontal=True,
-            key="met_compare_axis",
-            help=compare_help,
+    _period_choice = (epoch_short_label("A"), epoch_short_label("B"))
+    show_period = (
+        st.session_state.get("met_compare_axis", COMPARE_EPOCHS) != COMPARE_YEARS
+        and st.session_state.get("met_layout", LAYOUT_SINGLE_CHART) == LAYOUT_SINGLE_CHART
+    )
+    if show_period and st.session_state.get("met_ep") not in _period_choice:
+        raw = st.session_state.get("met_ep", "")
+        st.session_state.met_ep = (
+            _period_choice[0] if epoch_from_label(raw or "B") == "A" else _period_choice[1]
         )
-    with top2:
-        map_layout = st.radio(
-            "Layout:",
-            _chart_layouts,
-            horizontal=True,
-            key="met_layout",
-        )
+    show_archive_top = not compare_years_pending
+    show_date_period = compare_years_pending
+    if show_date_period:
+        _date_period = (epoch_short_label("A"), epoch_short_label("B"))
+        _date_now = st.session_state.get("met_date_epoch")
+        if _date_now not in _date_period:
+            st.session_state.met_date_epoch = (
+                _date_period[0] if epoch_from_label(_date_now or "B") == "A" else _date_period[1]
+            )
+    n_top = 2 + int(show_period) + int(show_archive_top) + int(show_date_period)
+    with st.container(key="met_top_controls"):
+        top_cols = st.columns(n_top)
+        with top_cols[0]:
+            compare_axis = st.radio(
+                "Compare:",
+                (COMPARE_EPOCHS, COMPARE_YEARS),
+                horizontal=True,
+                key="met_compare_axis",
+                help=compare_help,
+            )
+        series_opts = None
+        if compare_years_pending and year_labels and st.session_state.get(
+            "met_layout", LAYOUT_SINGLE_CHART,
+        ) == LAYOUT_SINGLE_CHART:
+            _y1 = st.session_state.get("met_archive_year") or st.session_state.get(
+                "_active_met_archive_year", "Live",
+            )
+            _y2 = st.session_state.get("met_compare_year") or year_labels[-1]
+            _left = f"Archive {int(_y1)}" if str(_y1) != "Live" else "Live"
+            _right = f"Archive {int(_y2)}"
+            if _left == _right:
+                _left = f"{_left} (left)"
+                _right = f"{_right} (right)"
+            series_opts = (_left, _right)
+            if st.session_state.get("met_year_pick") not in series_opts:
+                st.session_state.met_year_pick = series_opts[0]
+        with top_cols[1]:
+            map_layout = st.radio(
+                "Layout:",
+                _chart_layouts,
+                horizontal=True,
+                key="met_layout",
+            )
+            if series_opts:
+                st.radio(
+                    "Show series:",
+                    series_opts,
+                    horizontal=True,
+                    key="met_year_pick",
+                )
+        next_col = 2
+        if show_period:
+            with top_cols[next_col]:
+                st.radio(
+                    "Select Reference Period:",
+                    _period_choice,
+                    horizontal=True,
+                    key="met_ep",
+                )
+            next_col += 1
+        if show_date_period:
+            with top_cols[next_col]:
+                st.radio(
+                    "Reference Period:",
+                    _date_period,
+                    horizontal=True,
+                    key="met_date_epoch",
+                    help=HELP["meteo_date_epoch"],
+                )
+            next_col += 1
+        if show_archive_top:
+            with top_cols[next_col]:
+                archive_choice = st.selectbox(
+                    "Archive Year:",
+                    ["Live"] + year_labels,
+                    key="met_archive_year",
+                    help=HELP["meteo_archive_year"],
+                )
     compare_years = compare_axis == COMPARE_YEARS
 
     is_archive = False
@@ -358,73 +499,40 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
             st.session_state["met_archive_year"] = st.session_state.get(
                 "_active_met_archive_year", "Live",
             )
-        if is_expert_mode():
-            y1, y2, y3 = st.columns([1, 1, 1.2])
-            with y1:
-                archive_choice = st.selectbox(
-                    "Archive Year:",
-                    ["Live"] + year_labels,
-                    key="met_archive_year",
-                    help=HELP["meteo_archive_year"],
-                )
-            with y2:
-                compare_year = int(st.selectbox(
-                    "Compare year:",
-                    year_labels,
-                    key="met_compare_year",
-                    help=HELP["meteo_compare_year"],
-                ))
-            with y3:
-                if "met_date_epoch" not in st.session_state:
-                    st.session_state.met_date_epoch = epoch_period_label("B")
-                date_epoch = epoch_from_label(st.radio(
-                    "Colour against:",
-                    (epoch_period_label("A"), epoch_period_label("B")),
-                    horizontal=True,
-                    key="met_date_epoch",
-                    help=HELP["meteo_date_epoch"],
-                ))
-        else:
-            y1, y2 = st.columns(2)
-            with y1:
-                archive_choice = st.selectbox(
-                    "Archive Year:",
-                    ["Live"] + year_labels,
-                    key="met_archive_year",
-                    help=HELP["meteo_archive_year"],
-                )
-            with y2:
-                compare_year = int(st.selectbox(
-                    "Compare year:",
-                    year_labels,
-                    key="met_compare_year",
-                    help=HELP["meteo_compare_year"],
-                ))
-        st.session_state["_active_met_archive_year"] = archive_choice
-        is_archive = archive_choice != "Live"
-        archive_year = int(archive_choice) if is_archive else None
-        live_panel = f"Archive {archive_year}" if is_archive else "Live"
-        year_panel = f"Archive {compare_year}"
-        if live_panel == year_panel:
-            live_panel = f"{live_panel} (left)"
-            year_panel = f"{year_panel} (right)"
-        if st.session_state.get("met_year_pick") not in (live_panel, year_panel):
-            st.session_state.met_year_pick = live_panel
-        if map_layout == LAYOUT_SINGLE_CHART:
-            met_year_pick = st.session_state.get("met_year_pick", live_panel)
-        else:
-            met_year_pick = live_panel
-    else:
-        if "met_archive_year" not in st.session_state:
-            st.session_state["met_archive_year"] = st.session_state.get(
-                "_active_met_archive_year", "Live",
-            )
-        archive_choice = st.selectbox(
-            "Archive Year:",
-            ["Live"] + year_labels,
-            key="met_archive_year",
-            help=HELP["meteo_archive_year"],
+        date_epoch = epoch_from_label(
+            st.session_state.get("met_date_epoch", epoch_short_label("B"))
         )
+        with st.container(key="met_year_row"):
+            y1, y2, _year_pad = st.columns([1.15, 1.15, 2.7])
+            with y1:
+                archive_choice = st.selectbox(
+                    "Year 1",
+                    ["Live"] + year_labels,
+                    key="met_archive_year",
+                    help=HELP["meteo_archive_year"],
+                )
+            with y2:
+                compare_year = int(st.selectbox(
+                    "Year 2",
+                    year_labels,
+                    key="met_compare_year",
+                    help=HELP["meteo_compare_year"],
+                ))
+            st.session_state["_active_met_archive_year"] = archive_choice
+            is_archive = archive_choice != "Live"
+            archive_year = int(archive_choice) if is_archive else None
+            live_panel = f"Archive {archive_year}" if is_archive else "Live"
+            year_panel = f"Archive {compare_year}"
+            if live_panel == year_panel:
+                live_panel = f"{live_panel} (left)"
+                year_panel = f"{year_panel} (right)"
+            if st.session_state.get("met_year_pick") not in (live_panel, year_panel):
+                st.session_state.met_year_pick = live_panel
+            if map_layout == LAYOUT_SINGLE_CHART:
+                met_year_pick = st.session_state.get("met_year_pick", live_panel)
+            else:
+                met_year_pick = live_panel
+    else:
         st.session_state["_active_met_archive_year"] = archive_choice
         is_archive = archive_choice != "Live"
         archive_year = int(archive_choice) if is_archive else None
@@ -491,36 +599,32 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
             live_s = pd.Timestamp(left_when).strftime("%d.%m.%Y")
             arch_s = analog_target.strftime("%d.%m.%Y")
             left_verb = "was" if is_archive else "is"
-            if map_layout == LAYOUT_SINGLE_CHART:
+            narrative_html = None
+            narrative_left = None
+            narrative_right = None
+            if is_archive:
+                pass
+            elif map_layout == LAYOUT_SINGLE_CHART:
                 show_live = met_year_pick != year_panel
                 if show_live and cat_live is not None:
-                    chip = _severity_phrase_html(cat_live, dir_live, point_condition_phrase(cat_live, dir_live))
-                    _render_html(
-                        f"<div class='atmopulse-narrative-banner'>"
-                        f"{lead}, on {html.escape(live_s)} the area of {addr} {left_verb}{chip}."
-                        f"</div>"
+                    narrative_html = _point_note(
+                        addr, left_verb, lead, cat_live, dir_live, when=html.escape(live_s),
                     )
                 elif (not show_live) and cat_arch is not None:
-                    chip = _severity_phrase_html(cat_arch, dir_arch, point_condition_phrase(cat_arch, dir_arch))
-                    _render_html(
-                        f"<div class='atmopulse-narrative-banner'>"
-                        f"{lead}, on {html.escape(arch_s)} the area of {addr} was{chip}."
-                        f"</div>"
+                    narrative_html = _point_note(
+                        addr, "was", lead, cat_arch, dir_arch, when=html.escape(arch_s),
                     )
             elif cat_live is not None or cat_arch is not None:
-                bits = []
                 if cat_live is not None:
-                    chip = _severity_phrase_html(cat_live, dir_live, point_condition_phrase(cat_live, dir_live))
-                    bits.append(f"on {html.escape(live_s)} the area of {addr} {left_verb}{chip}")
+                    narrative_left = _point_note(
+                        addr, left_verb, lead, cat_live, dir_live,
+                        when=html.escape(live_s), force_lead=True,
+                    )
                 if cat_arch is not None:
-                    chip = _severity_phrase_html(cat_arch, dir_arch, point_condition_phrase(cat_arch, dir_arch))
-                    if cat_live is not None:
-                        bits.append(f"on {html.escape(arch_s)} it was{chip}")
-                    else:
-                        bits.append(f"on {html.escape(arch_s)} the area of {addr} was{chip}")
-                _render_html(
-                    f"<div class='atmopulse-narrative-banner'>{lead}, {'; '.join(bits)}.</div>"
-                )
+                    narrative_right = _point_note(
+                        addr, "was", lead, cat_arch, dir_arch,
+                        when=html.escape(arch_s), force_lead=True,
+                    )
 
             t_live = df_live[col_target].values if col_target in df_live.columns else np.full(len(df_live), np.nan)
             t_arch = df_arch[col_target].values if col_target in df_arch.columns else np.full(len(df_arch), np.nan)
@@ -552,33 +656,21 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
                     min(z500_rng_live[0], z500_rng_arch[0]),
                     max(z500_rng_live[1], z500_rng_arch[1]),
                 )
-            vline_live = _vline_ms(df_live, left_when)
-            vline_arch = _vline_ms(df_arch, analog_target)
+            vline_live = None if is_archive else _vline_ms(df_live, left_when)
+            vline_arch = None
             title_live = f"{live_panel}<br>({live_s})"
             title_arch = f"{year_panel}<br>({arch_s})"
 
-            st.markdown(
-                f"<div class='atmopulse-map-legend atmopulse-subsection-label' "
-                f"style='margin-bottom: 6px; white-space: nowrap;'>"
-                f"<b>Legend.</b> "
-                f"<span style='padding-left: 4px;'>Warm:</span> "
-                f"<span style='{legend_badge_style('warm', 'above')}'>Above average</span> "
-                f"<span style='{legend_badge_style('warm', 'moderate')}'>Moderate</span> "
-                f"<span style='{legend_badge_style('warm', 'strong')}'>Strong</span> "
-                f"<span style='{legend_badge_style('warm', 'extreme')}'>Extreme</span> "
-                f"<span style='{legend_badge_style('warm', 'record')}'>Record</span>"
-                f"<span style='padding-left: 12px;'>Cold:</span> "
-                f"<span style='{legend_badge_style('cold', 'below')}'>Below average</span> "
-                f"<span style='{legend_badge_style('cold', 'moderate')}'>Moderate</span> "
-                f"<span style='{legend_badge_style('cold', 'strong')}'>Strong</span> "
-                f"<span style='{legend_badge_style('cold', 'extreme')}'>Extreme</span> "
-                f"<span style='{legend_badge_style('cold', 'record')}'>Record</span>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-
             heading = str(meteo_var)
             if map_layout == LAYOUT_SIDE_BY_SIDE:
+                if narrative_left or narrative_right:
+                    note_l, note_r = st.columns(2, gap="small")
+                    with note_l:
+                        if narrative_left:
+                            st.markdown(narrative_left, unsafe_allow_html=True)
+                    with note_r:
+                        if narrative_right:
+                            st.markdown(narrative_right, unsafe_allow_html=True)
                 fig_live = _build_meteogram_panel(traces_live, title_live, global_min, global_max, vline_live)
                 fig_arch = _build_meteogram_panel(traces_arch, title_arch, global_min, global_max, vline_arch)
                 with st.container(key="atmopulse_split_meteo"):
@@ -588,14 +680,34 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
                             fig_live, "meteogram_historical",
                             csv_text=df_live.to_csv(index=False),
                             export_title=_meteo_export_title(heading, date_epoch, left_when, panel=live_panel),
+                            show_footer=False,
                         )
                     with mc2:
                         st_plotly_press(
                             fig_arch, "meteogram_recent",
                             csv_text=df_arch.to_csv(index=False),
                             export_title=_meteo_export_title(heading, date_epoch, analog_target, panel=year_panel),
+                            show_footer=False,
+                        )
+                st.markdown(_temp_legend_html(), unsafe_allow_html=True)
+                with st.container(key="atmopulse_split_meteo_foot"):
+                    mc1, mc2 = st.columns(2, gap="small")
+                    with mc1:
+                        st_plotly_press(
+                            fig_live, "meteogram_historical",
+                            csv_text=df_live.to_csv(index=False),
+                            export_title=_meteo_export_title(heading, date_epoch, left_when, panel=live_panel),
+                            show_chart=False,
+                        )
+                    with mc2:
+                        st_plotly_press(
+                            fig_arch, "meteogram_recent",
+                            csv_text=df_arch.to_csv(index=False),
+                            export_title=_meteo_export_title(heading, date_epoch, analog_target, panel=year_panel),
+                            show_chart=False,
                         )
                 if use_z500:
+                    st.markdown("<div class='atmopulse-z500-gap'></div>", unsafe_allow_html=True)
                     st.markdown("**Z500 anomaly**", help=HELP["meteo_z500_panel"])
                     with st.container(key="atmopulse_split_meteo_z500"):
                         zc1, zc2 = st.columns(2, gap="small")
@@ -613,13 +725,30 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
                                 csv_text=z500_csv_arch,
                                 export_title=_meteo_export_title("Z500 anomaly", date_epoch, analog_target, panel=year_panel),
                             )
-            else:
-                flicker_choice = st.radio(
-                    "Show series:",
-                    (live_panel, year_panel),
-                    horizontal=True,
-                    key="met_year_pick",
+                st.markdown("<div class='atmopulse-meteo-yearly-gap'></div>", unsafe_allow_html=True)
+                fig_yr_live = build_yearly_extremes_chart(
+                    lat_target, lon_target, "A", col_target, wsdi=meteo_spell, csdi=meteo_spell,
+                    _ref_clim=ref_clim, _load_point_archive_series=_load_point_archive_series,
                 )
+                fig_yr_arch = build_yearly_extremes_chart(
+                    lat_target, lon_target, "B", col_target, wsdi=meteo_spell, csdi=meteo_spell,
+                    _ref_clim=ref_clim, _load_point_archive_series=_load_point_archive_series,
+                )
+                align_yearly_extremes_yranges(fig_yr_live, fig_yr_arch)
+                with st.container(key="atmopulse_split_meteo_yearly_dates"):
+                    yc1, yc2 = st.columns(2, gap="small")
+                    with yc1:
+                        st_plotly_press(
+                            fig_yr_live, "yearly_historical_dates",
+                            export_title=_meteo_export_title("Days exceeding thresholds", "A", left_when),
+                        )
+                    with yc2:
+                        st_plotly_press(
+                            fig_yr_arch, "yearly_recent_dates",
+                            export_title=_meteo_export_title("Days exceeding thresholds", "B", analog_target),
+                        )
+            else:
+                flicker_choice = st.session_state.get("met_year_pick", live_panel)
                 show_live = flicker_choice == live_panel
                 traces = traces_live if show_live else traces_arch
                 title = title_live if show_live else title_arch
@@ -632,8 +761,11 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
                     fig, f"meteogram_{'live' if show_live else 'year'}",
                     csv_text=df_csv.to_csv(index=False),
                     export_title=_meteo_export_title(heading, date_epoch, when, panel=panel),
+                    legend_html=_temp_legend_html(),
+                    note_html=narrative_html,
                 )
                 if use_z500:
+                    st.markdown("<div class='atmopulse-z500-gap'></div>", unsafe_allow_html=True)
                     st.markdown("**Z500 anomaly**", help=HELP["meteo_z500_panel"])
                     z_tr = z500_live if show_live else z500_arch
                     z_csv = z500_csv_live if show_live else z500_csv_arch
@@ -662,6 +794,9 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
             if is_archive:
                 plot_target_date = _archive_plot_target(df_live, archive_year)
                 cat_a = dir_a = cat_b = dir_b = None
+                narrative_html = None
+                narrative_left = None
+                narrative_right = None
             else:
                 plot_target_date = target_date
 
@@ -684,6 +819,9 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
                 )
 
                 cat_a = dir_a = cat_b = dir_b = None
+                narrative_html = None
+                narrative_left = None
+                narrative_right = None
                 # Only the exact calendar day. A missing row is a missing day —
                 # never snap to a neighbour and narrate the wrong date.
                 if active_date in df_indexed.index and col_target in df_indexed.columns:
@@ -700,23 +838,16 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
                         addr = html.escape(location.address)
                         if map_layout == LAYOUT_SINGLE_CHART:
                             cat_x, dir_x = (cat_a, dir_a) if met_active_epoch == "A" else (cat_b, dir_b)
-                            chip = _severity_phrase_html(cat_x, dir_x, point_condition_phrase(cat_x, dir_x))
                             lead = html.escape(baseline_against_lead(met_active_epoch))
-                            _render_html(
-                                f"<div class='atmopulse-narrative-banner'>"
-                                f"{lead}, the area of {addr} is currently{chip}."
-                                f"</div>"
-                            )
+                            narrative_html = _point_note(addr, "is currently", lead, cat_x, dir_x)
                         else:
-                            a_html = _severity_phrase_html(cat_a, dir_a, point_condition_phrase(cat_a, dir_a))
-                            b_html = _severity_phrase_html(cat_b, dir_b, point_condition_phrase(cat_b, dir_b))
-                            lead_a = html.escape(baseline_against_lead("A"))
-                            lead_b = html.escape(baseline_against_lead("B"))
-                            _render_html(
-                                f"<div class='atmopulse-narrative-banner'>"
-                                f"{lead_a}, the area of {addr} is currently{a_html}. "
-                                f"{lead_b}, it is{b_html}."
-                                f"</div>"
+                            narrative_left = _point_note(
+                                addr, "is currently", html.escape(baseline_against_lead("A")), cat_a, dir_a,
+                                force_lead=True,
+                            )
+                            narrative_right = _point_note(
+                                addr, "is currently", html.escape(baseline_against_lead("B")), cat_b, dir_b,
+                                force_lead=True,
                             )
 
             t_arr = (
@@ -746,33 +877,14 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
                     max(z500_rng_a[1], z500_rng_b[1]),
                 )
             vline_x = tgt_dt_norm.timestamp() * 1000
-            if is_archive and not _archive_day_available(df_live, plot_target_date):
+            if is_archive and (
+                map_layout == LAYOUT_SINGLE_CHART
+                or not _archive_day_available(df_live, plot_target_date)
+            ):
                 vline_x = None
             title_a = epoch_period_label("A")
             title_b = epoch_period_label("B")
 
-            # Five warm + five cold chips. Moderate/Strong/Extreme/Record share
-            # the Map Tracker palette; Above/Below average are the pale extras.
-            st.markdown(
-                f"<div class='atmopulse-map-legend atmopulse-subsection-label' "
-                f"style='margin-bottom: 6px; white-space: nowrap;'>"
-                f"<b>Legend.</b> "
-                f"<span style='padding-left: 4px;'>Warm:</span> "
-                f"<span style='{legend_badge_style('warm', 'above')}'>Above average</span> "
-                f"<span style='{legend_badge_style('warm', 'moderate')}'>Moderate</span> "
-                f"<span style='{legend_badge_style('warm', 'strong')}'>Strong</span> "
-                f"<span style='{legend_badge_style('warm', 'extreme')}'>Extreme</span> "
-                f"<span style='{legend_badge_style('warm', 'record')}'>Record</span>"
-                f"<span style='padding-left: 12px;'>Cold:</span> "
-                f"<span style='{legend_badge_style('cold', 'below')}'>Below average</span> "
-                f"<span style='{legend_badge_style('cold', 'moderate')}'>Moderate</span> "
-                f"<span style='{legend_badge_style('cold', 'strong')}'>Strong</span> "
-                f"<span style='{legend_badge_style('cold', 'extreme')}'>Extreme</span> "
-                f"<span style='{legend_badge_style('cold', 'record')}'>Record</span>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-            
             if map_layout == LAYOUT_SIDE_BY_SIDE:
                 live_csv = df_live.to_csv(index=False)
                 fig_a = _build_meteogram_panel(
@@ -782,19 +894,45 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
                     traces_b, title_b, global_min, global_max, vline_x,
                 )
                 heading = str(meteo_var)
+                if narrative_left or narrative_right:
+                    note_l, note_r = st.columns(2, gap="small")
+                    with note_l:
+                        if narrative_left:
+                            st.markdown(narrative_left, unsafe_allow_html=True)
+                    with note_r:
+                        if narrative_right:
+                            st.markdown(narrative_right, unsafe_allow_html=True)
                 with st.container(key="atmopulse_split_meteo"):
                     mc1, mc2 = st.columns(2, gap="small")
                     with mc1:
                         st_plotly_press(
                             fig_a, "meteogram_historical", csv_text=live_csv,
                             export_title=_meteo_export_title(heading, "A", plot_target_date),
+                            show_footer=False,
                         )
                     with mc2:
                         st_plotly_press(
                             fig_b, "meteogram_recent", csv_text=live_csv,
                             export_title=_meteo_export_title(heading, "B", plot_target_date),
+                            show_footer=False,
+                        )
+                st.markdown(_temp_legend_html(), unsafe_allow_html=True)
+                with st.container(key="atmopulse_split_meteo_foot"):
+                    mc1, mc2 = st.columns(2, gap="small")
+                    with mc1:
+                        st_plotly_press(
+                            fig_a, "meteogram_historical", csv_text=live_csv,
+                            export_title=_meteo_export_title(heading, "A", plot_target_date),
+                            show_chart=False,
+                        )
+                    with mc2:
+                        st_plotly_press(
+                            fig_b, "meteogram_recent", csv_text=live_csv,
+                            export_title=_meteo_export_title(heading, "B", plot_target_date),
+                            show_chart=False,
                         )
                 if use_z500:
+                    st.markdown("<div class='atmopulse-z500-gap'></div>", unsafe_allow_html=True)
                     st.markdown("**Z500 anomaly**", help=HELP["meteo_z500_panel"])
                     fig_z_a = _build_z500_panel(z500_a, z500_ylim, vline_x)
                     fig_z_b = _build_z500_panel(z500_b, z500_ylim, vline_x)
@@ -830,15 +968,6 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
                             export_title=_meteo_export_title("Days exceeding thresholds", "B", plot_target_date),
                         )
             else:
-                # Same widget key ("met_ep") whose value we already read into
-                # `met_active_epoch` above (before the narrative text was built) —
-                # re-rendering it here just places it at its usual spot below the chart.
-                flicker_epoch = st.radio(
-                    "Select Reference Period:",
-                    (epoch_period_label("A"), epoch_period_label("B")),
-                    horizontal=True, key="met_ep", index=1,
-                )
-                met_active_epoch = epoch_from_label(flicker_epoch)
                 traces = traces_a if met_active_epoch == "A" else traces_b
                 z500_tr = z500_a if met_active_epoch == "A" else z500_b
                 fig = _build_meteogram_panel(
@@ -849,8 +978,11 @@ def render_meteogram(location, lat_target, lon_target, meteo_var, meteo_env, tar
                     fig, f"meteogram_{met_active_epoch}",
                     csv_text=df_live.to_csv(index=False),
                     export_title=_meteo_export_title(str(meteo_var), met_active_epoch, plot_target_date),
+                    legend_html=_temp_legend_html(),
+                    note_html=narrative_html,
                 )
                 if use_z500:
+                    st.markdown("<div class='atmopulse-z500-gap'></div>", unsafe_allow_html=True)
                     st.markdown("**Z500 anomaly**", help=HELP["meteo_z500_panel"])
                     fig_z = _build_z500_panel(z500_tr, z500_ylim, vline_x)
                     st_plotly_press(

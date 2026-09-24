@@ -81,7 +81,7 @@ HELP: dict[str, str] = {
         "Available from 1 Jan 1940 through 5 days before today."
     ),
     "map_date_epoch": (
-        "Climatology used to colour both dates. Default is the recent 1996–2025 baseline "
+        "Reference period used to colour both dates. Default is the recent 1996–2025 baseline "
         "so the two dates are judged on the same scale."
     ),
     "map_variable": (
@@ -131,7 +131,7 @@ HELP: dict[str, str] = {
     ),
     "mslp_anomaly": (
         "Sea-level pressure minus the 5-day day-of-year mean of the map's selected reference "
-        "period (1961–1990 or 1996–2025). Isolines every 2 hPa (tighter than the 5 hPa absolute "
+        "period (1961–1990 or 1996–2025). Isolines every 3 hPa (tighter than the 5 hPa absolute "
         "field, which otherwise hides typical ±4…±15 hPa departures); "
         "solid = above that baseline, dashed = below. The two maps therefore differ even though "
         "the observed field is the same."

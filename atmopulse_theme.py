@@ -124,6 +124,8 @@ def atmopulse_streamlit_css(brand: dict) -> str:
     s = ATMOPULSE_FONTS["sora_css"]
     lw = ATMOPULSE_FONTS["logo_weight"]
     uw = ATMOPULSE_FONTS["ui_weight"]
+    from config import FORECAST_OFFSET_MAX, FORECAST_OFFSET_MIN
+    _zero_pct = (0 - FORECAST_OFFSET_MIN) / (FORECAST_OFFSET_MAX - FORECAST_OFFSET_MIN) * 100
     map_uri = _svg_data_uri(MAP_TRACKER_SVG)
     meteo_uri = _svg_data_uri(METEOGRAM_SVG)
     wave_uri = _svg_data_uri(WAVOGRAM_SVG)
@@ -148,7 +150,7 @@ div[data-testid="stIFrame"]:has(iframe[height="0"]),
     border-radius: 12px !important;
     box-shadow: 0 4px 10px rgba(0,0,0,0.05) !important;
     padding: 8px 16px !important; 
-    margin-bottom: 20px !important;
+    margin-bottom: 0.35rem !important;
     display: flex !important; 
     flex-direction: row !important;
     flex-wrap: nowrap !important;
@@ -216,7 +218,8 @@ div[data-testid="stIFrame"]:has(iframe[height="0"]),
 /* Pull the sidebar content closer to the top so the (now larger) logo sits
    higher on the page instead of leaving a big gap above it. */
 section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{
-    padding-top: 0.75rem !important;
+    padding-top: 0.4rem !important;
+    padding-bottom: 0.35rem !important;
 }}
 .atmopulse-nav-logo span,
 .atmopulse-sidebar-logo span {{ 
@@ -380,7 +383,23 @@ section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{
     background: transparent !important;
 }}
 section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
-    margin-bottom: 12px !important;
+    margin-bottom: 8px !important;
+    margin-left: -10px !important;
+}}
+.st-key-map_archive_mode + [data-testid="stElementContainer"] {{
+    margin-top: 0.95rem !important;
+    margin-bottom: 0.95rem !important;
+}}
+.st-key-map_archive_mode + [data-testid="stElementContainer"] hr {{
+    margin: 0 !important;
+}}
+.st-key-forecast_model {{
+    margin-top: 0.2rem !important;
+    margin-bottom: 0.55rem !important;
+}}
+.st-key-offset_slider {{
+    margin-top: 0.45rem !important;
+    margin-bottom: 0.35rem !important;
 }}
 .st-key-atmopulse_ui_mode [data-testid="stRadio"] > div[role="radiogroup"] {{
     display: inline-flex !important;
@@ -404,7 +423,7 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     justify-content: center !important;
     text-align: center !important;
     margin: 0 !important;
-    padding: 8px 18px !important;
+    padding: 5px 12px !important;
     border: none !important;
     outline: none !important;
     box-shadow: none !important;
@@ -429,7 +448,7 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
 .st-key-atmopulse_ui_mode [data-testid="stRadio"] > div[role="radiogroup"] > label p,
 .st-key-atmopulse_ui_mode [data-testid="stRadio"] > div[role="radiogroup"] > label span {{
     font-family: {o} !important;
-    font-size: 15px !important;
+    font-size: 13px !important;
     font-weight: {uw} !important;
     color: {brand['text_on_light']} !important;
     line-height: 1.2 !important;
@@ -494,22 +513,24 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     border: none !important;
 }}
 
-/* Forecast Offset slider — force the native -7 / +3 tick labels to stay
-   permanently visible (not just on hover), and make our injected "0" label
-   share the exact same size/weight/color so all three anchors match. */
-.st-key-offset_slider [data-testid="stTickBar"],
-.st-key-offset_slider [data-testid="stTickBarMin"],
-.st-key-offset_slider [data-testid="stTickBarMax"] {{
+/* Forecast Offset: keep the end ticks visible, and mirror the value "0"
+   directly under the thumb's "0" (same face, colour, and size). */
+.st-key-offset_slider [data-testid="stSliderTickBar"] {{
     opacity: 1 !important;
     visibility: visible !important;
 }}
-.st-key-offset_slider [data-testid="stTickBarMin"],
-.st-key-offset_slider [data-testid="stTickBarMax"],
-.st-key-offset_slider .atmopulse-slider-zero {{
-    font-size: 14px !important;
-    font-weight: 600 !important;
-    color: #31333F !important;
-    line-height: 1 !important;
+.st-key-offset_slider [data-testid="stSliderTickBar"]::after {{
+    content: "0";
+    position: absolute;
+    left: {_zero_pct}%;
+    top: 0;
+    transform: translateX(-50%);
+    font-family: {o} !important;
+    font-size: 0.875rem !important;
+    font-weight: {uw} !important;
+    line-height: 1.6 !important;
+    color: {brand['primary']} !important;
+    pointer-events: none;
 }}
 
 /* Side-by-side A/B compare: one vertical brand-blue divider. Used by Map
@@ -525,23 +546,27 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     width: 50% !important;
     max-width: 50% !important;
     box-sizing: border-box !important;
-    padding: 0 10px !important;
+    padding: 0 !important;
     margin: 0 !important;
     min-width: 0 !important;
-    overflow-x: auto !important;
+    overflow: visible !important;
     position: relative !important;
 }}
 [class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
 [class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
+    padding-right: 10px !important;
     box-shadow: inset -2px 0 0 0 {_hex_to_rgba(brand['primary'], 0.55)} !important;
 }}
-/* Extra air before the divider belongs on the table row only. The map
-   columns keep equal padding so the two frames stay the same size. */
+[class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child,
+[class*="st-key-atmopulse_split"] [data-testid="stHorizontalBlock"] > [data-testid="column"]:last-child {{
+    padding-left: 10px !important;
+}}
+/* Same small inset from the centre line on the table row as on the maps. */
 .st-key-atmopulse_split_map_tables [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
 .st-key-atmopulse_split_map_tables [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child,
 .st-key-atmopulse_split_map_tables_overlay [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child,
 .st-key-atmopulse_split_map_tables_overlay [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
-    padding-right: 28px !important;
+    padding-right: 10px !important;
 }}
 /* Press buttons are a nested row. Keep them content-sized; the 50% column
    rule and the table gap must not spread SVG / PDF / CSV apart. */
@@ -573,6 +598,10 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
 [class*="st-key-atmopulse_split"] [data-testid="stColumn"] [data-testid="stHorizontalBlock"] > [data-testid="column"]:first-child {{
     box-shadow: none !important;
     padding-right: 10px !important;
+}}
+[class*="st-key-atmopulse_split"] [data-testid="stColumn"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child,
+[class*="st-key-atmopulse_split"] [data-testid="stColumn"] [data-testid="stHorizontalBlock"] > [data-testid="column"]:last-child {{
+    padding-left: 0 !important;
 }}
 [class*="st-key-atmopulse_split"] [data-testid="stDataFrame"],
 [class*="st-key-atmopulse_split"] [data-testid="stDataFrame"] > div {{
@@ -614,6 +643,20 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     }}
 }}
 
+.atmopulse-europe-share-gap {{
+    height: 2.1rem;
+}}
+.atmopulse-map-table-gap {{
+    height: 0.85rem;
+}}
+.atmopulse-panel-credit {{
+    font-family: {o} !important;
+    font-size: 11px !important;
+    font-weight: {uw} !important;
+    color: rgba(49, 51, 63, 0.62) !important;
+    line-height: 1.35 !important;
+    margin: 1.15rem 0 0.35rem 0 !important;
+}}
 .atmopulse-sev-pair {{
     display: flex !important;
     flex-direction: row !important;
@@ -700,10 +743,41 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     line-height: 1.3 !important;
 }}
 .atmopulse-map-credit {{
-    margin: -2px 0 10px 0 !important;
+    height: 0 !important;
+    margin: 0 10px 0 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+    text-align: right !important;
+    font-size: 11px !important;
+    line-height: 1.15 !important;
+    position: relative !important;
+    z-index: 6 !important;
+    top: -18px !important;
+    pointer-events: none !important;
+    background: rgba(255,255,255,0.78);
+    width: fit-content !important;
+    margin-left: auto !important;
 }}
 .atmopulse-chart-credit {{
-    margin: -18px 0 6px 0 !important;
+    height: 0 !important;
+    margin: 0 0 0 48px !important;
+    padding: 0 !important;
+    overflow: visible !important;
+    text-align: left !important;
+    font-size: 11px !important;
+    line-height: 1.15 !important;
+    position: relative !important;
+    z-index: 6 !important;
+    top: -22px !important;
+    pointer-events: none !important;
+    background: rgba(255,255,255,0.78);
+    width: fit-content !important;
+}}
+[data-testid="stElementContainer"]:has(.atmopulse-map-legend) + [data-testid="stElementContainer"] .atmopulse-chart-credit,
+[data-testid="stElementContainer"]:has(.atmopulse-map-legend) + [data-testid="stElementContainer"] .atmopulse-map-credit,
+[data-testid="stElementContainer"]:has(.atmopulse-narrative-banner.is-under-figure) + [data-testid="stElementContainer"] .atmopulse-chart-credit,
+[data-testid="stElementContainer"]:has(.atmopulse-narrative-banner.is-under-figure) + [data-testid="stElementContainer"] .atmopulse-map-credit {{
+    margin-top: 4px !important;
 }}
 /* Markdown help icons are pinned to the right of a full-width element.
    Shrink that element to the title so the icon sits directly after the text. */
@@ -734,24 +808,32 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
 }}
 .st-key-map_a,
 .st-key-map_b,
-.st-key-map_flicker {{
+.st-key-map_flicker,
+.st-key-map_opacity {{
     position: relative !important;
     aspect-ratio: 70 / 42 !important;
     width: 100% !important;
     height: auto !important;
+    flex: 0 0 auto !important;
     max-width: 100% !important;
     overflow: hidden !important;
 }}
-/* Same Europe frame as Flicker (70:42). Percentage padding is of the width,
-   so the map stays 42/70 tall and the extra 68px holds the cross-fade slider. */
-.st-key-map_opacity {{
-    position: relative !important;
-    width: 100% !important;
-    height: 0 !important;
-    padding-top: calc(60% + 68px) !important;
-    aspect-ratio: auto !important;
-    max-width: 100% !important;
-    overflow: hidden !important;
+.ap-opacity-ctrl {{
+    display: flex !important;
+    align-items: center !important;
+    gap: 10px !important;
+    margin: 12px 2px 0 2px !important;
+    font-family: {o} !important;
+    font-size: 13px !important;
+    font-weight: 400 !important;
+    color: #31333F !important;
+}}
+.ap-opacity-ctrl span {{
+    white-space: nowrap !important;
+}}
+.ap-opacity-ctrl input[type="range"] {{
+    flex: 1 1 auto !important;
+    accent-color: {brand['primary']} !important;
 }}
 .st-key-map_a > div,
 .st-key-map_b > div,
@@ -779,6 +861,28 @@ section[data-testid="stSidebar"] .st-key-atmopulse_ui_mode {{
     height: 100% !important;
     max-width: 100% !important;
     max-height: 100% !important;
+}}
+/* Plotly keeps the drawing at the size of its first layout. Stretch that
+   SVG to the frame so the field fills the map instead of sitting inside it.
+   The opacity slider is HTML under the frame, so this stretch stays on the map. */
+.st-key-map_a svg.main-svg,
+.st-key-map_b svg.main-svg,
+.st-key-map_flicker svg.main-svg,
+.st-key-map_opacity svg.main-svg {{
+    width: 100% !important;
+    height: 100% !important;
+    max-width: none !important;
+    max-height: none !important;
+}}
+.st-key-swipe_map_frame + [data-testid="stElementContainer"] .atmopulse-map-legend,
+[data-testid="stElementContainer"]:has(.ap-opacity-ctrl) + [data-testid="stElementContainer"] .atmopulse-map-legend {{
+    margin-top: 8px !important;
+}}
+[data-testid="stHtml"]:has(.ap-map-fit) {{
+    height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: hidden !important;
 }}
 
 /* Compact left-aligned press-export buttons; SVG, PDF, and CSV sit together. */
@@ -810,16 +914,65 @@ div[class*="st-key-press-row"] button {{
     line-height: 1.2 !important;
     white-space: nowrap !important;
 }}
+div[class*="st-key-wave_event_foot_"] {{
+    width: max-content !important;
+    max-width: 100% !important;
+    gap: 0.35rem !important;
+}}
+div[class*="st-key-wave_event_foot_"] > [data-testid="stElementContainer"] {{
+    margin-bottom: 0 !important;
+}}
+div[class*="st-key-wave_event_foot_"] > [data-testid="stElementContainer"]:last-child {{
+    width: 0 !important;
+    min-width: 100% !important;
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+}}
+div[class*="st-key-wave_event_foot_"] [data-testid="stButton"] button {{
+    width: 100% !important;
+    min-width: 0 !important;
+    min-height: 1.65rem !important;
+    height: 1.65rem !important;
+    padding: 0.12rem 0.7rem !important;
+    font-size: 12px !important;
+    line-height: 1.2 !important;
+    white-space: nowrap !important;
+}}
 div[class*="st-key-press-row-map_"] {{
-    margin-bottom: 1rem !important;
+    margin-bottom: 0 !important;
 }}
 .atmopulse-meteo-yearly-gap {{
     height: 1.75rem !important;
 }}
+.atmopulse-z500-gap {{
+    height: 0.95rem;
+}}
+.st-key-press-row-meteogram_A,
+.st-key-press-row-meteogram_B,
+.st-key-press-row-meteogram_live,
+.st-key-press-row-meteogram_year {{
+    margin-top: 0.45rem !important;
+}}
+.st-key-atmopulse_split_meteo_foot {{
+    margin-top: 0.45rem !important;
+}}
 
-/* Swipe compare now renders both maps inside one self-contained
-   components.html iframe (see render_swipe_compare_map in
-   frontend_plots.py) — no outer .st-key-* CSS is needed for it. */
+/* Swipe iframe is given height=900 so the map can lay out. The used box
+   follows the map (70×42) plus the slider, which drops the empty band
+   without shrinking the drawing. */
+.st-key-swipe_map_frame,
+.st-key-swipe_map_frame [data-testid="stElementContainer"],
+.st-key-swipe_map_frame .stElementContainer {{
+    height: auto !important;
+    flex: 0 0 auto !important;
+}}
+.st-key-swipe_map_frame iframe {{
+    width: 100% !important;
+    aspect-ratio: 70 / 45.2 !important;
+    display: block !important;
+    border: 0 !important;
+    overflow: hidden !important;
+}}
 
 /* Sidebar: Filters & Controls */
 section[data-testid="stSidebar"] {{
@@ -849,10 +1002,106 @@ section[data-testid="stSidebar"] .stRadio > div {{
 .st-key-map_archive_mode [data-testid="stRadio"] div[role="radiogroup"] {{
     gap: 1.35rem !important;
 }}
+/* Compare, Map Layout, and the period choice sit on one row with equal gaps,
+   so Map Layout is centred between the other two. They stack on a phone. */
+.st-key-map_top_controls [data-testid="stHorizontalBlock"] {{
+    justify-content: space-between !important;
+    align-items: flex-start !important;
+}}
+.st-key-map_top_controls [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+.st-key-map_top_controls [data-testid="stHorizontalBlock"] > [data-testid="column"] {{
+    flex: 0 0 auto !important;
+    width: auto !important;
+    max-width: none !important;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+}}
+@media (max-width: 820px) {{
+    .st-key-map_top_controls [data-testid="stHorizontalBlock"] {{
+        flex-wrap: wrap !important;
+        justify-content: flex-start !important;
+        row-gap: 0.6rem !important;
+    }}
+    .st-key-map_top_controls [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+    .st-key-map_top_controls [data-testid="stHorizontalBlock"] > [data-testid="column"] {{
+        flex: 1 1 100% !important;
+        width: 100% !important;
+        max-width: 100% !important;
+    }}
+}}
+/* Meteogram: Compare left, Layout centred, reference period on the right.
+   Wavogram: Layout left, reference period centred. */
+.st-key-met_top_controls [data-testid="stHorizontalBlock"],
+.st-key-wave_top_controls [data-testid="stHorizontalBlock"] {{
+    position: relative !important;
+    justify-content: flex-start !important;
+    align-items: flex-start !important;
+    width: 100% !important;
+}}
+.st-key-met_top_controls [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+.st-key-met_top_controls [data-testid="stHorizontalBlock"] > [data-testid="column"],
+.st-key-wave_top_controls [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+.st-key-wave_top_controls [data-testid="stHorizontalBlock"] > [data-testid="column"] {{
+    flex: 0 0 auto !important;
+    width: auto !important;
+    max-width: none !important;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+}}
+.st-key-wave_top_controls [data-testid="stHorizontalBlock"] > :nth-child(2) {{
+    position: absolute !important;
+    left: 50% !important;
+    top: 0 !important;
+    transform: translateX(-50%) !important;
+}}
+.st-key-met_top_controls [data-testid="stHorizontalBlock"] {{
+    justify-content: space-between !important;
+}}
+.st-key-met_top_controls [data-testid="stHorizontalBlock"] > :nth-child(2),
+.st-key-met_top_controls [data-testid="stHorizontalBlock"] > :nth-child(3),
+.st-key-met_top_controls [data-testid="stHorizontalBlock"] > :nth-child(4) {{
+    position: static !important;
+    left: auto !important;
+    top: auto !important;
+    transform: none !important;
+    margin-left: 0 !important;
+}}
+.st-key-met_top_controls .st-key-met_archive_year [data-testid="stSelectbox"] {{
+    width: 8.5rem !important;
+}}
+@media (max-width: 820px) {{
+    .st-key-met_top_controls [data-testid="stHorizontalBlock"],
+    .st-key-wave_top_controls [data-testid="stHorizontalBlock"] {{
+        flex-wrap: wrap !important;
+        justify-content: flex-start !important;
+        row-gap: 0.6rem !important;
+    }}
+    .st-key-met_top_controls [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+    .st-key-met_top_controls [data-testid="stHorizontalBlock"] > [data-testid="column"],
+    .st-key-wave_top_controls [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+    .st-key-wave_top_controls [data-testid="stHorizontalBlock"] > [data-testid="column"],
+    .st-key-met_top_controls [data-testid="stHorizontalBlock"] > :nth-child(2),
+    .st-key-met_top_controls [data-testid="stHorizontalBlock"] > :nth-child(3),
+    .st-key-met_top_controls [data-testid="stHorizontalBlock"] > :nth-child(4),
+    .st-key-wave_top_controls [data-testid="stHorizontalBlock"] > :nth-child(2) {{
+        position: static !important;
+        left: auto !important;
+        top: auto !important;
+        transform: none !important;
+        flex: 1 1 100% !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        margin-left: 0 !important;
+    }}
+    .st-key-met_top_controls .st-key-met_archive_year [data-testid="stSelectbox"] {{
+        width: 100% !important;
+    }}
+}}
 /* Help icons sit on the label text, not at the far end of the date field. */
 .st-key-map_archive_date [data-testid="stWidgetLabel"],
 .st-key-map_compare_date [data-testid="stWidgetLabel"],
 .st-key-met_archive_year [data-testid="stWidgetLabel"],
+.st-key-met_compare_year [data-testid="stWidgetLabel"],
 .st-key-wave_drill_ms [data-testid="stWidgetLabel"] {{
     width: fit-content !important;
     max-width: 100% !important;
@@ -860,10 +1109,219 @@ section[data-testid="stSidebar"] .stRadio > div {{
     gap: 0.35rem !important;
 }}
 .st-key-met_archive_year [data-testid="stTooltipIcon"],
+.st-key-met_compare_year [data-testid="stTooltipIcon"],
 .st-key-wave_drill_ms [data-testid="stTooltipIcon"] {{
     position: static !important;
     top: auto !important;
     right: auto !important;
+}}
+.st-key-met_year_row {{
+    position: relative !important;
+}}
+.st-key-met_year_row [data-testid="stHorizontalBlock"] > :nth-child(1),
+.st-key-met_year_row [data-testid="stHorizontalBlock"] > :nth-child(2) {{
+    flex: 0 0 8.4rem !important;
+    width: 8.4rem !important;
+    max-width: 8.4rem !important;
+}}
+.st-key-met_year_row .st-key-met_archive_year [data-testid="stSelectbox"],
+.st-key-met_year_row .st-key-met_compare_year [data-testid="stSelectbox"] {{
+    width: 7.6rem !important;
+}}
+.st-key-met_top_controls [data-testid="stHorizontalBlock"] > :nth-child(2) [data-testid="stRadio"] + [data-testid="stElementContainer"] {{
+    margin-top: 0.15rem !important;
+}}
+.atmopulse-date-title-gap {{
+    height: 18px;
+}}
+[data-testid="stElementContainer"]:has(.atmopulse-date-title-gap) {{
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+}}
+/* Archive / compare clocks: the date field is 75% of the row, and
+   Day before / Day after sit in the remaining space, vertically centred. */
+.st-key-map_archive_clock,
+.st-key-map_compare_clock {{
+    display: flex !important;
+    flex-direction: row !important;
+    flex-wrap: nowrap !important;
+    align-items: center !important;
+    gap: 0.75rem !important;
+}}
+.st-key-map_archive_clock > [data-testid="stElementContainer"]:first-child,
+.st-key-map_compare_clock > [data-testid="stElementContainer"]:first-child {{
+    flex: 0 0 75% !important;
+    width: 75% !important;
+    max-width: 75% !important;
+    min-width: 0 !important;
+}}
+.st-key-map_archive_clock > [data-testid="stElementContainer"]:last-child,
+.st-key-map_compare_clock > [data-testid="stElementContainer"]:last-child {{
+    flex: 1 1 auto !important;
+    width: auto !important;
+    max-width: none !important;
+    min-width: 0 !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+}}
+.st-key-map_archive_clock [data-testid="stHorizontalBlock"],
+.st-key-map_compare_clock [data-testid="stHorizontalBlock"] {{
+    width: 100% !important;
+    gap: 0.4rem !important;
+    align-items: center !important;
+    justify-content: center !important;
+}}
+.st-key-map_archive_clock button,
+.st-key-map_compare_clock button {{
+    text-align: center !important;
+    line-height: 1.15 !important;
+    padding-left: 0.35rem !important;
+    padding-right: 0.35rem !important;
+}}
+.st-key-map_archive_clock button p,
+.st-key-map_compare_clock button p {{
+    font-size: 1rem !important;
+    white-space: nowrap !important;
+    text-align: center !important;
+    line-height: 1.15 !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+}}
+.st-key-map_archive_clock [data-baseweb="input"] input,
+.st-key-map_compare_clock [data-baseweb="input"] input {{
+    font-size: 1rem !important;
+}}
+/* Two dates share one row. Each date field is half of its column so
+   Day before / Day after keep the other half and the label stays inside. */
+.st-key-map_date_pair .st-key-map_archive_clock,
+.st-key-map_date_pair .st-key-map_compare_clock {{
+    align-items: flex-end !important;
+    gap: 0.4rem !important;
+}}
+.st-key-map_date_pair .st-key-map_archive_clock > :first-child {{
+    flex: 0 0 50% !important;
+    width: 50% !important;
+    max-width: 50% !important;
+    min-width: 0 !important;
+}}
+.st-key-map_date_pair .st-key-map_compare_clock > :first-child {{
+    flex: 0 0 35% !important;
+    width: 35% !important;
+    max-width: 35% !important;
+    min-width: 0 !important;
+}}
+.st-key-map_date_pair .st-key-map_archive_clock > :last-child,
+.st-key-map_date_pair .st-key-map_compare_clock > :last-child {{
+    flex: 0 0 35% !important;
+    width: 35% !important;
+    max-width: 35% !important;
+    min-width: 0 !important;
+    margin-right: auto !important;
+    padding-bottom: 0.15rem !important;
+}}
+.st-key-map_date_pair .st-key-map_archive_clock [data-testid="stHorizontalBlock"] > div,
+.st-key-map_date_pair .st-key-map_compare_clock [data-testid="stHorizontalBlock"] > div {{
+    min-width: 0 !important;
+    flex: 1 1 0 !important;
+    width: auto !important;
+}}
+.st-key-map_date_pair .st-key-map_archive_clock button,
+.st-key-map_date_pair .st-key-map_compare_clock button {{
+    min-width: 0 !important;
+    max-width: 100% !important;
+    width: 100% !important;
+    overflow: visible !important;
+    padding: 0.3rem 0.35rem !important;
+}}
+.st-key-map_date_pair .st-key-map_archive_clock button p,
+.st-key-map_date_pair .st-key-map_compare_clock button p {{
+    font-size: 1rem !important;
+    line-height: 1.15 !important;
+    white-space: nowrap !important;
+    text-align: center !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+    margin: 0 !important;
+}}
+.st-key-map_synoptic_overlays [data-testid="stCaptionContainer"] p {{
+    font-size: 0.75rem !important;
+    line-height: 1.35 !important;
+}}
+.st-key-map_live_day_buttons [data-testid="stHorizontalBlock"] {{
+    gap: 0.3rem !important;
+}}
+.st-key-map_live_day_buttons button {{
+    padding: 0.4rem 0.2rem !important;
+    overflow: visible !important;
+}}
+.st-key-map_live_day_buttons button,
+.st-key-map_live_day_buttons button p {{
+    white-space: nowrap !important;
+    text-align: center !important;
+    line-height: 1.15 !important;
+    font-size: 0.78rem !important;
+}}
+.st-key-map_target_date [data-testid="stAlert"] {{
+    flex-wrap: nowrap !important;
+    align-items: center !important;
+}}
+.st-key-map_target_date [data-testid="stAlert"],
+.st-key-map_target_date [data-testid="stAlert"] p,
+.st-key-map_target_date [data-testid="stAlert"] span,
+.st-key-map_target_date [data-testid="stAlert"] strong {{
+    font-size: 14px !important;
+    line-height: 1.15 !important;
+    white-space: nowrap !important;
+}}
+.st-key-wave_z500_outline {{
+    margin-top: 0.85rem !important;
+    width: fit-content !important;
+    max-width: 100% !important;
+}}
+.st-key-wave_z500_outline [data-testid="stCheckbox"] {{
+    width: fit-content !important;
+    max-width: 100% !important;
+    display: flex !important;
+    flex-direction: row !important;
+    align-items: flex-start !important;
+    gap: 0.2rem !important;
+}}
+.st-key-wave_z500_outline label {{
+    width: auto !important;
+    max-width: 100% !important;
+}}
+.st-key-wave_z500_outline [data-testid="stTooltipIcon"] {{
+    position: static !important;
+    inset: auto !important;
+    margin: 0.12rem 0 0 0 !important;
+    transform: none !important;
+    flex: 0 0 auto !important;
+}}
+div:has(> .st-key-atmopulse_nav_bar) + [data-testid="stElementContainer"] {{
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+}}
+.st-key-atmopulse_nav_bar + div hr,
+.st-key-atmopulse_nav_bar + div [data-testid="stDivider"],
+div:has(> .st-key-atmopulse_nav_bar) + [data-testid="stElementContainer"] hr,
+div:has(> .st-key-atmopulse_nav_bar) + [data-testid="stElementContainer"] [data-testid="stDivider"] {{
+    margin-top: 0.15rem !important;
+    margin-bottom: 0.35rem !important;
+}}
+@media (max-width: 820px) {{
+    .st-key-map_archive_clock,
+    .st-key-map_compare_clock {{
+        flex-wrap: wrap !important;
+    }}
+    .st-key-map_archive_clock > [data-testid="stElementContainer"]:first-child,
+    .st-key-map_compare_clock > [data-testid="stElementContainer"]:first-child,
+    .st-key-map_archive_clock > [data-testid="stElementContainer"]:last-child,
+    .st-key-map_compare_clock > [data-testid="stElementContainer"]:last-child {{
+        flex: 1 1 100% !important;
+        width: 100% !important;
+        max-width: 100% !important;
+    }}
 }}
 section[data-testid="stSidebar"] div[data-testid="stRadio"] label p,
 section[data-testid="stSidebar"] [data-testid="stCheckbox"] label,
@@ -914,6 +1372,22 @@ section[data-testid="stSidebar"] [data-baseweb="select"] {{
     font-weight: {uw} !important;
 }}
 
+/* Main column uses the width beside the sidebar. Side padding stays tight
+   so the map frames, not the margins, take the screen. */
+[data-testid="stMainBlockContainer"].block-container {{
+    max-width: none !important;
+    width: 100% !important;
+    padding-top: 0.75rem !important;
+    padding-left: 1rem !important;
+    padding-right: 0.2rem !important;
+    padding-bottom: 2rem !important;
+}}
+section[data-testid="stSidebar"][aria-expanded="true"] {{
+    width: 15.5rem !important;
+    min-width: 15.5rem !important;
+    max-width: 15.5rem !important;
+}}
+
 /* Main content: UI labels & Headings */
 .main .block-container, 
 .main .block-container h1, 
@@ -933,14 +1407,82 @@ section[data-testid="stSidebar"] [data-baseweb="select"] {{
     font-weight: {uw} !important;
 }}
 
-.atmopulse-location-banner {{
-    background-color: {brand['nav_bg']} !important;
-    color: {brand['text_on_light']} !important;
-    padding: 0.75rem 1rem !important;
-    border-radius: 0.5rem !important;
+.atmopulse-data-vintage {{
+    font-size: 12px !important;
+    color: #555 !important;
+    margin-top: 0.7rem !important;
+    margin-bottom: 0.85rem !important;
+}}
+.atmopulse-data-vintage.is-disabled {{
+    color: rgba(0, 0, 0, 0.4) !important;
+}}
+.st-key-target_location_row {{
+    margin-top: 0.7rem !important;
+    margin-bottom: 0.35rem !important;
+}}
+.st-key-target_location_row [data-testid="stHorizontalBlock"] {{
+    align-items: center !important;
+    flex-wrap: nowrap !important;
+    gap: 0.45rem !important;
+}}
+.st-key-target_location_row [data-testid="stElementContainer"],
+.st-key-target_location_row [data-testid="stMarkdownContainer"] {{
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+}}
+.atmopulse-target-location-label {{
+    margin: 0 !important;
     font-family: {o} !important;
-    font-weight: {uw} !important;
-    margin: 0 0 0.5rem 0 !important;
+    font-size: 1.6rem !important;
+    font-weight: 700 !important;
+    line-height: 1.15 !important;
+    white-space: nowrap !important;
+}}
+.st-key-target_location_row [data-testid="stHorizontalBlock"] > div {{
+    display: flex !important;
+    align-items: center !important;
+    align-self: center !important;
+}}
+.st-key-target_location_row [data-testid="stHorizontalBlock"] > div:first-child {{
+    flex: 0 0 auto !important;
+    width: auto !important;
+    min-width: max-content !important;
+}}
+.st-key-target_location_row [data-testid="stHorizontalBlock"] > div:last-child {{
+    flex: 1 1 auto !important;
+    width: auto !important;
+    min-width: 12rem !important;
+}}
+.st-key-loc_field [data-testid="stWidgetLabel"] {{
+    display: none !important;
+}}
+.st-key-loc_field [data-testid="stSelectbox"] {{
+    width: 100% !important;
+    margin-bottom: 0 !important;
+}}
+.st-key-loc_field input {{
+    font-family: {o} !important;
+    font-weight: 700 !important;
+    font-size: 1rem !important;
+    height: 2.35rem !important;
+    line-height: 1.15 !important;
+    padding: 0.54rem 8px 0 8px !important;
+    transform: translateY(-2px) !important;
+}}
+.st-key-loc_field input::placeholder {{
+    font-weight: 500 !important;
+}}
+@media (max-width: 820px) {{
+    .st-key-target_location_row [data-testid="stHorizontalBlock"] {{
+        flex-wrap: wrap !important;
+    }}
+    .st-key-target_location_row [data-testid="stHorizontalBlock"] > div:first-child,
+    .st-key-target_location_row [data-testid="stHorizontalBlock"] > div:last-child {{
+        flex: 1 1 100% !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        min-width: 0 !important;
+    }}
 }}
 .atmopulse-narrative-banner {{
     background-color: {brand['nav_bg']} !important;
@@ -948,25 +1490,70 @@ section[data-testid="stSidebar"] [data-baseweb="select"] {{
     padding: 0.75rem 1rem !important;
     border-radius: 0.5rem !important;
     font-family: {o} !important;
-    font-weight: {uw} !important;
+    font-weight: 400 !important;
     font-size: 15px !important;
     margin: 0 0 1.15rem 0 !important;
     line-height: 1.45 !important;
 }}
-.atmopulse-narrative-chip {{
-    padding: 0 0.22em 0 0.18em !important;
+.atmopulse-narrative-banner.is-under-figure {{
     margin: 0 !important;
-    border-radius: 3px !important;
+    padding: 0.55rem 1rem !important;
+}}
+[data-testid="stElementContainer"]:has(.atmopulse-narrative-banner.is-under-figure),
+[data-testid="stElementContainer"]:has(.atmopulse-narrative-banner.is-map),
+[data-testid="stElementContainer"]:has(.atmopulse-narrative-banner.is-wave) {{
+    margin-top: 0.35rem !important;
+    margin-bottom: 0.45rem !important;
+}}
+.st-key-map_opacity .slider-group,
+.st-key-map_opacity .slider-container,
+.st-key-map_opacity .slider-rail,
+.st-key-map_opacity .slider-handle,
+.st-key-map_opacity .slider-ticks,
+.st-key-map_opacity text.slider-label {{
+    display: none !important;
+}}
+.atmopulse-narrative-chip {{
+    padding: 0 !important;
+    margin: 0 !important;
+    border-radius: 0 !important;
+    background: none !important;
+    background-color: transparent !important;
+    box-shadow: none !important;
     font-family: inherit !important;
     font-size: inherit !important;
-    font-weight: inherit !important;
+    font-weight: 400 !important;
     white-space: nowrap !important;
     display: inline !important;
     line-height: inherit !important;
     vertical-align: baseline !important;
-    box-decoration-break: clone;
-    -webkit-box-decoration-break: clone;
 }}
+.atmopulse-narrative-chip.atmopulse-sev-normal,
+.atmopulse-narrative-chip.atmopulse-sev-warm-moderate,
+.atmopulse-narrative-chip.atmopulse-sev-warm-strong,
+.atmopulse-narrative-chip.atmopulse-sev-warm-extreme,
+.atmopulse-narrative-chip.atmopulse-sev-warm-record,
+.atmopulse-narrative-chip.atmopulse-sev-cold-moderate,
+.atmopulse-narrative-chip.atmopulse-sev-cold-strong,
+.atmopulse-narrative-chip.atmopulse-sev-cold-extreme,
+.atmopulse-narrative-chip.atmopulse-sev-cold-record {{
+    background: none !important;
+    background-color: transparent !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+    border-radius: 0 !important;
+}}
+.atmopulse-narrative-chip.atmopulse-sev-normal {{
+    color: {brand['text_on_light']} !important;
+}}
+.atmopulse-narrative-chip.atmopulse-sev-warm-moderate {{ color: #C47D00 !important; }}
+.atmopulse-narrative-chip.atmopulse-sev-warm-strong {{ color: #D86A00 !important; }}
+.atmopulse-narrative-chip.atmopulse-sev-warm-extreme {{ color: {ATMOPULSE_WARM['p95']} !important; }}
+.atmopulse-narrative-chip.atmopulse-sev-warm-record {{ color: {ATMOPULSE_WARM['rec']} !important; }}
+.atmopulse-narrative-chip.atmopulse-sev-cold-moderate {{ color: #1A7AAD !important; }}
+.atmopulse-narrative-chip.atmopulse-sev-cold-strong {{ color: {ATMOPULSE_COLD['p10']} !important; }}
+.atmopulse-narrative-chip.atmopulse-sev-cold-extreme {{ color: {ATMOPULSE_COLD['p5']} !important; }}
+.atmopulse-narrative-chip.atmopulse-sev-cold-record {{ color: {ATMOPULSE_COLD['rec']} !important; }}
 .atmopulse-sev-normal {{
     background-color: {brand['mode_track']} !important;
     color: {brand['text_on_light']} !important;

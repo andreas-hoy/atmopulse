@@ -54,8 +54,8 @@ def baseline_against_lead(epoch: str) -> str:
     """Opening clause used by Map Tracker flicker/compare banners."""
     label = EPOCH_LABELS.get(epoch, epoch)
     if epoch == "A":
-        return f"Against the colder historical baseline ({label})"
-    return f"Against the warmer recent baseline ({label})"
+        return f"Against the colder historical reference period ({label})"
+    return f"Against the warmer recent reference period ({label})"
 
 # Mask codes as produced by app.py::_build_display_mask(). Codes are ordinal
 # by severity WITHIN each direction: warm ascends 5->8, cold descends 4->1.
@@ -338,7 +338,8 @@ def render_point_wavogram_narrative(
     selected_epoch: str = "B",
     threshold_level: str = "Strong (P90/10)",
     target_date=None,
-) -> dict | None:
+    is_warm=None,
+) -> str | None:
     """
     Point Wavogram narrative. Deliberately STATIC with respect to `ui_state`
     (map layout / baseline compare toggles): it always ranks the current
@@ -347,19 +348,27 @@ def render_point_wavogram_narrative(
     layout argument at all — there is nothing here for the visual overlay
     state to change.
 
-    Renders nothing (returns None) unless there is a currently active
-    heatwave/coldwave AND it ranks in the Top 20 longest events on record.
+    Returns None unless there is a currently active heatwave/coldwave AND
+    it ranks in the Top 20 longest events on record. The caller places the
+    HTML between the ridge export row and the next block.
     """
+    import html
+
     rank_info = get_wave_historical_rank(
         lat, lon, parameter=parameter, selected_epoch=selected_epoch,
         threshold_level=threshold_level, target_date=target_date,
+        is_warm=is_warm,
     )
     if rank_info is None:
         return None
 
-    st.markdown(
-        f"The area of **{location_name}** is currently experiencing its "
-        f"**{rank_info['rank_ordinal']} longest** {rank_info['severity']} {rank_info['wave_type']} "
-        f"since the start of the ERA5 record in 1940."
+    name = html.escape(str(location_name))
+    lead = html.escape(baseline_against_lead(selected_epoch))
+    return (
+        "<div class='atmopulse-narrative-banner is-under-figure is-wave'>"
+        f"{lead}, the area of {name} is currently experiencing its "
+        f"{rank_info['rank_ordinal']} longest "
+        f"{rank_info['severity']} {rank_info['wave_type']} "
+        "since the start of the ERA5 record in 1940."
+        "</div>"
     )
-    return rank_info

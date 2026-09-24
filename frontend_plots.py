@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
+import json
 import re
 
 import numpy as np
@@ -26,7 +28,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 import streamlit.components.v1 as components
 from scipy.interpolate import make_interp_spline
-from scipy.ndimage import gaussian_filter, maximum_filter, minimum_filter, uniform_filter
+from scipy.ndimage import gaussian_filter, maximum_filter, minimum_filter
 
 from backend_map_locations import EUROPE_BBOX
 from backend_analytics import (
@@ -167,17 +169,18 @@ _Z500_ANOM_SMOOTH_SIGMA = 1.4
 # Isoline intervals. MSLP is hPa; Z500 is dam (decameters of geopotential
 # height), never hPa. Absolute MSLP uses the WMO/synoptic 5 hPa step.
 # Absolute Z500 uses 8 dam so the overlay stays readable on the percentile
-# heatmap (a dedicated 500 hPa chart would typically be 4 dam). Anomaly
-# MSLP uses 2 hPa (composite/reanalysis practice; 5 hPa hides typical
-# ±4…±15 hPa departures). Anomaly Z500 uses 4 dam because typical
+# heatmap (a dedicated 500 hPa chart would typically be 4 dam).
+# MSLP anomaly uses 3 hPa. 2 hPa packed the lines too tightly on the
+# temperature map; 5 hPa still hides typical ±4…±15 hPa departures.
+# Anomaly Z500 uses 4 dam because typical
 # European departures (±8…±24 dam) would nearly vanish at 8 dam.
-_MSLP_CONTOUR_START = 980.0
-_MSLP_CONTOUR_END = 1040.0
+# Absolute MSLP is drawn every 5 hPa from the lowest value on the map
+# to the highest. No fixed floor or ceiling.
 _MSLP_CONTOUR_INTERVAL = 5.0
 _Z500_CONTOUR_START = 500.0
 _Z500_CONTOUR_END = 600.0
 _Z500_CONTOUR_INTERVAL = 8.0
-_MSLP_ANOM_INTERVAL = 2.0
+_MSLP_ANOM_INTERVAL = 3.0
 _MSLP_ANOM_SPAN = 40.0
 _Z500_ANOM_INTERVAL = 4.0
 _Z500_ANOM_SPAN = 40.0
@@ -237,8 +240,9 @@ _JET_ISOTACH_LINE_WIDTH = 1.0  # < MAP_CONTOUR_LINE_WIDTH (Z500's 1.35)
 # instead of one per grid cell.
 _JET_ARROW_SEED_STEP_LAT = 4
 _JET_ARROW_SEED_STEP_LON = 7
-_JET_ARROW_TRACK_POSITIONS = 10  # along-track (west->east) sample positions
-_JET_ARROW_WIDE_ROW_COUNT = 3    # sampled rows crossing the core at one position -> "wide" there -> 2 arrows (edges) instead of 1
+_JET_ARROW_TRACK_POSITIONS = 13  # along-track (west->east) sample positions
+_JET_ARROW_WIDE_ROW_COUNT = 3    # sampled rows crossing the core at one position -> edges
+_JET_ARROW_MID_SPAN_DEG = 10.0   # core wider than this also gets an arrow in the middle
 _JET_ARROW_SHAFT_DEG = 1.5     # fixed shaft length -- the screenshot's arrows were ~15-25 deg
 _JET_ARROWHEAD_LEN_DEG = 0.55
 _JET_ARROWHEAD_ANGLE_DEG = 26.0
@@ -254,36 +258,51 @@ _JET_ARROW_HALO_WIDTH = 4.2
 # figure (e.g. the previous long-streamline figure) is never served again
 # for the "jet" toggle just because date/toggles/source_mtime didn't
 # change.
-_JET_OVERLAY_VERSION = 6
-# Synoptic H/L: only label centres with a closed-system footprint
-# (neighbourhood span of at least one 5 hPa isoline) and keep glyphs apart.
-_MSLP_HL_SMOOTH_SIGMA = 2.5
-_MSLP_HL_NEIGHBORHOOD = 21
-_MSLP_HL_PROM_WINDOW = 45      # background mean; smaller window underestimates broad highs
-_MSLP_HL_RANGE_WINDOW = 41     # ~10°: closed or strongly curved isolines nearby
-_MSLP_HL_MIN_PROMINENCE = 2.0  # hPa vs regional mean
-_MSLP_HL_MIN_RANGE = 4.0       # hPa span; drops flat saddles without isoline structure
-_MSLP_HL_MIN_SEP_SAME = 14.0
-_MSLP_HL_MIN_SEP_CROSS = 7.0
+_JET_OVERLAY_VERSION = 7
+# Synoptic H/L. Centres are taken from the same smoothed field as the green
+# isobars. A glyph needs a real bowl, not a kink: around the point the
+# typical rise (a low) or fall (a high) is at least CLOSED_MEDIAN, and even
+# the weakest side still clears CLOSED_DEPTH. A broad Iceland low on a later
+# forecast day is only about 2 hPa deep on its open side, but several hPa
+# deep on average; a contour wiggle over the Mediterranean is the reverse.
+# Rings may be clipped by the map edge as long as most of the arc is on the grid.
+# The drawn field is smoothed (sigma 2.8). The 1030 hPa high over Britain on
+# 21 Sep 2026 is broad: inside 10° the weakest flank is still only about 1 hPa,
+# so both IFS and AIFS (same smoothed field) failed the 1.35 hPa gate and the
+# old 5 hPa median. A 14° ring with a 1 hPa flank and a 2 hPa median labels
+# that closed high. A kink that is deep on one side only still fails the
+# weakest-side test.
+_MSLP_HL_NEIGHBORHOOD = 9
+_MSLP_HL_CLOSED_DEPTH = 1.0
+_MSLP_HL_CLOSED_MEDIAN = 2.0
+_MSLP_HL_CLOSED_RADII_DEG = (2.0, 3.0, 4.5, 6.0, 8.0, 10.0, 12.0, 14.0)
+_MSLP_HL_CLOSED_SAMPLES = 24
+_MSLP_HL_CLOSED_MIN_SAMPLES = 16
+_MSLP_HL_MIN_SEP_SAME = 6.5
+_MSLP_HL_MIN_SEP_CROSS = 4.0
 _MSLP_HL_EDGE_DEG = 0.0
 _MSLP_HL_INSET_DEG = 1.8
 _MSLP_HL_EDGE_BAND = 5.0
-_MSLP_HL_EDGE_PROM = 4.0
-_MSLP_HL_EDGE_RANGE = 8.0
-_MSLP_HL_MAX_LABELS = 2
-_MSLP_HL_STEER_FRAC = 0.60
-_MSLP_HL_VERSION = 7
+_MSLP_HL_MAX_LABELS = 5
+_MSLP_HL_VERSION = 15
 MAP_EXTREMES_OPACITY = 0.75
 # Spell-hatching (WSDI/CSDI overlay on the daily map): black "x" per cell.
 # 0.40 / size 4.5 buried the colour field; keep a readable mark, not a second map.
 MAP_HATCH_OPACITY = 0.20
 MAP_HATCH_SIZE = 3.6
 SYNOPTIC_MAP_CONFIG = {
-    "displayModeBar": True,
+    "displayModeBar": "hover",
     "displaylogo": False,
     "responsive": True,
-    "modeBarButtonsToRemove": ["autoScale2d", "select2d", "lasso2d"],
+    "modeBarButtonsToRemove": ["toImage", "autoScale2d", "select2d", "lasso2d"],
     "scrollZoom": True,
+}
+# Every other Plotly chart keeps zoom and pan. The camera is the on-screen
+# PNG; SVG/PDF under the figure are the press files.
+PLOTLY_UI_CONFIG = {
+    "displayModeBar": "hover",
+    "displaylogo": False,
+    "modeBarButtonsToRemove": ["toImage"],
 }
 
 
@@ -349,18 +368,18 @@ def _build_persistence_customdata(warm, cold):
     return np.stack([_vfmt_days(warm), _vfmt_days(cold)], axis=-1)
 
 def _map_xaxis_kwargs(**extra):
-    # constrain="domain" on X (not Y): if the box is a pixel off the 70:42
-    # geographic ratio, leftover width letterboxes left/right instead of
-    # cropping southern Europe off the latitude range.
+    # Both axes span the whole frame. A scale lock was leaving a white
+    # margin inside the map whenever the pixel box was a step off 70:42.
     return dict(
         range=list(MAP_VIEW_LON), autorange=False, showgrid=False, zeroline=False,
-        visible=False, constrain="domain", constraintoward="center", **extra,
+        visible=False, constrain=None, domain=[0, 1], **extra,
     )
 
 def _map_yaxis_kwargs(**extra):
     return dict(
         range=list(MAP_VIEW_LAT), autorange=False, showgrid=False, zeroline=False,
-        scaleanchor="x", scaleratio=1, visible=False, **extra,
+        visible=False, scaleanchor=None, scaleratio=None, constrain=None,
+        domain=[0, 1], **extra,
     )
 
 def _output_credit_text(*, html_break: bool = False) -> str:
@@ -640,6 +659,10 @@ def st_plotly_press(
     fig: go.Figure, stem: str, csv_text: str | None = None,
     *, on_select: str | None = None, selection_mode=("points",), key: str | None = None,
     export_title: str | None = None,
+    legend_html: str | None = None,
+    note_html: str | None = None,
+    show_chart: bool = True,
+    show_footer: bool = True,
     **chart_kw,
 ):
     """`st.plotly_chart` + the compact SVG/PDF/CSV row.
@@ -652,23 +675,97 @@ def st_plotly_press(
     (or None when selection isn't enabled/nothing is selected).
     """
     plot_kwargs = dict(use_container_width=True, **chart_kw)
+    plot_kwargs.setdefault("config", PLOTLY_UI_CONFIG)
     if on_select is not None:
         plot_kwargs["on_select"] = on_select
         plot_kwargs["selection_mode"] = selection_mode
     if key is not None:
         plot_kwargs["key"] = key
-    event = st.plotly_chart(fig, **plot_kwargs)
-    st.markdown(
-        f"<p class='atmopulse-chart-credit'>{_output_credit_text()}</p>",
-        unsafe_allow_html=True,
-    )
-    render_press_export(fig, stem, csv_text=csv_text, export_title=export_title)
+    if note_html and show_chart:
+        st.markdown(note_html, unsafe_allow_html=True)
+    event = st.plotly_chart(fig, **plot_kwargs) if show_chart else None
+    if legend_html:
+        st.markdown(legend_html, unsafe_allow_html=True)
+    if show_footer:
+        render_press_export(fig, stem, csv_text=csv_text, export_title=export_title)
     return event
+
+
+def _drop_plotly_sliders(fig) -> None:
+    """Remove a layout slider. ``update_layout(sliders=[])`` leaves it drawn."""
+    try:
+        fig.layout.sliders = ()
+    except Exception:
+        pass
+    props = getattr(fig.layout, "_props", None)
+    if isinstance(props, dict):
+        props.pop("sliders", None)
+
+
+def _detach_opacity_slider(fig) -> str | None:
+    """Move the cross-fade control out of the SVG so the map stays 70:42."""
+    sliders = list(fig.layout.sliders or ())
+    if not sliders:
+        return None
+    steps = []
+    for step in sliders[0].steps:
+        args = step["args"] if isinstance(step, dict) else step.args
+        payload = args[0]
+        if not isinstance(payload, dict):
+            payload = dict(payload)
+        steps.append({
+            "opacity": [float(v) for v in payload.get("opacity", [])],
+            "idx": [int(i) for i in args[1]],
+        })
+    if not steps:
+        return None
+    label_a, label_b = "Historical", "Recent"
+    kept = []
+    for ann in list(fig.layout.annotations or ()):
+        try:
+            xf = float(ann.x)
+        except (TypeError, ValueError):
+            xf = None
+        if xf in (0.148, 0.852):
+            text = str(getattr(ann, "text", "") or "")
+            if xf < 0.5:
+                label_a = text
+            else:
+                label_b = text
+            continue
+        kept.append(ann)
+    fig.layout.annotations = tuple(kept)
+    _drop_plotly_sliders(fig)
+    data = json.dumps(steps)
+    last = len(steps) - 1
+    return (
+        f'<div class="ap-opacity-ctrl">'
+        f"<span>{html.escape(label_a)}</span>"
+        f'<input id="ap-opacity-range" type="range" min="0" max="{last}" value="0" step="1">'
+        f"<span>{html.escape(label_b)}</span></div>"
+        f"<script>(function(){{"
+        f"var steps={data};"
+        f"function bind(){{"
+        f'var gd=document.querySelector(".st-key-map_opacity .js-plotly-plot");'
+        f'var input=document.getElementById("ap-opacity-range");'
+        f"if(!gd||!input||!window.Plotly)return false;"
+        f"if(input.__apBound)return true;"
+        f"input.__apBound=true;"
+        f'input.addEventListener("input",function(){{'
+        f"var s=steps[Number(input.value)]||steps[0];"
+        f"window.Plotly.restyle(gd,{{opacity:s.opacity}},s.idx);"
+        f"}});return true;}}"
+        f"if(!bind()){{var n=0;var t=setInterval(function(){{if(bind()||++n>25)clearInterval(t);}},200);}}"
+        f"}})();</script>"
+    )
 
 
 def _render_synoptic_map(
     fig, title: str, key: str, *, bottom_margin: int = 0,
     export_title: str | None = None, help_text: str | None = None,
+    legend_html: str | None = None, banner_html: str | None = None,
+    show_chart: bool = True, show_footer: bool = True,
+    show_credit: bool = True,
 ) -> None:
     """Render one synoptic map: Streamlit title above a CSS 70:42 frame.
 
@@ -679,37 +776,49 @@ def _render_synoptic_map(
     `bottom_margin` reserves room below the map (e.g. for a Plotly
     layout slider) without affecting the default zero-margin callers.
     """
-    title_html = f"<p class='atmopulse-map-title'>{title}</p>"
-    if help_text:
-        with st.container(key=f"{key}_title"):
-            st.markdown(title_html, unsafe_allow_html=True, help=help_text, width="content")
-    else:
-        st.markdown(title_html, unsafe_allow_html=True)
-    fig.update_layout(
-        **plotly_typography(),
-        uirevision="map_sync_state",
-        autosize=True,
-        height=None,
-        title=None,
-        margin=dict(t=0, l=0, r=0, b=bottom_margin),
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-    )
-    with st.container(key=key):
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-            config=SYNOPTIC_MAP_CONFIG,
-            key=f"plotly_{key}",
+    if show_chart:
+        slider_html = _detach_opacity_slider(fig) if key == "map_opacity" else None
+        if slider_html:
+            bottom_margin = 0
+        title_html = f"<p class='atmopulse-map-title'>{title}</p>"
+        if help_text:
+            with st.container(key=f"{key}_title"):
+                st.markdown(title_html, unsafe_allow_html=True, help=help_text, width="content")
+        else:
+            st.markdown(title_html, unsafe_allow_html=True)
+        if banner_html:
+            st.markdown(banner_html, unsafe_allow_html=True)
+        fig.update_layout(
+            **plotly_typography(),
+            uirevision="map_sync_state",
+            autosize=True,
+            height=None,
+            title=None,
+            xaxis=_map_xaxis_kwargs(),
+            yaxis=_map_yaxis_kwargs(),
+            margin=dict(t=0, l=0, r=0, b=bottom_margin, pad=0),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
         )
-    st.markdown(
-        f"<p class='atmopulse-map-credit'>{_output_credit_text()}</p>",
-        unsafe_allow_html=True,
-    )
-    render_press_export(
-        fig, f"map_{key}", heavy=True,
-        export_title=export_title or title,
-    )
+        if slider_html:
+            _drop_plotly_sliders(fig)
+        with st.container(key=key):
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                config=SYNOPTIC_MAP_CONFIG,
+                key=f"plotly_{key}",
+            )
+        if slider_html:
+            st.html(slider_html, unsafe_allow_javascript=True)
+        del show_credit
+    if legend_html:
+        st.markdown(legend_html, unsafe_allow_html=True)
+    if show_footer:
+        render_press_export(
+            fig, f"map_{key}", heavy=True,
+            export_title=export_title or title,
+        )
 
 def _mslp_sep2(lon1, lat1, lon2, lat2) -> float:
     """Squared angular distance with a cosine correction for longitude."""
@@ -747,18 +856,6 @@ def _mslp_align_grid(lons, lats, z):
     return None, None, None
 
 
-def _mslp_collect_centres(lon2, lat2, smooth, local_mean, mask, letter: str) -> list[tuple]:
-    rows, cols = np.where(mask)
-    if rows.size == 0:
-        return []
-    out = []
-    for r, c in zip(rows.tolist(), cols.tolist()):
-        lon, lat = _mslp_inset(float(lon2[r, c]), float(lat2[r, c]))
-        prom = abs(float(smooth[r, c] - local_mean[r, c]))
-        out.append((lon, lat, prom, letter))
-    return out
-
-
 def _mslp_near_edge(lon: float, lat: float) -> bool:
     return (
         lon <= EUROPE_BBOX[0] + _MSLP_HL_EDGE_BAND
@@ -768,8 +865,8 @@ def _mslp_near_edge(lon: float, lat: float) -> bool:
     )
 
 
-def _mslp_edge_candidates(lon2, lat2, smooth, local_mean, local_range, finite) -> list[tuple]:
-    """Island-low / Azores-high style systems whose centre sits on the map rim."""
+def _mslp_edge_candidates(lon2, lat2, smooth, finite, radii) -> list[tuple]:
+    """Systems whose centre sits on the map rim, if that rim point is still closed."""
     if not np.any(finite):
         return []
     out = []
@@ -784,21 +881,17 @@ def _mslp_edge_candidates(lon2, lat2, smooth, local_mean, local_range, finite) -
         lon, lat = float(lon2[idx]), float(lat2[idx])
         if not _mslp_near_edge(lon, lat):
             continue
-        prom = abs(float(smooth[idx] - local_mean[idx]))
-        if prom < _MSLP_HL_EDGE_PROM or float(local_range[idx]) < _MSLP_HL_EDGE_RANGE:
+        depth = _mslp_closure_depth(smooth, finite, idx[0], idx[1], letter, radii)
+        if depth < _MSLP_HL_CLOSED_DEPTH:
             continue
         lon, lat = _mslp_inset(lon, lat)
-        out.append((lon, lat, prom, letter))
+        out.append((lon, lat, depth, letter))
     return out
 
 
 def _mslp_nms(candidates: list[tuple]) -> list[tuple]:
-    """Keep only steering-scale centres (strongest H/L, drop weak companions)."""
+    """Keep the deepest closed centres and drop a second glyph on the same system."""
     ranked = sorted(candidates, key=lambda rec: rec[2], reverse=True)
-    best = {"H": 0.0, "L": 0.0}
-    for _lon, _lat, prom, letter in ranked:
-        if prom > best[letter]:
-            best[letter] = prom
     kept: list[tuple] = []
     n_h = n_l = 0
     for lon, lat, prom, letter in ranked:
@@ -806,8 +899,7 @@ def _mslp_nms(candidates: list[tuple]) -> list[tuple]:
             continue
         if letter == "L" and n_l >= _MSLP_HL_MAX_LABELS:
             continue
-        floor = max(_MSLP_HL_MIN_PROMINENCE, _MSLP_HL_STEER_FRAC * best[letter])
-        if prom < floor:
+        if prom < _MSLP_HL_CLOSED_DEPTH:
             continue
         too_close = False
         for klon, klat, _kp, kletter in kept:
@@ -826,6 +918,47 @@ def _mslp_nms(candidates: list[tuple]) -> list[tuple]:
     return kept
 
 
+def _mslp_closure_depth(smooth, finite, r, c, letter, radii) -> float:
+    """Weakest-side closure of the best qualifying ring, in hPa.
+
+    A ring counts when most of it lies on the map, every sample is on the
+    correct side of the centre, and the typical sample is a real bowl
+    (median), not a one-sided kink. Returns 0 when no ring qualifies.
+    """
+    centre = float(smooth[r, c])
+    nlat, nlon = smooth.shape
+    best = 0.0
+    for rad in radii:
+        signed = []
+        for ang in np.linspace(0.0, 2.0 * np.pi, _MSLP_HL_CLOSED_SAMPLES, endpoint=False):
+            rr = int(round(r + rad * np.sin(ang)))
+            cc = int(round(c + rad * np.cos(ang)))
+            if rr < 0 or cc < 0 or rr >= nlat or cc >= nlon or not finite[rr, cc]:
+                continue
+            value = float(smooth[rr, cc])
+            signed.append((value - centre) if letter == "L" else (centre - value))
+        if len(signed) < _MSLP_HL_CLOSED_MIN_SAMPLES:
+            continue
+        if float(np.median(signed)) < _MSLP_HL_CLOSED_MEDIAN:
+            continue
+        depth = float(min(signed))
+        if depth > best:
+            best = depth
+    return best
+
+
+def _mslp_closed_records(lon2, lat2, smooth, finite, mask, letter, radii) -> list[tuple]:
+    out = []
+    rows, cols = np.where(mask)
+    for r, c in zip(rows.tolist(), cols.tolist()):
+        depth = _mslp_closure_depth(smooth, finite, r, c, letter, radii)
+        if depth < _MSLP_HL_CLOSED_DEPTH:
+            continue
+        lon, lat = _mslp_inset(float(lon2[r, c]), float(lat2[r, c]))
+        out.append((lon, lat, depth, letter))
+    return out
+
+
 def _mslp_pressure_centers(lons, lats, z) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
     """Local MSLP maxima (H) and minima (L) with a closed-isobar footprint."""
     field, lon, lat = _mslp_align_grid(lons, lats, z)
@@ -838,21 +971,14 @@ def _mslp_pressure_centers(lons, lats, z) -> tuple[list[tuple[float, float]], li
 
     fill = float(np.nanmean(field))
     filled = np.where(finite, field, fill)
-    smooth = gaussian_filter(filled, sigma=_MSLP_HL_SMOOTH_SIGMA, mode="nearest")
-    local_mean = uniform_filter(filled, size=_MSLP_HL_PROM_WINDOW, mode="nearest")
-    local_range = (
-        maximum_filter(smooth, size=_MSLP_HL_RANGE_WINDOW, mode="nearest")
-        - minimum_filter(smooth, size=_MSLP_HL_RANGE_WINDOW, mode="nearest")
-    )
+    # Same smooth as the drawn isobars, so a glyph sits in a closed contour
+    # the map actually shows, not on a kink that smoothing has removed.
+    smooth = gaussian_filter(filled, sigma=_MSLP_CONTOUR_SMOOTH_SIGMA, mode="nearest")
 
     max_in = np.where(finite, smooth, -np.inf)
     min_in = np.where(finite, smooth, np.inf)
     is_max = finite & (smooth == maximum_filter(max_in, size=_MSLP_HL_NEIGHBORHOOD, mode="nearest"))
     is_min = finite & (smooth == minimum_filter(min_in, size=_MSLP_HL_NEIGHBORHOOD, mode="nearest"))
-    is_max &= (smooth - local_mean) >= _MSLP_HL_MIN_PROMINENCE
-    is_min &= (local_mean - smooth) >= _MSLP_HL_MIN_PROMINENCE
-    is_max &= local_range >= _MSLP_HL_MIN_RANGE
-    is_min &= local_range >= _MSLP_HL_MIN_RANGE
 
     lon2, lat2 = np.meshgrid(lon, lat)
     in_frame = (
@@ -863,11 +989,16 @@ def _mslp_pressure_centers(lons, lats, z) -> tuple[list[tuple[float, float]], li
     )
     is_max &= in_frame
     is_min &= in_frame
-
+    step = max(
+        abs(float(lat[1] - lat[0])) if lat.size > 1 else 0.25,
+        abs(float(lon[1] - lon[0])) if lon.size > 1 else 0.25,
+        0.05,
+    )
+    radii = tuple(max(2, int(round(rd / step))) for rd in _MSLP_HL_CLOSED_RADII_DEG)
     candidates = (
-        _mslp_collect_centres(lon2, lat2, smooth, local_mean, is_max, "H")
-        + _mslp_collect_centres(lon2, lat2, smooth, local_mean, is_min, "L")
-        + _mslp_edge_candidates(lon2, lat2, smooth, local_mean, local_range, finite)
+        _mslp_closed_records(lon2, lat2, smooth, finite, is_max, "H", radii)
+        + _mslp_closed_records(lon2, lat2, smooth, finite, is_min, "L", radii)
+        + _mslp_edge_candidates(lon2, lat2, smooth, finite, radii)
     )
     kept = _mslp_nms(candidates)
     highs = [(lon, lat) for lon, lat, _p, letter in kept if letter == "H"]
@@ -949,6 +1080,25 @@ def _add_land_sea_base(fig, lons, lats) -> None:
     ))
 
 
+def _mslp_contour_span(z) -> tuple[float, float]:
+    """5 hPa start/end covering every value on the map, not a fixed window."""
+    field = np.squeeze(np.asarray(getattr(z, "values", z), dtype=float))
+    finite = field[np.isfinite(field)]
+    step = _MSLP_CONTOUR_INTERVAL
+    if finite.size == 0:
+        return 980.0, 1040.0
+    lo = float(np.min(finite))
+    hi = float(np.max(finite))
+    if lo > 2000.0:
+        lo /= 100.0
+        hi /= 100.0
+    start = float(np.floor(lo / step) * step)
+    end = float(np.ceil(hi / step) * step)
+    if end < start:
+        return 980.0, 1040.0
+    return float(start), float(end)
+
+
 def _mslp_smooth_field(z, sigma=_MSLP_CONTOUR_SMOOTH_SIGMA):
     """Nan-safe Gaussian smooth so isolines do not fray into tiny closed blobs."""
     field = np.squeeze(np.asarray(getattr(z, "values", z), dtype=float))
@@ -965,6 +1115,7 @@ def _mslp_smooth_field(z, sigma=_MSLP_CONTOUR_SMOOTH_SIGMA):
 def _add_map_contour(fig, lons, lats, z, color, start, end, step, *, dash=None, width=None):
     fig.add_trace(go.Contour(
         x=lons, y=lats, z=z,
+        autocontour=False,
         colorscale=[[0, color], [1, color]],
         contours=dict(
             start=start, end=end, size=step, showlabels=True,
@@ -986,15 +1137,22 @@ def _add_anomaly_contours(fig, lons, lats, z, color, interval, span, *, smooth_s
     """Signed isolines of a departure field; zero contour omitted.
 
     Solid = above the selected reference-period DOY mean, dashed = below.
+    Levels are exact multiples of ``interval`` through zero: -6, -3, 3, 6 …
+    Anchoring the negative run at ``-span`` (for example -40) steps by 3 onto
+    -4 and skips -3. The last multiple at or inside ``span`` is the outer end.
     """
     field = np.squeeze(np.asarray(z, dtype=float))
     if smooth_sigma:
         field = _mslp_smooth_field(field, sigma=smooth_sigma)
     if not np.isfinite(field).any():
         return
-    _add_map_contour(fig, lons, lats, field, color, interval, span, interval)
+    step = float(interval)
+    bound = float(int(np.floor(float(span) / step)) * step)
+    # Plotly's end is exclusive on some builds; a hair past the last level
+    # keeps -3 and +bound in the set.
+    _add_map_contour(fig, lons, lats, field, color, step, bound + step * 0.01, step)
     _add_map_contour(
-        fig, lons, lats, field, color, -span, -interval, interval, dash="dash",
+        fig, lons, lats, field, color, -bound, -step + step * 0.01, step, dash="dash",
     )
 
 def _add_jet_band_fill(fig, lons, lats, field) -> None:
@@ -1041,11 +1199,10 @@ def _select_jet_arrow_seeds(speed_smooth, lons, lats):
     meant a MERIDIONALLY WIDE core only ever got one arrow, always at
     whichever row a flat top-N pick happened to land on -- typically
     leaving one whole edge (e.g. the northern half of a wide band) with no
-    arrow at all. Now each along-track position is checked for how many
-    sampled rows there actually cross the core: a narrow crossing still
-    gets exactly one arrow (its middle row); a WIDE crossing
-    (>= _JET_ARROW_WIDE_ROW_COUNT sampled rows) gets one arrow near EACH
-    edge of the core instead, so both sides of a broad jet are covered.
+    arrow at all. A narrow crossing still gets exactly one arrow (its
+    middle row). A wider crossing gets one arrow near each edge. A core
+    at least _JET_ARROW_MID_SPAN_DEG across also gets one in the middle,
+    so a broad jet is not only marked on its flanks.
 
     Returns (iy, ix) index pairs -- arrows are drawn exactly ON these grid
     points using the field's own u/v there, no interpolation needed.
@@ -1069,15 +1226,28 @@ def _select_jet_arrow_seeds(speed_smooth, lons, lats):
         pick = sorted(set(int(round(p)) for p in pick))
         cols_with_rows = [cols_with_rows[p] for p in pick]
 
+    lats_arr = np.asarray(lats, dtype=float)
     seeds = []
     for j in cols_with_rows:
         rows_j = np.flatnonzero(core[:, j])
-        if rows_j.size >= _JET_ARROW_WIDE_ROW_COUNT:
-            picks = (rows_j[0], rows_j[-1])  # one near each edge of the core
+        if rows_j.size == 0:
+            continue
+        lat_lo = float(lats_arr[lat_idx[rows_j[0]]])
+        lat_hi = float(lats_arr[lat_idx[rows_j[-1]]])
+        span = abs(lat_hi - lat_lo)
+        if span >= _JET_ARROW_MID_SPAN_DEG:
+            chosen = (rows_j[0], rows_j[rows_j.size // 2], rows_j[-1])
+        elif rows_j.size >= _JET_ARROW_WIDE_ROW_COUNT:
+            chosen = (rows_j[0], rows_j[-1])
         else:
-            picks = (rows_j[rows_j.size // 2],)  # narrow here: one, in the middle
-        for i in picks:
-            seeds.append((int(lat_idx[i]), int(lon_idx[j])))
+            chosen = (rows_j[rows_j.size // 2],)
+        seen = set()
+        for i in chosen:
+            ii = int(i)
+            if ii in seen:
+                continue
+            seen.add(ii)
+            seeds.append((int(lat_idx[ii]), int(lon_idx[j])))
     return seeds
 
 
@@ -1167,7 +1337,7 @@ def build_baseline_map(
     ref_data, map_phys_data, target_date, t_warm, t_cold, toggles, view_mode, persist_metric, top10_threshold,
     baseline_type="A", map_var="TG", anchor_date=None, *, full_width=False,
     border_trace=None, get_map_location_labels=None, get_persistence_arrays=None,
-    syn_clim=None,
+    syn_clim=None, forecast_model=None,
 ):
     """
     `border_trace` / `get_map_location_labels` / `get_persistence_arrays` are
@@ -1178,6 +1348,8 @@ def build_baseline_map(
     script from scratch on every call and crash on already-instantiated
     widgets.
     """
+    if forecast_model is None:
+        forecast_model = selected_forecast_model()
     if ref_data is None or map_phys_data is None: 
         return go.Figure()
         
@@ -1255,12 +1427,14 @@ def build_baseline_map(
             hovertemplate=daily_hovertemplate,
         ))
         
-        if toggles.get("hatching", False) and not is_aifs_model():
+        if toggles.get("hatching", False):
+            # Same model as this panel: live AIFS uses the AIFS series,
+            # an archive day uses ERA5 even when the sidebar still says AIFS.
             anchor_date_str = anchor_date.strftime('%Y-%m-%d') if anchor_date is not None else None
             try:
                 streaks = get_persistence_arrays(
                     target_date.strftime('%Y-%m-%d'), baseline_type, map_var, anchor_date_str,
-                    forecast_model=selected_forecast_model(),
+                    forecast_model=forecast_model,
                 )
             except Exception:
                 streaks = None
@@ -1293,7 +1467,7 @@ def build_baseline_map(
         anchor_date_str = anchor_date.strftime('%Y-%m-%d') if anchor_date is not None else None
         streaks = get_persistence_arrays(
             target_date.strftime('%Y-%m-%d'), baseline_type, map_var, anchor_date_str,
-            forecast_model=selected_forecast_model(),
+            forecast_model=forecast_model,
         )
         if streaks is not None:
             mapping = {
@@ -1344,9 +1518,10 @@ def build_baseline_map(
     if toggles.get("mslp", False) and "mslp" in map_phys_data:
         mslp_z = np.squeeze(_synoptic_array(map_phys_data["mslp"]))
         mslp_draw = _mslp_smooth_field(mslp_z)
+        _c0, _c1 = _mslp_contour_span(mslp_z)
         _add_map_contour(
             fig, lons, lats, mslp_draw, ATMOPULSE_OVERLAY['mslp_contour'],
-            _MSLP_CONTOUR_START, _MSLP_CONTOUR_END, _MSLP_CONTOUR_INTERVAL,
+            _c0, _c1, _MSLP_CONTOUR_INTERVAL,
         )
         _add_mslp_hl_labels(fig, lons, lats, mslp_z)
     if toggles.get("z500", False) and "z500" in map_phys_data:
@@ -1399,19 +1574,22 @@ def build_baseline_map(
         height=None,
         xaxis=_map_xaxis_kwargs(),
         yaxis=_map_yaxis_kwargs(),
-        margin=dict(t=0, l=0, r=0, b=0),
+        margin=dict(t=0, l=0, r=0, b=0, pad=0),
         plot_bgcolor='rgba(0,0,0,0)',
         paper_bgcolor='rgba(0,0,0,0)',
     )
     return fig
 
+# Version args are hashed on purpose. A leading underscore would drop them
+# from the Streamlit cache key and keep serving a figure built by older code.
 @st.cache_data(show_spinner=False, max_entries=32)
 def get_cached_baseline_map(
     date_str, baseline_type, map_var, view_mode, persist_metric, top10_threshold,
     t_warm_items, t_cold_items, active_toggles, source_mtime, forecast_model,
     full_width=False, anchor_date_str=None, spell_days=6,
-    anom_mslp_hpa=_MSLP_ANOM_INTERVAL, _hl_version=_MSLP_HL_VERSION,
-    _jet_version=_JET_OVERLAY_VERSION, _credit_version=4, _hatch_version=2,
+    anom_mslp_hpa=_MSLP_ANOM_INTERVAL, hl_version=_MSLP_HL_VERSION,
+    jet_version=_JET_OVERLAY_VERSION, credit_version=4, hatch_version=4,
+    mslp_span_version=5, map_frame_version=2,
     *, _ref_data, _map_phys_data, _syn_clim=None,
 ):
     """Schritt C: @st.cache_data front door for build_baseline_map.
@@ -1428,9 +1606,8 @@ def get_cached_baseline_map(
     `frozenset` of the active names,
     `source_mtime` (see `backend_io.synoptic_source_mtime`) so a fresh
     forecast download busts this cache even for the same date/toggles, and
-    `forecast_model` purely so the key differs per model even though
-    build_baseline_map itself reads the active model from `config`'s global
-    session state, not from an argument.
+    `forecast_model` is both the cache key and the model passed into
+    persistence. An archive panel stays on ERA5 when the sidebar is AIFS.
 
     `_ref_data`/`_map_phys_data`/`_syn_clim` are keyword-only with a leading
     underscore (Streamlit's convention for cache-key-EXCLUDED args) — identical
@@ -1466,6 +1643,7 @@ def get_cached_baseline_map(
         get_map_location_labels=get_map_location_labels,
         get_persistence_arrays=get_persistence_arrays,
         syn_clim=_syn_clim,
+        forecast_model=forecast_model,
     )
 
 
@@ -1475,31 +1653,31 @@ def _clone_map_trace(trace):
     return constructors.get(data.get("type", "scatter"), go.Scatter)(data)
 
 
-def _plotly_compare_slider(*, active: int, prefix: str, steps: list) -> dict:
+def _plotly_compare_slider(*, active: int, steps: list) -> dict:
+    # The bar sits between the two end labels, with no tick marks under it.
     return dict(
         active=active,
-        x=0.08, y=0.02, len=0.84,
-        pad=dict(t=6, b=6),
-        currentvalue=dict(
-            prefix=prefix,
-            visible=True,
-            xanchor="center",
-            font=dict(size=12),
-        ),
+        x=0.16, y=0, len=0.68,
+        pad=dict(t=12, b=0),
+        currentvalue=dict(visible=False),
+        ticklen=0,
+        tickcolor="rgba(0,0,0,0)",
         steps=steps,
     )
 
 
 def build_opacity_slider_map(
     fig_a, fig_b,
-    label_a=epoch_period_label("A"),
-    label_b=epoch_period_label("B"),
-    n_steps=21,
+    label_a="Historical",
+    label_b="Recent",
+    n_steps=11,
 ):
     """Cross-fade two already-built maps with a Plotly layout slider.
 
-    `method="restyle"` runs entirely in the browser, so dragging the handle
-    does not trigger a Streamlit rerun or rebuild the NetCDF layers.
+    ``label_a`` and ``label_b`` sit directly against the two ends of the bar.
+    The bar has no tick marks and no value line above it.
+    ``method="restyle"`` runs entirely in the browser, so dragging the
+    handle does not trigger a Streamlit rerun or rebuild the NetCDF layers.
     """
     if not fig_a.data and not fig_b.data:
         return go.Figure()
@@ -1521,21 +1699,32 @@ def build_opacity_slider_map(
     base_op_b = [1.0 if t.opacity is None else float(t.opacity) for t in traces_b]
 
     steps = []
+    last = max(n_steps - 1, 1)
     for i in range(n_steps):
-        frac = i / (n_steps - 1)
+        frac = i / last
         opac_a = [round(o * (1.0 - frac), 4) for o in base_op_a]
         opac_b = [round(o * frac, 4) for o in base_op_b]
         steps.append(dict(
             method="restyle",
             args=[{"opacity": opac_a + opac_b}, idx_a + idx_b],
-            label=f"{int(round(frac * 100))}% {label_b}",
+            label="",
         ))
 
-    fig.update_layout(sliders=[_plotly_compare_slider(
-        active=0,
-        prefix=f"{label_a} → {label_b}: ",
-        steps=steps,
-    )])
+    fig.update_layout(
+        sliders=[_plotly_compare_slider(active=0, steps=steps)],
+        margin=dict(t=0, l=0, r=0, b=39, pad=0),
+    )
+    end_font = dict(size=13, color="#31333F")
+    fig.add_annotation(
+        text=label_a, xref="paper", yref="paper",
+        x=0.148, y=0, xanchor="right", yanchor="top", yshift=-12,
+        showarrow=False, font=end_font,
+    )
+    fig.add_annotation(
+        text=label_b, xref="paper", yref="paper",
+        x=0.852, y=0, xanchor="left", yanchor="top", yshift=-12,
+        showarrow=False, font=end_font,
+    )
     for t, op in zip(fig.data[:n_a], base_op_a):
         t.opacity = op
     for t in fig.data[n_a:]:
@@ -1546,6 +1735,8 @@ def build_opacity_slider_map(
 def render_swipe_compare_map(
     fig_a, fig_b, *, title: str, help_text: str,
     export_title_a: str | None = None, export_title_b: str | None = None,
+    legend_html: str | None = None,
+    banner_html: str | None = None,
 ) -> None:
     """One map, two Plotly.js instances drawn inside a single self-owned
     iframe, with the top layer clipped by a CSS custom property.
@@ -1572,7 +1763,7 @@ def render_swipe_compare_map(
         uirevision="map_sync_state",
         autosize=True,
         title=None,
-        margin=dict(t=0, l=0, r=0, b=0),
+        margin=dict(t=0, l=0, r=0, b=0, pad=0),
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
         # Box-zoom drag would otherwise fight the swipe-divider drag on the
@@ -1591,6 +1782,8 @@ def render_swipe_compare_map(
             help=help_text,
             width="content",
         )
+    if banner_html:
+        st.markdown(banner_html, unsafe_allow_html=True)
 
     primary = ATMOPULSE_BRAND["primary"]
     json_a = fig_bottom.to_json()
@@ -1652,8 +1845,8 @@ def render_swipe_compare_map(
 
   var figA = {json_a};
   var figB = {json_b};
-  var cfgA = {{displayModeBar: true, displaylogo: false, responsive: false,
-               modeBarButtonsToRemove: ["autoScale2d", "select2d", "lasso2d"], scrollZoom: false}};
+  var cfgA = {{displayModeBar: "hover", displaylogo: false, responsive: false,
+               modeBarButtonsToRemove: ["toImage", "autoScale2d", "select2d", "lasso2d"], scrollZoom: false}};
   var cfgB = {{displayModeBar: false, responsive: false, scrollZoom: false}};
 
   var stack = document.getElementById("swipe-stack");
@@ -1671,7 +1864,7 @@ def render_swipe_compare_map(
   // hidden previously cropped latitude (scaleanchor 1:1) — SVG/PDF export
   // never hit that path, so they looked complete.
   function layout() {{
-    var w = stack.clientWidth || document.documentElement.clientWidth || 0;
+    var w = window.innerWidth || stack.clientWidth || document.documentElement.clientWidth || 0;
     var mapH = w > 0 ? Math.round(w * 42 / 70) : 0;
     if (mapH > 0) {{
       stack.style.aspectRatio = "auto";
@@ -1680,9 +1873,16 @@ def render_swipe_compare_map(
     }}
     var ctrl = document.querySelector(".atmopulse-swipe-ctrl");
     var ctrlH = ctrl ? (ctrl.getBoundingClientRect().height || SLIDER_H) : SLIDER_H;
-    var total = Math.ceil((mapH || 0) + ctrlH + 8);
-    if (total > 0) {{
-      window.parent.postMessage({{type: "streamlit:setFrameHeight", height: total}}, "*");
+    // Trim only the empty band under the slider. A short first measure
+    // must not be published — that collapsed the map to a thin strip.
+    // The iframe starts at 900px, so the map is laid out full size first.
+    if (mapH >= 280) {{
+      var total = Math.ceil(mapH + ctrlH + 8);
+      window.parent.postMessage({{
+        isStreamlitMessage: true,
+        type: "streamlit:setFrameHeight",
+        height: total
+      }}, "*");
     }}
     if (plotted && w > 0 && mapH > 0) {{
       Plotly.relayout("swipe-a", {{autosize: false, width: w, height: mapH}});
@@ -1783,11 +1983,10 @@ def render_swipe_compare_map(
 }})();
 </script>
 """
-    components.html(html, height=900, scrolling=False)
-    st.markdown(
-        f"<p class='atmopulse-map-credit'>{_output_credit_text()}</p>",
-        unsafe_allow_html=True,
-    )
+    with st.container(key="swipe_map_frame"):
+        components.html(html, height=900, scrolling=False)
+    if legend_html:
+        st.markdown(legend_html, unsafe_allow_html=True)
     e1, e2 = st.columns(2)
     with e1:
         render_press_export(
@@ -2037,7 +2236,7 @@ def get_meteogram_traces(df_live, ref_clim, lat, lon, target_date, epoch, meteo_
     traces.append(go.Scatter(
         x=d_hist, y=t_hist, mode='lines',
         name='Current Value', legendgroup='air', showlegend=False,
-        line=dict(color='rgba(0,0,0,0.7)', width=1.5, shape='linear'), hoverinfo='skip',
+        line=dict(color='rgba(0,0,0,0.5)', width=1.1, shape='linear'), hoverinfo='skip',
     ))
     traces.append(go.Scatter(
         x=dates[fcst_line_mask], y=y_all[fcst_line_mask.values],
@@ -2758,12 +2957,12 @@ def build_kysely_wave_figs(
     fig_main.update_layout(
         **plotly_typography(),
         title=dict(
-            text=f"Duration and Intensity of Local {parameter} {t_suff} (1940–2026) | {lvl_text}<br><span style='font-size:11px;color:gray;'>{epoch_period_label(suffix)}</span>",
+            text=f"Duration and Intensity of Local {parameter} {t_suff} (1940–2026) | {lvl_text}",
             font=plotly_title_font(size=13),
         ),
         xaxis=dict(tickmode='array', tickvals=tick_vals, ticktext=tick_text, range=[start_plot_x, end_plot_x], showgrid=False, zeroline=False),
         yaxis=dict(tickmode='array', tickvals=y_ticks_vals[::5], ticktext=y_ticks_text[::5], range=[2026.5, start_year - (5.0 if is_warm else 15.0)], showgrid=False, zeroline=False, showline=False),
-        height=750, plot_bgcolor='white', paper_bgcolor='white', margin=dict(l=55, r=20, t=50, b=40),
+        height=750, plot_bgcolor='white', paper_bgcolor='white', margin=dict(l=55, r=20, t=36, b=40),
         meta=debug_info,
     )
 
@@ -2991,7 +3190,10 @@ def build_wave_event_mini_fig(payload: dict, wave: dict, n_total: int, y_range=N
         template="plotly_white", showlegend=False,
         hovermode="x",
     )
-    fig.update_xaxes(tickformat="%d.%m", showgrid=False, zeroline=False)
+    fig.update_xaxes(
+        range=[pad_start, pad_end],
+        tickformat="%d.%m", showgrid=False, zeroline=False,
+    )
     yaxis_kw = dict(showgrid=True, gridcolor=ATMOPULSE_OVERLAY["grid"], zeroline=False)
     if y_range is not None:
         # Shared y-scale across all displayed slots (set by the caller from
@@ -3067,9 +3269,12 @@ def build_wave_event_z500_mini_fig(payload: dict, wave: dict, y_range=None) -> g
         height=170, margin=dict(t=28, b=24, l=42, r=10),
         template="plotly_white", showlegend=False, hovermode="x",
     )
-    fig.update_xaxes(tickformat="%d.%m", showgrid=False, zeroline=False)
+    fig.update_xaxes(
+        range=[start - pd.Timedelta(days=3), end + pd.Timedelta(days=3)],
+        tickformat="%d.%m", showgrid=False, zeroline=False,
+    )
     yaxis_kw = dict(
-        title_text="Z500 anom. (dam)", showgrid=True, gridcolor=ATMOPULSE_OVERLAY["grid"],
+        showgrid=True, gridcolor=ATMOPULSE_OVERLAY["grid"],
         zeroline=True, zerolinecolor="rgba(0,0,0,0.45)",
     )
     if y_range is not None:

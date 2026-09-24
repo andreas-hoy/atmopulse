@@ -55,11 +55,13 @@ def render_grid_cell_profile(location_name, lat, lon):
         area = ns_extent * ew_extent
         roughness_class = _classify_roughness(sdor)
 
+        ns = "N" if lat >= 0 else "S"
+        ew = "E" if lon >= 0 else "W"
         col1, col2 = st.columns([2, 1])
         with col1:
             st.markdown(f"""
 **Grid Cell Dimensions:**
-The meteorological data for [{location_name}; {lat}°N, {lon}°E] is calculated based on a macro-scale ERA5 grid cell covering a total area of **{area:.1f} km²** (North-South: 27.8 km | East-West: {ew_extent:.1f} km).
+The meteorological data for [{location_name}; {abs(lat):.2f}°{ns}, {abs(lon):.2f}°{ew}] is calculated based on a macro-scale ERA5 grid cell covering a total area of **{area:.1f} km²** (North-South: 27.8 km | East-West: {ew_extent:.1f} km).
 
 **Modeled Physical Profile:**
 * **Surface Cover:** {lsm*100:.0f}% Land | {(1-lsm)*100:.0f}% Water

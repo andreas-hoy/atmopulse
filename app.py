@@ -20,6 +20,7 @@ Core functionalities:
 import streamlit as st
 import pandas as pd
 import numpy as np
+import importlib
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -27,8 +28,10 @@ from datetime import datetime
 from geopy.exc import GeocoderServiceError, GeocoderTimedOut, GeocoderUnavailable
 from geopy.geocoders import Nominatim
 
+from backend_map_locations import EUROPE_BBOX
 from backend_maps import etccdi_doy_365, latest_era5_archive_date, latest_forecast_cycle_label
 from backend_io import get_archive_year_options
+from backend_narrative import render_point_wavogram_narrative
 from backend_waves import compute_kysely_waves_data, rank_waves_by_metric
 from labels import HELP
 from atmopulse_theme import (
@@ -74,6 +77,7 @@ from config import (
     show_expert,
     is_daily_map_view,
     epoch_period_label,
+    epoch_short_label,
     epoch_from_label,
     meteo_var_code,
 )
@@ -86,6 +90,8 @@ from frontend_plots import (
     build_wave_event_mini_fig,
     build_wave_event_z500_mini_fig,
     render_press_export,
+    _output_credit_text,
+    PLOTLY_UI_CONFIG,
     wave_event_z500_window,
     _Z500_ANOM_Y_FLOOR,
 )
@@ -377,6 +383,7 @@ def _render_wave_drilldown(payload_a, payload_b, stack_metric, ctx_key, click_ev
                 mini_fig = build_wave_event_mini_fig(payload_b, w, n_total, y_range=y_range)
                 st.plotly_chart(
                     mini_fig, use_container_width=True, key=f"wave_mini_{w['event_id']}",
+                    config=PLOTLY_UI_CONFIG,
                 )
                 # Same compact SVG/PDF/CSV row as every other AtmoPulse
                 # figure, per event — not one combined export for all 5
@@ -392,13 +399,14 @@ def _render_wave_drilldown(payload_a, payload_b, stack_metric, ctx_key, click_ev
                             "date": window.index.strftime("%Y-%m-%d"),
                             "value": window.values,
                         }).to_csv(index=False)
-                render_press_export(mini_fig, f"wavogram_event_{w['event_id']}", csv_text=csv_text)
                 if show_z500_minis:
+                    render_press_export(mini_fig, f"wavogram_event_{w['event_id']}", csv_text=csv_text)
                     z_fig = build_wave_event_z500_mini_fig(payload_b, w, y_range=z500_range)
                     if z_fig is not None:
                         st.plotly_chart(
                             z_fig, use_container_width=True,
                             key=f"wave_mini_z500_{w['event_id']}",
+                            config=PLOTLY_UI_CONFIG,
                         )
                         packed = wave_event_z500_window(payload_b, w)
                         z_csv = None
@@ -410,33 +418,157 @@ def _render_wave_drilldown(payload_a, payload_b, stack_metric, ctx_key, click_ev
                                 "doy_mean_dam": np.round(z_clim, 2),
                                 "z500_anom_dam": np.round(anom, 2),
                             }).to_csv(index=False)
-                        render_press_export(
-                            z_fig, f"wavogram_event_z500_{w['event_id']}",
-                            csv_text=z_csv,
+                        with st.container(key=f"wave_event_foot_{w['event_id']}"):
+                            render_press_export(
+                                z_fig, f"wavogram_event_z500_{w['event_id']}",
+                                csv_text=z_csv,
+                            )
+                            st.button(
+                                "Map this event",
+                                key=f"wave_open_map_{w['event_id']}",
+                                help=HELP["wave_open_map"],
+                                on_click=_open_wave_event_on_map,
+                                args=(w["start_date"],),
+                            )
+                    else:
+                        st.button(
+                            "Map this event",
+                            key=f"wave_open_map_{w['event_id']}",
+                            help=HELP["wave_open_map"],
+                            on_click=_open_wave_event_on_map,
+                            args=(w["start_date"],),
                         )
-                st.button(
-                    "Map this event",
-                    key=f"wave_open_map_{w['event_id']}",
-                    use_container_width=True,
-                    help=HELP["wave_open_map"],
-                    on_click=_open_wave_event_on_map,
-                    args=(w["start_date"],),
-                )
+                else:
+                    with st.container(key=f"wave_event_foot_{w['event_id']}"):
+                        render_press_export(mini_fig, f"wavogram_event_{w['event_id']}", csv_text=csv_text)
+                        st.button(
+                            "Map this event",
+                            key=f"wave_open_map_{w['event_id']}",
+                            help=HELP["wave_open_map"],
+                            on_click=_open_wave_event_on_map,
+                            args=(w["start_date"],),
+                        )
     _wave_section_spacer()
 
 # --- UI & CSS: TOP NAVIGATION BAR ---
 st.set_page_config(page_title="AtmoPulse", layout="wide", page_icon="assets/favicon.svg", initial_sidebar_state="expanded")
-st.markdown(f"<style>{atmopulse_streamlit_css(ATMOPULSE_BRAND)}</style>", unsafe_allow_html=True)
+import atmopulse_theme as _ap_theme
+import backend_narrative as _bn
+import frontend_plots as _fp
+import page_map_tracker as _pmt
+import page_meteogram as _pm
+importlib.reload(_ap_theme)
+importlib.reload(_bn)
+importlib.reload(_fp)
+importlib.reload(_pmt)
+importlib.reload(_pm)
+st_plotly_press = _fp.st_plotly_press
+align_wave_stats_yranges = _fp.align_wave_stats_yranges
+build_wave_event_mini_fig = _fp.build_wave_event_mini_fig
+build_wave_event_z500_mini_fig = _fp.build_wave_event_z500_mini_fig
+render_press_export = _fp.render_press_export
+_output_credit_text = _fp._output_credit_text
+PLOTLY_UI_CONFIG = _fp.PLOTLY_UI_CONFIG
+wave_event_z500_window = _fp.wave_event_z500_window
+_Z500_ANOM_Y_FLOOR = _fp._Z500_ANOM_Y_FLOOR
+render_map_tracker = _pmt.render_map_tracker
+render_meteogram = _pm.render_meteogram
+st.markdown(f"<style>{_ap_theme.atmopulse_streamlit_css(_ap_theme.ATMOPULSE_BRAND)}</style>", unsafe_allow_html=True)
+st.html(
+    """
+<div class="ap-map-fit" style="height:0;overflow:hidden"></div>
+<script>
+(function () {
+  if (window.__apMapFitStop) window.__apMapFitStop();
+  var sel = ".st-key-map_a svg.main-svg, .st-key-map_b svg.main-svg, .st-key-map_flicker svg.main-svg, .st-key-map_opacity svg.main-svg";
+  function fit() {
+    document.querySelectorAll(sel).forEach(function (svg) {
+      var w = svg.getAttribute("width");
+      var h = svg.getAttribute("height");
+      if (!w || !h) return;
+      var vb = "0 0 " + w + " " + h;
+      if (svg.getAttribute("viewBox") !== vb) svg.setAttribute("viewBox", vb);
+      if (svg.getAttribute("preserveAspectRatio") !== "none") svg.setAttribute("preserveAspectRatio", "none");
+    });
+  }
+  function sizeSwipe() {
+    document.querySelectorAll(".st-key-swipe_map_frame iframe").forEach(function (frame) {
+      var w = frame.clientWidth || frame.getBoundingClientRect().width || 0;
+      if (w < 280) return;
+      var mapH = Math.round(w * 42 / 70);
+      if (mapH < 280) return;
+      var extra = 46 + 8;
+      try {
+        var ctrl = frame.contentDocument && frame.contentDocument.querySelector(".atmopulse-swipe-ctrl");
+        if (ctrl) extra = Math.ceil(ctrl.getBoundingClientRect().height) + 8;
+      } catch (e) {}
+      var total = mapH + extra;
+      if (frame.getAttribute("data-ap-swipe-h") === String(total)) return;
+      frame.setAttribute("data-ap-swipe-h", String(total));
+      frame.style.setProperty("height", total + "px", "important");
+      frame.style.setProperty("min-height", total + "px", "important");
+      frame.style.setProperty("max-height", total + "px", "important");
+      var wrap = frame.parentElement;
+      if (wrap) {
+        wrap.style.setProperty("height", "auto", "important");
+        wrap.style.setProperty("flex", "0 0 auto", "important");
+      }
+    });
+  }
+  fit();
+  sizeSwipe();
+  var obs = new MutationObserver(function () { fit(); sizeSwipe(); });
+  obs.observe(document.body, {subtree: true, childList: true, attributes: true, attributeFilter: ["width", "height"]});
+  window.addEventListener("resize", function () { sizeSwipe(); });
+  [80, 240, 600, 1200].forEach(function (t) { setTimeout(function () { sizeSwipe(); }, t); });
+  window.__apMapFitStop = function () { obs.disconnect(); };
+})();
+</script>
+""",
+    unsafe_allow_javascript=True,
+)
 inject_monday_weekstart()
 
 geolocator = Nominatim(user_agent="atmopulse_extremes_tracker_2026")
 
 
+class _PointLocation:
+    """Stand-in for a geopy result, so saved places do not need another lookup."""
+
+    def __init__(self, address, latitude, longitude):
+        self.address = address
+        self.latitude = float(latitude)
+        self.longitude = float(longitude)
+
+
+def _in_map_domain(lat, lon) -> bool:
+    return (
+        EUROPE_BBOX[0] <= float(lon) <= EUROPE_BBOX[2]
+        and EUROPE_BBOX[1] <= float(lat) <= EUROPE_BBOX[3]
+    )
+
+
+def _filter_map_domain(result):
+    if result is None:
+        return None
+    if isinstance(result, list):
+        return [r for r in result if _in_map_domain(r.latitude, r.longitude)]
+    if not _in_map_domain(result.latitude, result.longitude):
+        return None
+    return result
+
+
 def _safe_geocode(query, **kwargs):
-    """Nominatim lookup that must not crash the app when DNS/network is down."""
+    """Nominatim lookup inside the map domain. Must not crash when the network is down."""
     kwargs.setdefault("timeout", 10)
+    kwargs.setdefault(
+        "viewbox",
+        ((EUROPE_BBOX[1], EUROPE_BBOX[0]), (EUROPE_BBOX[3], EUROPE_BBOX[2])),
+    )
+    kwargs.setdefault("bounded", True)
+    kwargs.setdefault("language", "en")
     try:
-        return geolocator.geocode(query, **kwargs)
+        found = geolocator.geocode(query, **kwargs)
     except (GeocoderUnavailable, GeocoderTimedOut, GeocoderServiceError):
         st.warning(
             "Location search is temporarily unavailable "
@@ -444,9 +576,107 @@ def _safe_geocode(query, **kwargs):
             "Check the internet connection and try again."
         )
         return None
+    return _filter_map_domain(found)
+
+
+_DEFAULT_SAVED_LOCATIONS = (
+    {"name": "Tallinn", "address": "Tallinn, Estonia", "lat": 59.44, "lon": 24.75},
+    {"name": "Berlin", "address": "Berlin, Germany", "lat": 52.52, "lon": 13.40},
+    {"name": "Budapest", "address": "Budapest, Hungary", "lat": 47.50, "lon": 19.04},
+)
+
+
+_COUNTRY_EN = {
+    "deutschland": "Germany",
+    "österreich": "Austria",
+    "schweiz": "Switzerland",
+    "frankreich": "France",
+    "italien": "Italy",
+    "spanien": "Spain",
+    "polen": "Poland",
+    "tschechien": "Czechia",
+    "tschechische republik": "Czechia",
+    "ungarn": "Hungary",
+    "estland": "Estonia",
+    "lettland": "Latvia",
+    "litauen": "Lithuania",
+    "niederlande": "Netherlands",
+    "belgien": "Belgium",
+    "dänemark": "Denmark",
+    "schweden": "Sweden",
+    "norwegen": "Norway",
+    "finnland": "Finland",
+    "vereinigtes königreich": "United Kingdom",
+    "großbritannien": "United Kingdom",
+    "irland": "Ireland",
+    "portugal": "Portugal",
+    "griechenland": "Greece",
+    "rumänien": "Romania",
+    "bulgarien": "Bulgaria",
+    "kroatien": "Croatia",
+    "slowenien": "Slovenia",
+    "slowakei": "Slovakia",
+    "luxemburg": "Luxembourg",
+}
+
+
+def _location_country(loc) -> str:
+    parts = [part.strip() for part in str(loc.get("address") or "").split(",") if part.strip()]
+    if len(parts) < 2:
+        return ""
+    country = parts[-1]
+    if country.lower() == str(loc.get("name") or "").strip().lower():
+        return ""
+    return _COUNTRY_EN.get(country.lower(), country)
+
+
+def _saved_loc_label(loc) -> str:
+    lat, lon = float(loc["lat"]), float(loc["lon"])
+    ns = "N" if lat >= 0 else "S"
+    ew = "E" if lon >= 0 else "W"
+    coords = f"{abs(lon):.1f}°{ew}, {abs(lat):.1f}°{ns}"
+    place = loc["name"]
+    country = _location_country(loc)
+    if country:
+        place = f"{place}, {country}"
+    return f"{place} ({coords})"
+
+
+def _init_saved_locations() -> None:
+    if "saved_locations" in st.session_state:
+        return
+    known = {item["name"]: item for item in _DEFAULT_SAVED_LOCATIONS}
+    ordered = []
+    for name in st.session_state.get("search_history", [item["name"] for item in _DEFAULT_SAVED_LOCATIONS]):
+        if name in known:
+            ordered.append(dict(known[name]))
+        else:
+            ordered.append({"name": name, "address": name, "lat": None, "lon": None})
+    have = {item["name"] for item in ordered}
+    for item in _DEFAULT_SAVED_LOCATIONS:
+        if item["name"] not in have:
+            ordered.append(dict(item))
+    st.session_state.saved_locations = ordered[:10]
+
+
+def _remember_location(name, address, lat, lon) -> dict:
+    loc = {
+        "name": name,
+        "address": address,
+        "lat": round(float(lat), 2),
+        "lon": round(float(lon), 2),
+    }
+    key = (loc["lat"], loc["lon"])
+    kept = [
+        item for item in st.session_state.saved_locations
+        if item.get("lat") is None or (round(float(item["lat"]), 2), round(float(item["lon"]), 2)) != key
+    ]
+    st.session_state.saved_locations = [loc, *kept][:10]
+    return loc
+
 
 if "nc_lock" not in st.session_state: st.session_state.nc_lock = threading.Lock()
-if "search_history" not in st.session_state: st.session_state.search_history = ["Berlin", "Tallinn", "Budapest"]
+_init_saved_locations()
 if "toggles_warm" not in st.session_state: st.session_state.toggles_warm = {"p75": True, "p90": True, "p95": True, "rec": True}
 if "toggles_cold" not in st.session_state: st.session_state.toggles_cold = {"p25": True, "p10": True, "p5": True, "rec": True}
 if "offset_slider" not in st.session_state:
@@ -540,20 +770,6 @@ def toggle_cold_state():
     current = any(st.session_state.toggles_cold.values())
     for k in st.session_state.toggles_cold: 
         st.session_state.toggles_cold[k] = not current
-
-def _on_loc_history_change():
-    """Recent-location pick is the active source; drop leftover typed search."""
-    if st.session_state.get("loc_history_sel", "Select...") == "Select...":
-        return
-    st.session_state.loc_source = "history"
-    st.session_state.new_loc_input = ""
-    st.session_state.last_query = None
-    st.session_state.geocode_results = None
-
-def _on_new_loc_input_change():
-    """Typed search is the active source; clear the recent-location pick."""
-    st.session_state.loc_source = "search"
-    st.session_state.loc_history_sel = "Select..."
 
 def _fmt_map_year(yr_val) -> str:
     try:
@@ -661,8 +877,9 @@ with st.sidebar:
         _fc_tag = "AIFS" if is_aifs_model() else "IFS"
         _cycle = latest_forecast_cycle_label(selected_forecast_model())
         _fc_when = f" run {_cycle}" if _cycle else ""
+        _vintage_cls = "atmopulse-data-vintage is-disabled" if map_is_archive else "atmopulse-data-vintage"
         st.markdown(
-            f"<p style='font-size: 12px; color: #555; margin-top: -10px;'>📡 Data: ERA5 Archive (~ 5 days ago) | "
+            f"<p class='{_vintage_cls}'>📡 Data: ERA5 Archive (~ 5 days ago) | "
             f"{_fc_tag} Forecast{_fc_when}.</p>",
             unsafe_allow_html=True,
             help=HELP["data_vintage"],
@@ -676,29 +893,19 @@ with st.sidebar:
             st.caption("Forecast Offset is inactive while Map date is set to Archive.")
         else:
             st.slider("Forecast Offset (Days):", FORECAST_OFFSET_MIN, FORECAST_OFFSET_MAX, key="offset_slider", help=HELP["forecast_offset"])
-            # Native -7 / +3 tick labels are forced permanently visible via CSS
-            # (.st-key-offset_slider in atmopulse_theme.py); we just add the
-            # missing midpoint here, styled identically (0 sits at 70% of -7..3).
-            _zero_pct = (0 - FORECAST_OFFSET_MIN) / (FORECAST_OFFSET_MAX - FORECAST_OFFSET_MIN) * 100
-            st.markdown(
-                f"""
-                <div style='position: relative; width: 100%; height: 16px; margin-top: -20px; margin-bottom: 6px;'>
-                    <span class='atmopulse-slider-zero' style='position: absolute; left: {_zero_pct}%; transform: translateX(-50%);'>0</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            btn_col1, btn_col2 = st.columns(2)
-            with btn_col1: 
-                st.button("← Day before", on_click=sub_day, use_container_width=True)
-            with btn_col2: 
-                st.button("Day after →", on_click=add_day, use_container_width=True)
+            with st.container(key="map_live_day_buttons"):
+                btn_col1, btn_col2 = st.columns(2)
+                with btn_col1:
+                    st.button("Day before  \n←", on_click=sub_day, use_container_width=True)
+                with btn_col2:
+                    st.button("Day after  \n→", on_click=add_day, use_container_width=True)
 
         if map_is_archive:
             target_date = pd.Timestamp(st.session_state.map_archive_date)
         else:
             target_date = default_date + pd.Timedelta(days=st.session_state.offset_slider)
-            st.info(f"Target Date: **{target_date.strftime('%d.%m.%Y')}**")
+            with st.container(key="map_target_date"):
+                st.info(f"Target Date: **{target_date.strftime('%d.%m.%Y')}**")
         
         toggles = {}
         
@@ -743,14 +950,18 @@ with st.sidebar:
                 m_col1, m_col2 = st.columns(2)
                 with m_col1:
                     warm_active = any(st.session_state.toggles_warm.values())
-                    if st.button("Warm", use_container_width=True, type="primary" if warm_active else "secondary", help=HELP["warm_toggle"]): 
-                        toggle_warm_state()
-                        st.rerun()
+                    st.button(
+                        "Warm", use_container_width=True,
+                        type="primary" if warm_active else "secondary",
+                        help=HELP["warm_toggle"], on_click=toggle_warm_state,
+                    )
                 with m_col2:
                     cold_active = any(st.session_state.toggles_cold.values())
-                    if st.button("Cold", use_container_width=True, type="primary" if cold_active else "secondary", help=HELP["cold_toggle"]): 
-                        toggle_cold_state()
-                        st.rerun()
+                    st.button(
+                        "Cold", use_container_width=True,
+                        type="primary" if cold_active else "secondary",
+                        help=HELP["cold_toggle"], on_click=toggle_cold_state,
+                    )
                 if show_expert("percentile_layer_toggles"):
                     st.markdown("<hr style='margin-top:5px; margin-bottom:15px; border-top: 1px dashed gray;'>", unsafe_allow_html=True)
                     st.session_state.toggles_warm["p75"] = st.checkbox(
@@ -805,6 +1016,15 @@ with st.sidebar:
                     help=HELP["mslp_contours"],
                     key="map_overlay_mslp",
                 )
+                if show_expert("synoptic_anomalies"):
+                    toggles["mslp_anom"] = st.checkbox(
+                        "Sea-level pressure anomaly",
+                        value=STANDARD_DEFAULTS["mslp_anom"],
+                        help=HELP["mslp_anomaly"],
+                        key="map_overlay_mslp_anom",
+                    )
+                else:
+                    toggles["mslp_anom"] = STANDARD_DEFAULTS["mslp_anom"]
                 if show_expert("z500"):
                     # Leading word-joiner: Streamlit markdown otherwise treats a
                     # label that starts with digits as a numbered list and renders
@@ -817,6 +1037,15 @@ with st.sidebar:
                     )
                 else:
                     toggles["z500"] = STANDARD_DEFAULTS["z500"]
+                if show_expert("synoptic_anomalies"):
+                    toggles["z500_anom"] = st.checkbox(
+                        "\u200b500 hPa height anomaly",
+                        value=STANDARD_DEFAULTS["z500_anom"],
+                        help=HELP["z500_anomaly"],
+                        key="map_overlay_z500_anom",
+                    )
+                else:
+                    toggles["z500_anom"] = STANDARD_DEFAULTS["z500_anom"]
                 if show_expert("jet"):
                     # Leading word-joiner: see the Z500 checkbox above --
                     # otherwise Streamlit renders a label starting with a
@@ -830,25 +1059,10 @@ with st.sidebar:
                 else:
                     toggles["jet"] = STANDARD_DEFAULTS["jet"]
                 if show_expert("synoptic_anomalies"):
-                    toggles["mslp_anom"] = st.checkbox(
-                        "Sea-level pressure anomaly",
-                        value=STANDARD_DEFAULTS["mslp_anom"],
-                        help=HELP["mslp_anomaly"],
-                        key="map_overlay_mslp_anom",
-                    )
-                    toggles["z500_anom"] = st.checkbox(
-                        "\u200b500 hPa height anomaly",
-                        value=STANDARD_DEFAULTS["z500_anom"],
-                        help=HELP["z500_anomaly"],
-                        key="map_overlay_z500_anom",
-                    )
                     st.caption(
                         "Anomaly isolines are relative to each map's reference period. "
                         "Solid = above that DOY mean, dashed = below."
                     )
-                else:
-                    toggles["mslp_anom"] = STANDARD_DEFAULTS["mslp_anom"]
-                    toggles["z500_anom"] = STANDARD_DEFAULTS["z500_anom"]
             
         elif nav_selection in (NAV_METEO, NAV_WAVE):
             st.markdown("---")
@@ -913,6 +1127,11 @@ with st.sidebar:
                 else:
                     wave_z500_outline = STANDARD_DEFAULTS["wave_z500_outline"]
 
+        st.markdown(
+            f"<p class='atmopulse-panel-credit'>{_output_credit_text()}</p>",
+            unsafe_allow_html=True,
+        )
+
 if nav_selection == NAV_WELCOME:
     st.markdown(f"### Welcome to {atmopulse_wordmark_html()}", unsafe_allow_html=True)
     st.markdown(f"""
@@ -954,81 +1173,104 @@ elif nav_selection == NAV_MAP:
     )
 
 elif nav_selection in (NAV_METEO, NAV_WAVE):
-    st.subheader("🏙️ Target Location")
-    # loc_history_sel / new_loc_input only ever get created on this branch.
-    # Per Streamlit's widget-behavior rules, a keyed widget's value in
-    # session_state is deleted whenever the widget isn't rendered during a
-    # script run — so a detour through Map Tracker or Welcome (e.g. via the
-    # Wavogram's "Map this event" button) silently resets both back to
-    # "Select..." / "" the next time this branch runs. Restore from a
-    # plain shadow key (never itself a widget key, so it's never wiped)
-    # right before the widgets are (re-)created, then keep the shadow in
-    # sync below — the standard Streamlit pattern for carrying a widget's
-    # value across a page/branch it isn't rendered on.
-    if "loc_history_sel" not in st.session_state:
-        st.session_state["loc_history_sel"] = st.session_state.get("_active_loc_history_sel", "Select...")
-    if "new_loc_input" not in st.session_state:
-        st.session_state["new_loc_input"] = st.session_state.get("_active_new_loc_input", "")
+    # The location box only exists on these pages. Restore the last choice
+    # from a plain shadow key so a detour through Map Tracker does not wipe it.
+    if "loc_field" not in st.session_state and st.session_state.get("_active_loc_field"):
+        st.session_state.loc_field = st.session_state["_active_loc_field"]
 
-    search_col1, search_col2 = st.columns([1, 2])
-    with search_col1: 
-        loc_history_sel = st.selectbox(
-            "Select recent location:",
-            ["Select..."] + st.session_state.search_history,
-            key="loc_history_sel",
-            on_change=_on_loc_history_change,
-        )
-    with search_col2: 
-        new_loc_input = st.text_input(
-            "Or select new location (Press Enter to see options):",
-            key="new_loc_input",
-            on_change=_on_new_loc_input_change,
-        )
-    st.session_state["_active_loc_history_sel"] = loc_history_sel
-    st.session_state["_active_new_loc_input"] = new_loc_input
-    st.markdown("<div style='margin-bottom: 25px;'></div>", unsafe_allow_html=True)
+    saved = [
+        item for item in st.session_state.saved_locations
+        if item.get("lat") is not None and item.get("lon") is not None
+    ]
+    saved_labels = [_saved_loc_label(item) for item in saved]
+    saved_by_label = dict(zip(saved_labels, saved))
 
-    location = None
-    use_history = (
-        loc_history_sel != "Select..."
-        and st.session_state.get("loc_source") == "history"
-    )
-    if use_history:
-        location = _safe_geocode(loc_history_sel)
-    elif new_loc_input:
-        if new_loc_input != st.session_state.get("last_query"):
-            st.session_state.last_query = new_loc_input
+    current = st.session_state.get("loc_field")
+    pending = list(st.session_state.get("loc_pending_matches") or [])
+    if current in saved_labels:
+        pending = []
+        st.session_state.loc_pending_matches = []
+    elif current and current not in {item["label"] for item in pending}:
+        name = str(current).split(" (")[0].split(",")[0].strip()
+        known = next(
+            (
+                label for label in saved_labels
+                if label.startswith(name + " (") or label.startswith(name + ", ")
+            ),
+            None,
+        )
+        if known:
+            st.session_state.loc_field = known
+            pending = []
+        elif name:
             with st.spinner("Searching..."):
-                results = _safe_geocode(new_loc_input, exactly_one=False, limit=5)
-                st.session_state.geocode_results = results
-        results = st.session_state.get("geocode_results")
-        if results:
-            opts = {f"{r.address} (Lat: {r.latitude:.2f}, Lon: {r.longitude:.2f})": r for r in results}
-            chosen = st.selectbox("Multiple matches found. Select exact location:", list(opts.keys()))
-            location = opts[chosen]
-            short_name = location.address.split(",")[0].strip()
-            if short_name not in st.session_state.search_history:
-                st.session_state.search_history.insert(0, short_name)
-                if len(st.session_state.search_history) > 10: 
-                    st.session_state.search_history.pop()
-        else: 
-            st.warning("No results found.")
-    elif loc_history_sel != "Select...":
-        location = _safe_geocode(loc_history_sel)
+                found = _safe_geocode(name, exactly_one=False, limit=5) or []
+            pending = []
+            for hit in found:
+                short = hit.address.split(",")[0].strip()
+                pending.append({
+                    "label": _saved_loc_label({
+                        "name": short, "address": hit.address,
+                        "lat": hit.latitude, "lon": hit.longitude,
+                    }),
+                    "name": short,
+                    "address": hit.address,
+                    "lat": hit.latitude,
+                    "lon": hit.longitude,
+                })
+            if pending:
+                st.session_state.loc_field = pending[0]["label"]
+            else:
+                st.session_state.loc_field = None
+                st.warning("No results inside the map area.")
+        st.session_state.loc_pending_matches = pending
 
-    lat_target, lon_target = 52.52, 13.40 
-    if location:
-        lat_target, lon_target = round(location.latitude, 2), round(location.longitude, 2)
-        if not (-25 <= lon_target <= 45 and 30 <= lat_target <= 72):
-            st.warning(f"📍 Location {location.address} is outside the Europe domain.")
-            location = None
-        else: 
+    pending_labels = [item["label"] for item in pending]
+    options = list(dict.fromkeys([*pending_labels, *saved_labels]))
+    if st.session_state.get("loc_field") not in options:
+        st.session_state.pop("loc_field", None)
+    select_kwargs = {
+        "key": "loc_field",
+        "accept_new_options": True,
+        "placeholder": "Select a location",
+    }
+    if "loc_field" not in st.session_state:
+        select_kwargs["index"] = None
+    with st.container(key="target_location_row"):
+        loc_head, loc_field_col = st.columns([1, 3], vertical_alignment="center", gap="small")
+        with loc_head:
             st.markdown(
-                f"<div class='atmopulse-location-banner'>"
-                f"📍 <b>Location Matrix Active:</b> {location.address} | "
-                f"<b>{lat_target}°N, {lon_target}°E</b></div>",
+                "<p class='atmopulse-target-location-label'>Target Location:</p>",
                 unsafe_allow_html=True,
             )
+        with loc_field_col:
+            choice = st.selectbox(
+                "Select a location",
+                options,
+                label_visibility="collapsed",
+                **select_kwargs,
+            ) if options else None
+    st.session_state["_active_loc_field"] = choice
+
+    location = None
+    if choice in saved_by_label:
+        chosen_saved = saved_by_label[choice]
+        st.session_state.loc_pending_matches = []
+        location = _PointLocation(chosen_saved["address"], chosen_saved["lat"], chosen_saved["lon"])
+    else:
+        pending_hit = next((item for item in pending if item["label"] == choice), None)
+        if pending_hit is not None:
+            remembered = _remember_location(
+                pending_hit["name"], pending_hit["address"], pending_hit["lat"], pending_hit["lon"],
+            )
+            location = _PointLocation(remembered["address"], remembered["lat"], remembered["lon"])
+
+    lat_target, lon_target = 52.52, 13.40
+    if location:
+        lat_target, lon_target = round(location.latitude, 2), round(location.longitude, 2)
+        if not _in_map_domain(lat_target, lon_target):
+            st.warning(f"📍 Location {location.address} is outside the map area.")
+            location = None
 
     if location:
         render_grid_cell_profile(location.address, lat_target, lon_target)
@@ -1042,40 +1284,64 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
             _chart_layouts = (LAYOUT_SINGLE_CHART, LAYOUT_SIDE_BY_SIDE)
             if st.session_state.get("wave_layout") not in _chart_layouts:
                 st.session_state.wave_layout = LAYOUT_SINGLE_CHART
-            map_layout = st.radio(
-                "Layout:",
-                _chart_layouts,
-                horizontal=True,
-                key="wave_layout",
-            )
+            _period_choice = (epoch_short_label("A"), epoch_short_label("B"))
+            show_period = st.session_state.get("wave_layout", LAYOUT_SINGLE_CHART) == LAYOUT_SINGLE_CHART
+            if show_period and st.session_state.get("wave_ep") not in _period_choice:
+                raw = st.session_state.get("wave_ep", "")
+                st.session_state.wave_ep = (
+                    _period_choice[0] if epoch_from_label(raw or "B") == "A" else _period_choice[1]
+                )
+            with st.container(key="wave_top_controls"):
+                wave_cols = st.columns(2 if show_period else 1)
+                with wave_cols[0]:
+                    map_layout = st.radio(
+                        "Layout:",
+                        _chart_layouts,
+                        horizontal=True,
+                        key="wave_layout",
+                    )
+                if show_period:
+                    with wave_cols[1]:
+                        st.radio(
+                            "Select Reference Period:",
+                            _period_choice,
+                            horizontal=True,
+                            key="wave_ep",
+                        )
             param_code = meteo_var_code(wave_var)
             if is_aifs_model() and param_code in ("TX", "TN"):
                 st.warning(AIFS_TXTN_WARNING)
             else:
                 with st.spinner("Generating Historical Waves..."):
-                    (fig_m_a, fig_s_a, fig_f_a), (fig_m_b, fig_s_b, fig_f_b) = fetch_aligned_wave_figs(
-                        lat_target, lon_target, param_code, wave_thresh,
-                        is_warm=is_warm, z500_outline=wave_z500_outline,
-                        stack_metric=wave_stack_metric,
-                    )
-                    # A/B payloads for the Event Drill-down ranking/mini-charts
-                    # (user can toggle which reference period is ranked). Same
-                    # cached `_compute_wave_payload` fetch_aligned_wave_figs
-                    # already calls above, so these are cache hits, not extra
-                    # compute.
                     wave_payload_a = _compute_wave_payload(
                         lat_target, lon_target, param_code, "A", wave_thresh, is_warm=is_warm,
                     )
                     wave_payload_b = _compute_wave_payload(
                         lat_target, lon_target, param_code, "B", wave_thresh, is_warm=is_warm,
                     )
+                    from frontend_plots import build_kysely_wave_figs, union_wave_xrange
+
+                    def _wave_figs(payload, x_range):
+                        return build_kysely_wave_figs(
+                            payload, z500_outline=wave_z500_outline,
+                            stack_metric=wave_stack_metric, x_range=x_range,
+                        )
+
+                    side_by_side = map_layout == LAYOUT_SIDE_BY_SIDE
+                    if side_by_side:
+                        shared_x = union_wave_xrange(wave_payload_a, wave_payload_b)
+                        (fig_m_a, fig_s_a, fig_f_a) = _wave_figs(wave_payload_a, shared_x)
+                        (fig_m_b, fig_s_b, fig_f_b) = _wave_figs(wave_payload_b, shared_x)
+                    else:
+                        use_a_build = epoch_from_label(
+                            st.session_state.get("wave_ep", _period_choice[1])
+                        ) == "A"
+                        shown = wave_payload_a if use_a_build else wave_payload_b
+                        fig_m_a, fig_s_a, fig_f_a = _wave_figs(shown, None)
+                        fig_m_b, fig_s_b, fig_f_b = fig_m_a, fig_s_a, fig_f_a
                     wave_drill_ctx = (lat_target, lon_target, is_warm, param_code, wave_thresh)
 
-                # The old "Nth longest wave since 1940" rank banner was removed:
-                # the Event Drill-down table below already shows Rank, Start,
-                # End, Duration and Intensity for every detected event.
-
-                if fig_s_a.data and fig_s_b.data:
+                if side_by_side and fig_s_a.data and fig_s_b.data:
                     align_wave_stats_yranges(fig_s_a, fig_s_b, fig_f_a, fig_f_b)
 
                 stack_heading = (
@@ -1092,7 +1358,22 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                         f"{epoch_period_label(epoch)}"
                     )
 
+                def _show_wave_rank(epoch: str) -> None:
+                    banner = render_point_wavogram_narrative(
+                        location.address, lat_target, lon_target,
+                        parameter=param_code, selected_epoch=epoch,
+                        threshold_level=wave_thresh, target_date=target_date,
+                        is_warm=is_warm,
+                    )
+                    if banner:
+                        st.markdown(banner, unsafe_allow_html=True)
+
                 if map_layout == LAYOUT_SIDE_BY_SIDE:
+                    rank_l, rank_r = st.columns(2, gap="small")
+                    with rank_l:
+                        _show_wave_rank("A")
+                    with rank_r:
+                        _show_wave_rank("B")
                     with st.container(key="atmopulse_split_wave_ridge"):
                         w_col1, w_col2 = st.columns(2, gap="small")
                         with w_col1:
@@ -1137,7 +1418,7 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                             if show_expert("wave_annual_cycle"):
                                 _wave_section_spacer()
                                 st.markdown(
-                                    f"**Frequency [%] | {epoch_period_label('A')}**",
+                                    "**Frequency [%]**",
                                     help=HELP["wave_annual_cycle"],
                                 )
                                 st_plotly_press(
@@ -1156,7 +1437,7 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                             if show_expert("wave_annual_cycle"):
                                 _wave_section_spacer()
                                 st.markdown(
-                                    f"**Frequency [%] | {epoch_period_label('B')}**",
+                                    "**Frequency [%]**",
                                     help=HELP["wave_annual_cycle"],
                                 )
                                 st_plotly_press(
@@ -1164,13 +1445,9 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                                     export_title=_wave_export_title("Frequency [%]", "B"),
                                 )
                 else:
-                    flicker_epoch = st.radio(
-                        "Select Reference Period:",
-                        (epoch_period_label("A"), epoch_period_label("B")),
-                        horizontal=True, key="wave_ep", index=1,
-                    )
-                    use_a = epoch_from_label(flicker_epoch) == "A"
+                    use_a = epoch_from_label(st.session_state.get("wave_ep", _period_choice[1])) == "A"
                     ep = "A" if use_a else "B"
+                    _show_wave_rank(ep)
                     click_ep = st_plotly_press(
                         fig_m_a if use_a else fig_m_b, f"wavogram_ridge_{ep}",
                         on_select="rerun", selection_mode=("points",), key=f"wave_ridge_click_{ep}",
@@ -1191,7 +1468,7 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
                     if show_expert("wave_annual_cycle"):
                         _wave_section_spacer()
                         st.markdown(
-                            f"**Frequency [%] | {epoch_period_label(ep)}**",
+                            "**Frequency [%]**",
                             help=HELP["wave_annual_cycle"],
                         )
                         st_plotly_press(

@@ -40,6 +40,7 @@ from config import (
 from backend_analytics import compute_map_footprint, calculate_top10
 from frontend_plots import (
     _MAP_OVERLAY_TOGGLES,
+    _MSLP_HL_VERSION,
     _render_synoptic_map,
     get_cached_baseline_map,
     build_opacity_slider_map,
@@ -166,13 +167,12 @@ _COLD_PLAIN = {
 
 
 def _chip_style(direction: str, tier: str) -> str:
-    """Same 15px sentence size as the banner body (legend badges stay 12px)."""
+    """Severity as text colour. Legend badges keep their filled background."""
+    raw = legend_badge_style(direction, tier)
+    ink = raw.split("background-color:", 1)[1].split(";", 1)[0]
     return (
-        legend_badge_style(direction, tier)
-        .replace("font-size:12px;", f"font-size:{_BANNER_FONT_PX}px;")
-        .replace(f" font-weight:{ATMOPULSE_FONTS['ui_weight']};", " font-weight:inherit;")
-        .replace("padding: 1px 6px;", "padding: 0 6px;")
-        + " vertical-align: baseline;"
+        f"background:none; color:{ink}; padding:0; border-radius:0;"
+        f" font-size:{_BANNER_FONT_PX}px; font-weight:400; vertical-align:baseline;"
     )
 
 
@@ -198,7 +198,7 @@ def _daily_legend_html(top10_threshold: str) -> str:
 
     return (
         f"<div class='atmopulse-map-legend atmopulse-subsection-label' "
-        f"style='margin-top: 18px; margin-bottom: 12px; white-space: nowrap;'>"
+        f"style='margin-top: -12px; margin-bottom: 8px; white-space: nowrap;'>"
         f"<b>Legend.</b> "
         f"Warm: <span style='{s('warm', 'moderate')}'>Moderate</span> "
         f"<span style='{s('warm', 'strong')}'>Strong</span> "
@@ -217,12 +217,11 @@ def _banner_wrap(inner: str) -> str:
     bg = ATMOPULSE_BRAND["nav_bg"]
     fg = ATMOPULSE_BRAND["text_on_light"]
     font = ATMOPULSE_FONTS["outfit_css"]
-    weight = ATMOPULSE_FONTS["ui_weight"]
     return (
-        f"<div class='atmopulse-narrative-banner' style='"
-        f"background-color:{bg}; color:{fg}; padding:0.75rem 1rem; "
-        f"border-radius:0.5rem; font-family:{font}; font-weight:{weight}; "
-        f"font-size:{_BANNER_FONT_PX}px; line-height:1.55; margin:0 0 1.15rem 0;'>"
+        f"<div class='atmopulse-narrative-banner is-under-figure is-map' style='"
+        f"background-color:{bg}; color:{fg}; padding:0.4rem 0.75rem; "
+        f"border-radius:0.5rem; font-family:{font}; font-weight:400; "
+        f"font-size:{_BANNER_FONT_PX}px; line-height:1.45; margin:0.2rem 0 0.15rem 0;'>"
         f"{inner}</div>"
     )
 
@@ -241,13 +240,54 @@ def _single_footprint_banner(footprint: dict, active_tier: str, baseline_label: 
     cold_pct = footprint[active_tier]["cold_pct"]
     colder = baseline_label.startswith("1961")
     lead = (
-        f"Against the colder historical baseline ({html.escape(baseline_label)})"
+        f"Against the colder historical reference period ({html.escape(baseline_label)})"
         if colder
-        else f"Against the warmer recent baseline ({html.escape(baseline_label)})"
+        else f"Against the warmer recent reference period ({html.escape(baseline_label)})"
     )
     return _banner_wrap(
         f"{lead}, {_europe_clause(active_tier, warm_pct, cold_pct)}."
     )
+
+
+def _date_half_banner(footprint: dict, active_tier: str, baseline_label: str, day) -> str:
+    """One date's footprint sentence, for the left or right column."""
+    colder = baseline_label.startswith("1961")
+    lead = (
+        f"Against the colder historical reference period ({html.escape(baseline_label)})"
+        if colder
+        else f"Against the warmer recent reference period ({html.escape(baseline_label)})"
+    )
+    stamp = pd.Timestamp(day).strftime("%d.%m.%Y")
+    warm_pct = footprint[active_tier]["warm_pct"]
+    cold_pct = footprint[active_tier]["cold_pct"]
+    return _banner_wrap(
+        f"{lead}, on {html.escape(stamp)} {_europe_clause(active_tier, warm_pct, cold_pct)}."
+    )
+
+
+def _pair_banner_html(left_html: str | None, right_html: str | None) -> str | None:
+    """Two sentences side by side, for the slot between a shared title and the map."""
+    if not left_html and not right_html:
+        return None
+    return (
+        "<div style='display:flex;gap:0.75rem;align-items:stretch'>"
+        f"<div style='flex:1 1 0;min-width:0'>{left_html or ''}</div>"
+        f"<div style='flex:1 1 0;min-width:0'>{right_html or ''}</div>"
+        "</div>"
+    )
+
+
+def _render_split_banners(left_html: str | None, right_html: str | None) -> None:
+    """Period 1 under the left half, period 2 under the right half."""
+    if not left_html and not right_html:
+        return
+    left_col, right_col = st.columns(2, gap="small")
+    with left_col:
+        if left_html:
+            st.markdown(left_html, unsafe_allow_html=True)
+    with right_col:
+        if right_html:
+            st.markdown(right_html, unsafe_allow_html=True)
 
 
 def _compare_footprint_banner(footprint_a: dict, footprint_b: dict, active_tier: str) -> str:
@@ -258,9 +298,9 @@ def _compare_footprint_banner(footprint_a: dict, footprint_b: dict, active_tier:
     epoch_a = html.escape(EPOCH_LABELS["A"])
     epoch_b = html.escape(EPOCH_LABELS["B"])
     return _banner_wrap(
-        f"Against the colder historical baseline ({epoch_a}), "
+        f"Against the colder historical reference period ({epoch_a}), "
         f"{_europe_clause(active_tier, wa, ca)}. "
-        f"Against the warmer recent baseline ({epoch_b}), "
+        f"Against the warmer recent reference period ({epoch_b}), "
         f"{_europe_clause(active_tier, wb, cb)}."
     )
 
@@ -269,11 +309,13 @@ def _dates_footprint_banner(
     footprint_live: dict, footprint_arch: dict, active_tier: str,
     baseline_label: str, live_date, arch_date,
 ) -> str:
+    """Kept for callers that want one sentence. The map renders the two
+    halves under their own date fields."""
     colder = baseline_label.startswith("1961")
     lead = (
-        f"Against the colder historical baseline ({html.escape(baseline_label)})"
+        f"Against the colder historical reference period ({html.escape(baseline_label)})"
         if colder
-        else f"Against the warmer recent baseline ({html.escape(baseline_label)})"
+        else f"Against the warmer recent reference period ({html.escape(baseline_label)})"
     )
     live_s = pd.Timestamp(live_date).strftime("%d.%m.%Y")
     arch_s = pd.Timestamp(arch_date).strftime("%d.%m.%Y")
@@ -285,6 +327,46 @@ def _dates_footprint_banner(
         f"{lead}, on {html.escape(live_s)} {_europe_clause(active_tier, wl, cl)}. "
         f"On {html.escape(arch_s)} {_europe_clause(active_tier, wa, ca)}."
     )
+
+
+def _render_dates_footprint_banner(
+    footprint_live: dict, footprint_arch: dict, active_tier: str,
+    baseline_label: str, live_date, arch_date,
+) -> None:
+    """Left date under Archive date, right date under Compare with."""
+    colder = baseline_label.startswith("1961")
+    lead = (
+        f"Against the colder historical reference period ({html.escape(baseline_label)})"
+        if colder
+        else f"Against the warmer recent reference period ({html.escape(baseline_label)})"
+    )
+
+    def _one(day, warm_pct, cold_pct) -> str:
+        stamp = pd.Timestamp(day).strftime("%d.%m.%Y")
+        return _banner_wrap(
+            f"{lead}, on {html.escape(stamp)} "
+            f"{_europe_clause(active_tier, warm_pct, cold_pct)}."
+        )
+
+    left, right = st.columns(2, gap="small")
+    with left:
+        st.markdown(
+            _one(
+                live_date,
+                footprint_live[active_tier]["warm_pct"],
+                footprint_live[active_tier]["cold_pct"],
+            ),
+            unsafe_allow_html=True,
+        )
+    with right:
+        st.markdown(
+            _one(
+                arch_date,
+                footprint_arch[active_tier]["warm_pct"],
+                footprint_arch[active_tier]["cold_pct"],
+            ),
+            unsafe_allow_html=True,
+        )
 
 
 def _shift_map_compare_date(days: int) -> None:
@@ -299,10 +381,12 @@ def _shift_map_compare_date(days: int) -> None:
 
 def map_compare_prev_day():
     _shift_map_compare_date(-1)
+    st.session_state["_map_show_side"] = "right"
 
 
 def map_compare_next_day():
     _shift_map_compare_date(1)
+    st.session_state["_map_show_side"] = "right"
 
 
 _MAP_DATE_MIN = pd.Timestamp(1940, 1, 1).date()
@@ -322,14 +406,24 @@ def _shift_map_archive_date(days: int) -> None:
 
 def map_archive_prev_day():
     _shift_map_archive_date(-1)
+    st.session_state["_map_show_side"] = "left"
 
 
 def map_archive_next_day():
     _shift_map_archive_date(1)
+    st.session_state["_map_show_side"] = "left"
+
+
+def _show_map_left():
+    st.session_state["_map_show_side"] = "left"
+
+
+def _show_map_right():
+    st.session_state["_map_show_side"] = "right"
 
 
 def _render_day_buttons(prev_key, next_key, on_prev, on_next, current, max_d):
-    c1, c2, _rest = st.columns([1, 1, 1.35], gap="small")
+    c1, c2 = st.columns(2, gap="small")
     with c1:
         st.button(
             "← Day before", key=prev_key, on_click=on_prev,
@@ -345,37 +439,41 @@ def _render_day_buttons(prev_key, next_key, on_prev, on_next, current, max_d):
 def _render_archive_date_picker():
     """Archive calendar above the map it drives. Key matches the sidebar seed."""
     max_d = _map_date_max()
-    st.date_input(
-        "Archive date:",
-        min_value=_MAP_DATE_MIN,
-        max_value=max_d,
-        key="map_archive_date",
-        format="DD.MM.YYYY",
-        help=HELP["map_archive_clock"],
-    )
-    st.session_state["_active_map_archive_date"] = st.session_state.map_archive_date
-    _render_day_buttons(
-        "map_archive_prev_btn", "map_archive_next_btn",
-        map_archive_prev_day, map_archive_next_day,
-        st.session_state.map_archive_date, max_d,
-    )
+    with st.container(key="map_archive_clock"):
+        st.date_input(
+            "Archive date:",
+            min_value=_MAP_DATE_MIN,
+            max_value=max_d,
+            key="map_archive_date",
+            format="DD.MM.YYYY",
+            help=HELP["map_archive_clock"],
+            on_change=_show_map_left,
+        )
+        st.session_state["_active_map_archive_date"] = st.session_state.map_archive_date
+        _render_day_buttons(
+            "map_archive_prev_btn", "map_archive_next_btn",
+            map_archive_prev_day, map_archive_next_day,
+            st.session_state.map_archive_date, max_d,
+        )
 
 
 def _render_compare_date_picker():
     max_d = _map_date_max()
-    st.date_input(
-        "Compare with:",
-        min_value=_MAP_DATE_MIN,
-        max_value=max_d,
-        key="map_compare_date",
-        format="DD.MM.YYYY",
-        help=HELP["map_compare_date"],
-    )
-    _render_day_buttons(
-        "map_compare_prev_btn", "map_compare_next_btn",
-        map_compare_prev_day, map_compare_next_day,
-        st.session_state.map_compare_date, max_d,
-    )
+    with st.container(key="map_compare_clock"):
+        st.date_input(
+            "Compare with:",
+            min_value=_MAP_DATE_MIN,
+            max_value=max_d,
+            key="map_compare_date",
+            format="DD.MM.YYYY",
+            help=HELP["map_compare_date"],
+            on_change=_show_map_right,
+        )
+        _render_day_buttons(
+            "map_compare_prev_btn", "map_compare_next_btn",
+            map_compare_prev_day, map_compare_next_day,
+            st.session_state.map_compare_date, max_d,
+        )
 
 
 def _render_map_date_controls(map_is_archive, compare_dates, map_layout, live_label, arch_label):
@@ -386,22 +484,41 @@ def _render_map_date_controls(map_is_archive, compare_dates, map_layout, live_la
     opacity, and swipe keep both clocks above the one map.
     """
     if compare_dates:
-        left, right = st.columns(2, gap="small")
-        with left:
-            if map_is_archive:
-                _render_archive_date_picker()
-            elif live_label:
-                st.markdown(f"**{live_label}**", help=HELP["map_live_clock"])
-        with right:
-            _render_compare_date_picker()
+        with st.container(key="map_date_pair"):
+            left, right = st.columns(2, gap="small")
+            with left:
+                if map_is_archive:
+                    _render_archive_date_picker()
+                elif live_label:
+                    if map_layout == LAYOUT_SINGLE_MAP:
+                        st.button(
+                            live_label,
+                            key="map_show_live_label",
+                            on_click=_show_map_left,
+                            help=HELP["map_live_clock"],
+                        )
+                    else:
+                        st.markdown(f"**{live_label}**", help=HELP["map_live_clock"])
+            with right:
+                _render_compare_date_picker()
         if map_layout == LAYOUT_SINGLE_MAP and live_label and arch_label:
-            if st.session_state.get("map_flicker_date") not in (live_label, arch_label):
-                st.session_state.map_flicker_date = live_label
-            st.radio(
-                "Show date:",
-                (live_label, arch_label),
-                horizontal=True,
-                key="map_flicker_date",
+            side = st.session_state.get("_map_show_side", "left")
+            clock = "map_compare_clock" if side == "right" else "map_archive_clock"
+            live_mark = (
+                ".st-key-map_show_live_label button { box-shadow: inset 0 -2px 0 #0056B3 !important; }"
+                if side != "right" else ""
+            )
+            st.markdown(
+                "<style>"
+                f".st-key-{clock} input {{ box-shadow: inset 0 0 0 2px #0056B3 !important; }}"
+                ".st-key-map_show_live_label button {"
+                "background: transparent !important; border: none !important;"
+                "padding: 0 !important; min-height: 0 !important;"
+                "font-weight: 700 !important; color: inherit !important;"
+                "}"
+                f"{live_mark}"
+                "</style>",
+                unsafe_allow_html=True,
             )
         return
     if map_is_archive:
@@ -523,6 +640,7 @@ def _render_expert_severity(
         body = _severity_single_html(footprint_single, active_tier)
     else:
         return
+    st.markdown("<div class='atmopulse-europe-share-gap'></div>", unsafe_allow_html=True)
     st.markdown("**Share of Europe**", help=HELP[help_key])
     st.markdown(body, unsafe_allow_html=True)
 
@@ -552,31 +670,85 @@ def render_map_tracker(
     # Compare axis is orthogonal to Map Layout: A/B climatology at one date,
     # or two dates at one climatology. Layout then applies to that pair.
     if "map_compare_axis" not in st.session_state:
-        st.session_state.map_compare_axis = STANDARD_DEFAULTS["map_compare"]
+        saved_axis = st.session_state.get("_active_map_compare_axis", STANDARD_DEFAULTS["map_compare"])
+        st.session_state.map_compare_axis = (
+            saved_axis if saved_axis in (COMPARE_EPOCHS, COMPARE_DATES)
+            else STANDARD_DEFAULTS["map_compare"]
+        )
     elif st.session_state.map_compare_axis not in (COMPARE_EPOCHS, COMPARE_DATES):
         # Session still holding the old "Dates (Live vs Archive)" label.
         st.session_state.map_compare_axis = COMPARE_DATES
-    _map_layouts = (LAYOUT_SINGLE_MAP, LAYOUT_SIDE_BY_SIDE, LAYOUT_SWIPE, LAYOUT_OPACITY)
+    _map_layouts = (
+        (LAYOUT_SINGLE_MAP, LAYOUT_SIDE_BY_SIDE, LAYOUT_SWIPE, LAYOUT_OPACITY)
+        if is_expert_mode()
+        else (LAYOUT_SINGLE_MAP, LAYOUT_SIDE_BY_SIDE, LAYOUT_SWIPE)
+    )
+    if "map_layout" not in st.session_state:
+        saved_layout = st.session_state.get("_active_map_layout")
+        if saved_layout in _map_layouts:
+            st.session_state.map_layout = saved_layout
     if st.session_state.get("map_layout") not in _map_layouts:
         st.session_state.map_layout = LAYOUT_SINGLE_MAP
-    top1, top2 = st.columns([1.05, 2.15])
-    with top1:
-        compare_axis = st.radio(
-            "Compare:",
-            (COMPARE_EPOCHS, COMPARE_DATES),
-            horizontal=True,
-            key="map_compare_axis",
-            help=HELP["map_compare_axis"],
+    _colour_against = ("Historical (1961–1990)", "Recent (1996–2025)")
+    _period_choice = _colour_against
+    _compare_now = st.session_state.get("map_compare_axis", STANDARD_DEFAULTS["map_compare"])
+    _layout_now = st.session_state.get("map_layout", LAYOUT_SINGLE_MAP)
+    show_colour = _compare_now == COMPARE_DATES and is_expert_mode()
+    show_period = _compare_now != COMPARE_DATES and _layout_now == LAYOUT_SINGLE_MAP
+    if show_colour and st.session_state.get("map_date_epoch") not in _colour_against:
+        raw = st.session_state.get("map_date_epoch", "")
+        st.session_state.map_date_epoch = (
+            _colour_against[0] if epoch_from_label(raw or "B") == "A" else _colour_against[1]
         )
-    with top2:
-        map_layout = st.radio(
-            "Map Layout:",
-            _map_layouts,
-            horizontal=True,
-            key="map_layout",
+    if show_period and st.session_state.get("map_flicker_epoch") not in _period_choice:
+        raw = st.session_state.get("map_flicker_epoch", "")
+        st.session_state.map_flicker_epoch = (
+            _period_choice[0] if epoch_from_label(raw or "B") == "A" else _period_choice[1]
         )
-    compare_dates = compare_axis == COMPARE_DATES
+    flicker_epoch = None
     date_epoch = "B"
+    show_third = show_colour or show_period
+    with st.container(key="map_top_controls" if show_third else "map_top_pair"):
+        if show_third:
+            top1, top2, top3 = st.columns(3)
+        else:
+            top1, top2 = st.columns([1.05, 2.15])
+            top3 = None
+        with top1:
+            compare_axis = st.radio(
+                "Compare:",
+                (COMPARE_EPOCHS, COMPARE_DATES),
+                horizontal=True,
+                key="map_compare_axis",
+                help=HELP["map_compare_axis"],
+            )
+        with top2:
+            map_layout = st.radio(
+                "Map Layout:",
+                _map_layouts,
+                horizontal=True,
+                key="map_layout",
+            )
+        if show_colour:
+            with top3:
+                date_epoch = epoch_from_label(st.radio(
+                    "Colour against Reference Period:",
+                    _colour_against,
+                    horizontal=True,
+                    key="map_date_epoch",
+                    help=HELP["map_date_epoch"],
+                ))
+        elif show_period:
+            with top3:
+                flicker_epoch = st.radio(
+                    "Select Reference Period:",
+                    _period_choice,
+                    horizontal=True,
+                    key="map_flicker_epoch",
+                )
+    st.session_state["_active_map_compare_axis"] = compare_axis
+    st.session_state["_active_map_layout"] = map_layout
+    compare_dates = compare_axis == COMPARE_DATES
     live_label = arch_label = None
     compare_date = None
     if compare_dates:
@@ -586,21 +758,13 @@ def render_map_tracker(
             target_date, years_back=1, min_date=_min_archive, max_date=_max_archive,
         )
         if "map_compare_date" not in st.session_state:
-            st.session_state.map_compare_date = analog.date()
+            saved_day = st.session_state.get("_active_map_compare_date")
+            st.session_state.map_compare_date = saved_day if saved_day is not None else analog.date()
         else:
             st.session_state.map_compare_date = min(
                 st.session_state.map_compare_date, _max_archive.date(),
             )
-        if is_expert_mode():
-            if "map_date_epoch" not in st.session_state:
-                st.session_state.map_date_epoch = epoch_period_label("B")
-            date_epoch = epoch_from_label(st.radio(
-                "Colour against:",
-                (epoch_period_label("A"), epoch_period_label("B")),
-                horizontal=True,
-                key="map_date_epoch",
-                help=HELP["map_date_epoch"],
-            ))
+        st.session_state["_active_map_compare_date"] = st.session_state.map_compare_date
         compare_date = pd.Timestamp(st.session_state.map_compare_date)
         left_when = pd.Timestamp(target_date).strftime("%d.%m.%Y")
         right_when = compare_date.strftime("%d.%m.%Y")
@@ -616,21 +780,17 @@ def render_map_tracker(
     _render_map_date_controls(
         map_is_archive, compare_dates, map_layout, live_label, arch_label,
     )
+    if map_layout != LAYOUT_SINGLE_MAP and (compare_dates or map_is_archive):
+        st.markdown("<div class='atmopulse-date-title-gap'></div>", unsafe_allow_html=True)
 
-    flicker_epoch = None
     flicker_date_choice = None
-    if map_layout == LAYOUT_SINGLE_MAP:
-        if compare_dates:
-            flicker_date_choice = st.session_state.get("map_flicker_date", live_label)
-        else:
-            if "map_flicker_epoch" not in st.session_state:
-                st.session_state.map_flicker_epoch = epoch_period_label("B")
-            flicker_epoch = st.radio(
-                "Select Reference Period:",
-                (epoch_period_label("A"), epoch_period_label("B")),
-                horizontal=True,
-                key="map_flicker_epoch",
-            )
+    if map_layout == LAYOUT_SINGLE_MAP and compare_dates and live_label and arch_label:
+        if "_map_show_side" not in st.session_state:
+            prev = st.session_state.get("map_flicker_date")
+            st.session_state["_map_show_side"] = "right" if prev == arch_label else "left"
+        flicker_date_choice = (
+            arch_label if st.session_state.get("_map_show_side") == "right" else live_label
+        )
 
     if not is_daily_map_view(view_mode):
         _, pers_meta = _load_persistence_daily_series(
@@ -654,10 +814,6 @@ def render_map_tracker(
             )
         else:
             st.info(f"**Persistence Mode Active:** Showing number of consecutive days with target percentiles, ending on {target_date.strftime('%d.%m.%Y')}.")
-        if compare_dates and compare_date is not None:
-            st.caption(
-                f"Right panel persistence ends on {compare_date.strftime('%d.%m.%Y')} (ERA5 only)."
-            )
 
     def _render_impact_table(title: str, df, impact_col: str) -> None:
         st.markdown(_top10_header_html(title), unsafe_allow_html=True)
@@ -669,7 +825,7 @@ def render_map_tracker(
             column_config={
                 "Country": st.column_config.TextColumn("Country", width=120),
                 impact_col: st.column_config.ProgressColumn(
-                    "Area %", format="%.1f%%", min_value=0, max_value=100, width=160
+                    "Area %", format="%.1f%%", min_value=0, max_value=100, width=110
                 ),
             },
             hide_index=True,
@@ -677,6 +833,7 @@ def render_map_tracker(
         )
 
     def render_top10_period(df_h, df_c, period_label=None):
+        st.markdown("<div class='atmopulse-map-table-gap'></div>", unsafe_allow_html=True)
         if period_label:
             st.markdown(f"**{period_label}**")
         wcol, ccol = st.columns(2, gap="medium")
@@ -697,12 +854,9 @@ def render_map_tracker(
     # involved at all), so it is exempt here (forecast_model is already
     # forced to IFS above for map_is_archive).
     aifs_txtn_blocked = (not map_is_archive) and is_aifs_model() and map_var_code in ("TX", "TN")
-    aifs_hatch_blocked = (not map_is_archive) and is_aifs_model() and bool(toggles.get("hatching"))
-    if aifs_txtn_blocked or aifs_hatch_blocked:
+    if aifs_txtn_blocked:
         st.warning(AIFS_TXTN_WARNING)
     if not aifs_txtn_blocked:
-        if aifs_hatch_blocked:
-            toggles = {**toggles, "hatching": False}
         try:
             needed_vars = synoptic_vars_for_map(map_var_code, toggles, view_mode)
 
@@ -784,6 +938,9 @@ def render_map_tracker(
                 arch_phys = None
 
             footprint_a = footprint_b = footprint_single = None
+            banner_html = None
+            banner_left = None
+            banner_right = None
             active_tier = "strong"
             if is_daily_map_view(view_mode):
                 active_tier = {
@@ -810,9 +967,9 @@ def render_map_tracker(
                             source_mtime if use_live else arch_mtime,
                         )
                         if footprint_single:
-                            _render_html(_single_footprint_banner(
+                            banner_html = _single_footprint_banner(
                                 footprint_single, active_tier, EPOCH_LABELS[date_epoch],
-                            ))
+                            )
                     else:
                         active_epoch = epoch_from_label(flicker_epoch)
                         footprint_single = _fp(
@@ -820,9 +977,9 @@ def render_map_tracker(
                             anchor_date_str, source_mtime,
                         )
                         if footprint_single:
-                            _render_html(_single_footprint_banner(
+                            banner_html = _single_footprint_banner(
                                 footprint_single, active_tier, EPOCH_LABELS[active_epoch],
-                            ))
+                            )
                 else:
                     if compare_dates:
                         footprint_a = _fp(
@@ -833,11 +990,14 @@ def render_map_tracker(
                             arch_phys, arch_date_str, date_epoch,
                             arch_anchor_str, arch_mtime,
                         )
-                        if footprint_a and footprint_b:
-                            _render_html(_dates_footprint_banner(
-                                footprint_a, footprint_b, active_tier,
-                                EPOCH_LABELS[date_epoch], target_date, compare_date,
-                            ))
+                        if footprint_a:
+                            banner_left = _date_half_banner(
+                                footprint_a, active_tier, EPOCH_LABELS[date_epoch], target_date,
+                            )
+                        if footprint_b:
+                            banner_right = _date_half_banner(
+                                footprint_b, active_tier, EPOCH_LABELS[date_epoch], compare_date,
+                            )
                     else:
                         footprint_a = _fp(
                             map_phys_data, target_date_str, "A",
@@ -847,31 +1007,14 @@ def render_map_tracker(
                             map_phys_data, target_date_str, "B",
                             anchor_date_str, source_mtime,
                         )
-                        if footprint_a and footprint_b:
-                            _render_html(_compare_footprint_banner(
-                                footprint_a, footprint_b, active_tier,
-                            ))
-
-                if is_expert_mode():
-                    sev_headers = None
-                    sev_change = True
-                    sev_help = "europe_share_table"
-                    if compare_dates:
-                        sev_headers = (
-                            "",
-                            pd.Timestamp(target_date).strftime("%d.%m.%Y"),
-                            pd.Timestamp(compare_date).strftime("%d.%m.%Y"),
-                        )
-                        sev_change = False
-                        sev_help = "europe_share_table_dates"
-                    _render_expert_severity(
-                        footprint_a=footprint_a, footprint_b=footprint_b,
-                        footprint_single=footprint_single, active_tier=active_tier,
-                        compare=map_layout != LAYOUT_SINGLE_MAP,
-                        headers=sev_headers, with_change=sev_change,
-                        help_key=sev_help,
-                    )
-                st.markdown(_daily_legend_html(top10_threshold), unsafe_allow_html=True)
+                        if footprint_a:
+                            banner_left = _single_footprint_banner(
+                                footprint_a, active_tier, EPOCH_LABELS["A"],
+                            )
+                        if footprint_b:
+                            banner_right = _single_footprint_banner(
+                                footprint_b, active_tier, EPOCH_LABELS["B"],
+                            )
 
             overlay_names = frozenset(
                 name for name, active in toggles.items()
@@ -889,6 +1032,8 @@ def render_map_tracker(
                     mtime, model,
                     full_width=full_width, anchor_date_str=anchor_str,
                     spell_days=spell_days,
+                    hl_version=_MSLP_HL_VERSION,
+                    mslp_span_version=4,
                     _ref_data=ref_clim, _map_phys_data=phys,
                     _syn_clim=syn_clim,
                 )
@@ -914,6 +1059,33 @@ def render_map_tracker(
             left_anchor_str = pd.Timestamp(left_anchor).strftime("%Y-%m-%d")
             right_anchor_str = pd.Timestamp(right_anchor).strftime("%Y-%m-%d")
 
+            def _daily_legend():
+                if is_daily_map_view(view_mode):
+                    return _daily_legend_html(top10_threshold)
+                return None
+
+            def _render_share_of_europe():
+                if not is_daily_map_view(view_mode) or not is_expert_mode():
+                    return
+                sev_headers = None
+                sev_change = True
+                sev_help = "europe_share_table"
+                if compare_dates:
+                    sev_headers = (
+                        "",
+                        pd.Timestamp(target_date).strftime("%d.%m.%Y"),
+                        pd.Timestamp(compare_date).strftime("%d.%m.%Y"),
+                    )
+                    sev_change = False
+                    sev_help = "europe_share_table_dates"
+                _render_expert_severity(
+                    footprint_a=footprint_a, footprint_b=footprint_b,
+                    footprint_single=footprint_single, active_tier=active_tier,
+                    compare=map_layout != LAYOUT_SINGLE_MAP,
+                    headers=sev_headers, with_change=sev_change,
+                    help_key=sev_help,
+                )
+
             if map_layout == LAYOUT_SIDE_BY_SIDE:
                 fig_a = _cached_map_for(
                     left_date_str, left_epoch, left_mtime, left_model, left_phys, left_anchor_str,
@@ -927,11 +1099,33 @@ def render_map_tracker(
                         _render_synoptic_map(
                             fig_a, left_title, "map_a",
                             export_title=_title_for(left_title, left_date),
+                            show_footer=False,
+                            banner_html=banner_left,
                         )
                     with mc2:
                         _render_synoptic_map(
                             fig_b, right_title, "map_b",
                             export_title=_title_for(right_title, right_date),
+                            show_footer=False,
+                            banner_html=banner_right,
+                        )
+                _map_legend = _daily_legend()
+                if _map_legend:
+                    st.markdown(_map_legend, unsafe_allow_html=True)
+                with st.container(key="atmopulse_split_map_foot"):
+                    mc1, mc2 = st.columns(2, gap="small")
+                    with mc1:
+                        _render_synoptic_map(
+                            fig_a, left_title, "map_a",
+                            export_title=_title_for(left_title, left_date),
+                            show_chart=False,
+                        )
+                    with mc2:
+                        _render_synoptic_map(
+                            fig_b, right_title, "map_b",
+                            export_title=_title_for(right_title, right_date),
+                            show_chart=False,
+                            show_credit=False,
                         )
                 with st.container(key="atmopulse_split_map_tables"):
                     mc1, mc2 = st.columns(2, gap="small")
@@ -941,6 +1135,7 @@ def render_map_tracker(
                     with mc2:
                         df_h_b, df_c_b = _top10(right_phys, right_date, right_epoch, right_anchor, right_mtime)
                         render_top10_period(df_h_b, df_c_b)
+                _render_share_of_europe()
             elif map_layout in (LAYOUT_OPACITY, LAYOUT_SWIPE):
                 fig_a = _cached_map_for(
                     left_date_str, left_epoch, left_mtime, left_model, left_phys, left_anchor_str,
@@ -958,8 +1153,8 @@ def render_map_tracker(
                         swipe_help = "Drag the map or the slider to compare the two dates."
                     else:
                         swipe_title = (
-                            "Swipe: Historical Reference Period (left) | "
-                            "Recent Reference Period (right)"
+                            "Swipe Reference Periods: Historical (1961–1990, left) | "
+                            "Recent (1996–2025, right)"
                         )
                         swipe_help = (
                             "Drag the map or the slider: left is 1961–1990, right is 1996–2025."
@@ -970,8 +1165,19 @@ def render_map_tracker(
                         help_text=swipe_help,
                         export_title_a=_title_for(left_title, left_date),
                         export_title_b=_title_for(right_title, right_date),
+                        legend_html=_daily_legend(),
+                        banner_html=_pair_banner_html(banner_left, banner_right),
                     )
                 else:
+                    if compare_dates:
+                        opacity_title = f"Opacity: {left_title} (left) | {right_title} (right)"
+                        end_left, end_right = left_title, right_title
+                    else:
+                        opacity_title = (
+                            "Opacity Reference Periods: Historical (1961–1990, left) | "
+                            "Recent (1996–2025, right)"
+                        )
+                        end_left, end_right = "Historical", "Recent"
                     opacity_help = (
                         "Drag the slider under the map to cross-fade between the two dates."
                         if compare_dates else
@@ -979,17 +1185,19 @@ def render_map_tracker(
                     )
                     _render_synoptic_map(
                         build_opacity_slider_map(
-                            fig_a, fig_b, label_a=left_title, label_b=right_title,
+                            fig_a, fig_b, label_a=end_left, label_b=end_right,
                         ),
-                        f"Opacity: {left_title} ↔ {right_title}",
+                        opacity_title,
                         "map_opacity",
-                        bottom_margin=60,
+                        bottom_margin=39,
                         export_title=map_export_title(
                             map_var_code, view_mode,
                             f"{left_title} ↔ {right_title}",
                             left_date, persist_metric,
                         ),
                         help_text=opacity_help,
+                        legend_html=_daily_legend(),
+                        banner_html=_pair_banner_html(banner_left, banner_right),
                     )
                 with st.container(key="atmopulse_split_map_tables_overlay"):
                     map_col1, map_col2 = st.columns(2, gap="small")
@@ -999,6 +1207,7 @@ def render_map_tracker(
                     with map_col2:
                         df_h_b, df_c_b = _top10(right_phys, right_date, right_epoch, right_anchor, right_mtime)
                         render_top10_period(df_h_b, df_c_b, right_title)
+                _render_share_of_europe()
             else:
                 if compare_dates:
                     use_live = flicker_date_choice == live_label
@@ -1015,6 +1224,8 @@ def render_map_tracker(
                     _render_synoptic_map(
                         fig, flicker_title, "map_flicker",
                         export_title=_title_for(flicker_title, left_date if use_live else right_date),
+                        legend_html=_daily_legend(),
+                        banner_html=banner_html,
                     )
                     df_h, df_c = _top10(
                         left_phys if use_live else right_phys,
@@ -1024,6 +1235,7 @@ def render_map_tracker(
                         left_mtime if use_live else right_mtime,
                     )
                     render_top10_tables(df_h, df_c)
+                    _render_share_of_europe()
                 else:
                     ep_sel = epoch_from_label(flicker_epoch)
                     flicker_title = epoch_period_label(ep_sel)
@@ -1035,10 +1247,13 @@ def render_map_tracker(
                         flicker_title,
                         "map_flicker",
                         export_title=_title_for(flicker_title, target_date),
+                        legend_html=_daily_legend(),
+                        banner_html=banner_html,
                     )
                     df_h, df_c = _top10(
                         map_phys_data, target_date, ep_sel, anchor_date, source_mtime,
                     )
                     render_top10_tables(df_h, df_c)
+                    _render_share_of_europe()
         except Exception as e:
             st.error(f"Error loading maps: {e}")

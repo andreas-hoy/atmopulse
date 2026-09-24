@@ -173,6 +173,13 @@ def epoch_period_label(epoch: str) -> str:
     return f"{EPOCH_PERIOD_NAME[key]} ({EPOCH_LABELS[key]})"
 
 
+def epoch_short_label(epoch: str) -> str:
+    """Radio option: Historical (1961–1990) / Recent (1996–2025)."""
+    key = "A" if str(epoch).upper().startswith("A") else "B"
+    name = "Historical" if key == "A" else "Recent"
+    return f"{name} ({EPOCH_LABELS[key]})"
+
+
 def epoch_from_label(text: str) -> str:
     """Parse a radio/title string to epoch A or B (do not use `'A' in label`)."""
     raw = str(text)
