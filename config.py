@@ -40,6 +40,13 @@ FORECAST_MODEL_OPTIONS = (FORECAST_MODEL_IFS, FORECAST_MODEL_AIFS)
 
 MAP_VIEW_DAILY = "Daily snapshot"
 MAP_VIEW_PERSISTENCE = "Persistence duration"
+MAP_VIEW_WAVES = "Wave tracking"
+
+# Map Tracker view radio, by audience mode. Standard omits Persistence;
+# Wave tracking is offered in both, always after Persistence when present.
+# Default view (STANDARD_DEFAULTS["map_view"]) stays MAP_VIEW_DAILY.
+MAP_VIEW_OPTIONS_STANDARD = (MAP_VIEW_DAILY, MAP_VIEW_WAVES)
+MAP_VIEW_OPTIONS_EXPERT = (MAP_VIEW_DAILY, MAP_VIEW_PERSISTENCE, MAP_VIEW_WAVES)
 
 # Map Tracker offers all four. Meteogram and Wavogram offer the chart pair.
 # Single Map / Single chart is the opening view (recent baseline 1996–2025).
@@ -128,6 +135,7 @@ STANDARD_DEFAULTS = {
     "meteo_count": METEO_COUNT_ALL,
     "wave_thresh": "Strong",
     "wave_z500_outline": False,
+    "map_wave_level": "Strong",
     "map_layout": LAYOUT_SINGLE_MAP,
     "chart_layout": LAYOUT_SINGLE_CHART,
     "map_compare": COMPARE_EPOCHS,
@@ -224,6 +232,66 @@ TOP10_MIN_PCT = 0.5
 TOP10_GRID_VERSION = 5  # bump when country-filter or top10 mask rules change (invalidates st.cache_data)
 TOP10_MASK_VERSION = 1
 
+# Kyselý wave intensity (K·days accumulated excess over the main threshold).
+# Single source of truth for BOTH the Point Wavogram ridge colour ramp
+# (frontend_wavogram.py) and the Map Tracker "Wave tracking" colorbar
+# (frontend_maps.py): values at/above the cap saturate to the full warm/
+# cold colour; hover always shows the true, uncapped number.
+WAVE_INTENSITY_CAP_TX = 100.0    # heat (TX), K·days
+WAVE_INTENSITY_CAP_TN = 200.0    # cold (TN), K·days
+
+# --- Wave tracking (Map Tracker spatial Kyselý view) ---
+# Precomputed daily wave-status raster: analog to the anomaly/climatology
+# stores, NOT era5_master_time_series.zarr (that Zarr is chunked for point
+# reads -- time=-1, lat/lon 10x10 tiles -- useless for a Europe-wide map).
+# Built/incrementally updated by batch_precompute_waves.py.
+WAVE_STATUS_DIR = DATA_ROOT / "Wave_Status"
+WAVE_STATUS_ZARR = WAVE_STATUS_DIR / "wave_status.zarr"
+
+# Map-optimal chunking: one (epoch, calendar day) slice is one chunk, so a
+# map load touches exactly one chunk per data variable -- same order of
+# magnitude as the Daily snapshot's own single-DOY climatology read.
+WAVE_MAP_CHUNKS = {"epoch": 1, "valid_time": 1, "latitude": -1, "longitude": -1}
+
+# Wave view's own Analysis / threshold control: Strong | Extreme only (no
+# Moderate, no All-Time Record -- Kyselý has no such tiers).
+MAP_WAVE_LEVELS = ("Strong", "Extreme")
+MAP_WAVE_VARS = ("TX", "TN", "TG", "T850")          # Expert; Standard locks TX (heat) / TN (cold)
+MAP_WAVE_DIRECTIONS = ("heat", "cold")
+
+
+def wave_map_var_key(var_code: str) -> str:
+    """Map-var code (TX/TN/TG/T850) -> on-disk variable key (tx/tn/tg/t850)."""
+    return str(var_code).lower()
+
+
+def wave_map_direction(is_warm: bool) -> str:
+    return "heat" if is_warm else "cold"
+
+
+def wave_map_tier(level: str) -> str:
+    return "extreme" if "Extreme" in str(level) else "strong"
+
+
+def wave_map_field(var_code: str, is_warm: bool, level: str, *, kind: str = "int") -> str:
+    """Data-variable name inside WAVE_STATUS_ZARR, e.g. 'tx_heat_strong_int'
+    (running Kyselý intensity-to-date, K·days, 0 = not in a wave) or
+    'tx_heat_strong_dur' (packed int16 duration-to-date, days elapsed in
+    the current wave through that map date, 0 = not in a wave)."""
+    return f"{wave_map_var_key(var_code)}_{wave_map_direction(is_warm)}_{wave_map_tier(level)}_{kind}"
+
+
+def wave_intensity_cap(is_warm: bool) -> float:
+    """Same cap used by the Wavogram ridge colour and the Wave map colorbar."""
+    return WAVE_INTENSITY_CAP_TX if is_warm else WAVE_INTENSITY_CAP_TN
+
+
+def wave_locked_var_code(is_warm: bool) -> str:
+    """Standard mode's locked Map Tracker Wave variable: TX for heat, TN for
+    cold (Expert may instead pick any of MAP_WAVE_VARS via the normal
+    Mapped Variable radio)."""
+    return "TX" if is_warm else "TN"
+
 
 def is_expert_mode() -> bool:
     return st.session_state.get("ui_mode") == UI_MODE_EXPERT
@@ -243,4 +311,16 @@ def show_expert(feature: str) -> bool:
 
 
 def is_daily_map_view(view_mode: str) -> bool:
-    return view_mode != MAP_VIEW_PERSISTENCE
+    """True only for the Daily snapshot (DOY percentile) view.
+
+    Was previously `view_mode != MAP_VIEW_PERSISTENCE`, which silently
+    treated any future third view as Daily. Wave tracking is its own
+    view — never Daily's percentile mask / spell hatching / footprint —
+    so this must be an explicit equality, not "not Persistence".
+    """
+    return view_mode == MAP_VIEW_DAILY
+
+
+def is_wave_map_view(view_mode: str) -> bool:
+    """True only for the Wave tracking (Kyselý intensity-to-date) view."""
+    return view_mode == MAP_VIEW_WAVES

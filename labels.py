@@ -94,7 +94,31 @@ HELP: dict[str, str] = {
     "map_view_mode": (
         "Daily snapshot colours each grid cell by how unusual that day is. "
         "Persistence duration shows how many consecutive days an extreme has lasted "
-        "(unbroken run back from the map date, up to 100 days)."
+        "(unbroken run back from the map date, up to 100 days). "
+        "Wave tracking shows which cells are currently inside a Kyselý heatwave/"
+        "coldwave (a different, stricter definition than the daily percentile map — "
+        "see the Point Wavogram)."
+    ),
+    "map_wave_direction": (
+        "Heatwaves or coldwaves. Defaults to the season (heat 16 Apr–15 Oct, cold "
+        "otherwise) but stays on your choice once changed."
+    ),
+    "map_wave_level": (
+        "Strong (P90 trigger / P75 drop for heat, P10/P25 for cold) or Extreme "
+        "(P95/P90 heat, P5/P10 cold). These are two separate Kyselý detections, "
+        "not nested tiers — a cell can be Strong without being Extreme, or vice versa "
+        "at the moment it breaks out."
+    ),
+    "map_wave_colorbar": (
+        "Kyselý intensity accumulated from the wave's start day through the map date "
+        "(sum of the daily excess over the main threshold, only on days still inside "
+        "the wave) — not the event's final total painted on every day. "
+        "Uncoloured cells are not currently inside a wave of this direction/level."
+    ),
+    "europe_share_table_wave": (
+        "Area-weighted share of Europe currently inside a Kyselý wave of the selected "
+        "direction, for Strong and Extreme independently — Extreme is a separate "
+        "detection, not a subset of Strong, so the two percentages do not nest."
     ),
     "map_analysis_level": (
         "How rare a value must be before it counts in the Europe-wide assessment, the country "

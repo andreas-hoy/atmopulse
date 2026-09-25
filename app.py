@@ -47,8 +47,10 @@ from config import (
     UI_MODE_LABELS,
     FORECAST_MODEL_IFS,
     FORECAST_MODEL_OPTIONS,
-    MAP_VIEW_DAILY,
-    MAP_VIEW_PERSISTENCE,
+    MAP_VIEW_WAVES,
+    MAP_VIEW_OPTIONS_STANDARD,
+    MAP_VIEW_OPTIONS_EXPERT,
+    MAP_WAVE_LEVELS,
     LAYOUT_SINGLE_CHART,
     LAYOUT_SIDE_BY_SIDE,
     AIFS_TXTN_WARNING,
@@ -76,6 +78,8 @@ from config import (
     selected_forecast_model,
     show_expert,
     is_daily_map_view,
+    is_wave_map_view,
+    wave_locked_var_code,
     epoch_period_label,
     epoch_short_label,
     epoch_from_label,
@@ -192,14 +196,18 @@ def _on_map_date_mode_change():
     st.session_state["_active_map_archive_date"] = picked
 
 
-def _open_wave_event_on_map(start_date):
+def _open_wave_event_on_map(start_date, *, is_warm=None, parameter=None, threshold_level=None, event_id=None):
     """Callback for the per-event 'Map this event' button: point the Map
-    Tracker at this wave's start day (ERA5 Archive), pre-select the
-    Meteogram's Archive Year to match if that calendar year is in the
-    Archive Year list (complete years plus the in-progress current year;
-    else leave the Meteogram on Live), and jump
-    the top nav to Map Tracker. Never touches offset_slider — this is a
-    one-way "open on map" action, not a general Map<->Meteogram coupling.
+    Tracker at this wave's start day (ERA5 Archive) on the Wave tracking
+    view — same is_warm/variable/Strong-Extreme/event_id as the Wavogram
+    event, so the map always lands on the SAME event, never on Daily
+    snapshot or Persistence duration (LOCKED PRODUCT DECISIONS: "Map this
+    event" ... "does NOT open Daily/Persistence/Point Meteogram"). Also
+    pre-selects the Meteogram's Archive Year to match if that calendar
+    year is in the Archive Year list (complete years plus the in-progress
+    current year; else leave the Meteogram on Live), and jumps the top nav
+    to Map Tracker. Never touches offset_slider — this is a one-way "open
+    on map" action, not a general Map<->Meteogram coupling.
 
     No explicit st.rerun() here: Streamlit always reruns the script once
     after any on_click callback finishes, so calling st.rerun() inside it
@@ -223,6 +231,28 @@ def _open_wave_event_on_map(start_date):
     st.session_state.pending_met_archive_year = (
         str(start_ts.year) if start_ts.year in archive_years else "Live"
     )
+
+    # Retarget the Map Tracker itself: Wave tracking view, matching
+    # direction/level, and (Expert only) matching variable — Standard mode
+    # locks TX/TN to the direction anyway via wave_locked_var_code().
+    # These are all plain widget keys created with key= below, so writing
+    # them here before the sidebar widgets are (re)built is the documented
+    # Streamlit pattern for programmatically setting a widget's value.
+    st.session_state["map_view_mode"] = MAP_VIEW_WAVES
+    if is_warm is not None:
+        st.session_state["map_wave_direction"] = "Heat" if is_warm else "Cold"
+    if threshold_level:
+        st.session_state["map_wave_level"] = "Extreme" if "Extreme" in threshold_level else "Strong"
+    if parameter:
+        matching = next(
+            (opt for opt in MAP_VAR_OPTIONS if f"({parameter})" in opt), None,
+        )
+        if matching:
+            st.session_state["map_var_radio"] = matching
+    # Non-widget key: not consumed by any rendering yet, but kept for a
+    # future "highlight this specific event" affordance without needing
+    # another retarget-signature change.
+    st.session_state["map_wave_event_id"] = event_id
 
     st.session_state.atmopulse_top_nav = NAV_MAP
 
@@ -429,6 +459,12 @@ def _render_wave_drilldown(payload_a, payload_b, stack_metric, ctx_key, click_ev
                                 help=HELP["wave_open_map"],
                                 on_click=_open_wave_event_on_map,
                                 args=(w["start_date"],),
+                                kwargs=dict(
+                                    is_warm=payload_b.get("is_warm"),
+                                    parameter=payload_b.get("parameter"),
+                                    threshold_level=payload_b.get("threshold_level"),
+                                    event_id=w["event_id"],
+                                ),
                             )
                     else:
                         st.button(
@@ -437,6 +473,12 @@ def _render_wave_drilldown(payload_a, payload_b, stack_metric, ctx_key, click_ev
                             help=HELP["wave_open_map"],
                             on_click=_open_wave_event_on_map,
                             args=(w["start_date"],),
+                            kwargs=dict(
+                                is_warm=payload_b.get("is_warm"),
+                                parameter=payload_b.get("parameter"),
+                                threshold_level=payload_b.get("threshold_level"),
+                                event_id=w["event_id"],
+                            ),
                         )
                 else:
                     with st.container(key=f"wave_event_foot_{w['event_id']}"):
@@ -447,6 +489,12 @@ def _render_wave_drilldown(payload_a, payload_b, stack_metric, ctx_key, click_ev
                             help=HELP["wave_open_map"],
                             on_click=_open_wave_event_on_map,
                             args=(w["start_date"],),
+                            kwargs=dict(
+                                is_warm=payload_b.get("is_warm"),
+                                parameter=payload_b.get("parameter"),
+                                threshold_level=payload_b.get("threshold_level"),
+                                event_id=w["event_id"],
+                            ),
                         )
     _wave_section_spacer()
 
@@ -910,28 +958,57 @@ with st.sidebar:
         toggles = {}
         
         if nav_selection == NAV_MAP:
+            # View is chosen BEFORE the Mapped Variable / Analysis Level
+            # controls below: Wave tracking locks TX/TN to the direction in
+            # Standard mode and uses its own Strong/Extreme-only level, so
+            # both need to know the view first. Shown in BOTH audience
+            # modes now (Standard: Daily | Wave; Expert adds Persistence)
+            # — LOCKED PRODUCT DECISIONS: "View placement".
+            st.markdown("---")
+            view_mode = st.radio(
+                "**Map view:**",
+                MAP_VIEW_OPTIONS_EXPERT if show_expert("persistence_view") else MAP_VIEW_OPTIONS_STANDARD,
+                key="map_view_mode",
+                help=HELP["map_view_mode"],
+            )
+
+            wave_is_warm = is_warm_season
+            wave_level = STANDARD_DEFAULTS["map_wave_level"]
+            if is_wave_map_view(view_mode):
+                st.markdown("---")
+                st.markdown("**Wave Direction**", help=HELP["map_wave_direction"])
+                if "map_wave_direction" not in st.session_state:
+                    st.session_state.map_wave_direction = "Heat" if is_warm_season else "Cold"
+                wave_direction = st.radio(
+                    "Wave direction", ("Heat", "Cold"),
+                    horizontal=True, key="map_wave_direction", label_visibility="collapsed",
+                )
+                wave_is_warm = wave_direction == "Heat"
+                st.markdown("**Wave Level**", help=HELP["map_wave_level"])
+                wave_level = st.radio(
+                    "Wave level", MAP_WAVE_LEVELS,
+                    horizontal=True, key="map_wave_level", label_visibility="collapsed",
+                )
+
             if show_expert("map_tx_tn"):
                 st.markdown("---")
                 map_var = st.radio(
                     "**Mapped Variable:**",
                     MAP_VAR_OPTIONS,
                     index=0,
+                    key="map_var_radio",
                     help=HELP["map_variable"],
                 )
+                map_var_code = map_var.split('(')[1].strip(')')
+            elif is_wave_map_view(view_mode):
+                # Standard + Wave tracking: TX(heat)/TN(cold) locked, per
+                # LOCKED PRODUCT DECISIONS — never the general TG default.
+                map_var_code = wave_locked_var_code(wave_is_warm)
             else:
                 map_var = STANDARD_DEFAULTS["map_var"]
-            map_var_code = map_var.split('(')[1].strip(')')
-            
+                map_var_code = map_var.split('(')[1].strip(')')
+
             persist_metric = STANDARD_DEFAULTS["persist_metric"]
-            if show_expert("persistence_view"):
-                st.markdown("---")
-                view_mode = st.radio(
-                    "**Map view:**",
-                    (MAP_VIEW_DAILY, MAP_VIEW_PERSISTENCE),
-                    help=HELP["map_view_mode"],
-                )
-            else:
-                view_mode = STANDARD_DEFAULTS["map_view"]
             if show_expert("map_analysis_level"):
                 st.markdown("---")
                 top10_threshold = st.radio(
@@ -1149,6 +1226,8 @@ if nav_selection == NAV_WELCOME:
     In the **Point Wavogram** tab, {atmopulse_wordmark_html()} uses a sophisticated definition (adapted from Kyselý) to track heatwaves and coldwaves:
     * **Heatwaves:** Detected year-round. Triggered when the daily maximum temperature (TX) exceeds the local summer (June–August) threshold for at least 3 consecutive days. The ridge focuses on May–September and widens if an event falls outside those months.
     * **Coldwaves:** Detected from 1 July to 30 June. Triggered when the daily minimum temperature (TN) falls below the local winter (December–February) threshold for at least 3 consecutive days. The ridge focuses on November–March and widens if an event falls outside those months.
+
+    The **Map Tracker** tab's **Wave tracking** view applies this exact same Kyselý definition spatially — every grid cell across Europe, not just one point — so you can see where an active heatwave or coldwave currently covers the continent, and how intensely (accumulated excess-temperature "K·days") each cell has been inside it. **Strong** and **Extreme** are independent detections there (different threshold pairs), not nested severity tiers of one event.
     """, unsafe_allow_html=True)
     
     img_col1, img_col2 = st.columns(2)
@@ -1170,6 +1249,7 @@ elif nav_selection == NAV_MAP:
         map_var_code, view_mode, persist_metric, top10_threshold, toggles, target_date, default_date,
         map_is_archive=map_is_archive,
         map_anchor_date=(target_date if map_is_archive else default_date),
+        wave_is_warm=wave_is_warm, wave_level=wave_level,
     )
 
 elif nav_selection in (NAV_METEO, NAV_WAVE):
@@ -1273,6 +1353,15 @@ elif nav_selection in (NAV_METEO, NAV_WAVE):
             location = None
 
     if location:
+        # Non-widget keys, persisted across nav changes so the Map Tracker's
+        # own location marker can draw a small circle+name once a location
+        # has actually been chosen — never a hardcoded fallback point
+        # (LOCKED PRODUCT DECISIONS: "no marker until location actually
+        # chosen (no Berlin 52.52,13.40 fallback)").
+        st.session_state["map_marker_lat"] = lat_target
+        st.session_state["map_marker_lon"] = lon_target
+        st.session_state["map_marker_name"] = location.address
+
         render_grid_cell_profile(location.address, lat_target, lon_target)
         if nav_selection == NAV_METEO:
             render_meteogram(

@@ -563,6 +563,162 @@ def _detect_kysely_waves(df_season: pd.DataFrame, group_key: str, p_thresh: floa
     return waves_data
 
 
+def detect_kysely_waves_grid(
+    temps: np.ndarray, p_thresh: np.ndarray, p_drop: np.ndarray, is_warm: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Grid-vectorized twin of `_detect_kysely_waves`, used by
+    batch_precompute_waves.py to build the Map Tracker's "Wave tracking"
+    raster. MUST reproduce the same >=3-day trigger / running-mean
+    continuation / single-day-drop-or-mean-crossing break semantics as the
+    point loop above, cell-by-cell, but without a per-cell Python loop:
+    one Python loop over ~`temps.shape[0]` days, every step inside it a
+    full-grid numpy vector op over all (lat, lon) cells at once.
+
+    Parameters
+    ----------
+    temps : (n_days, nlat, nlon) float array for ONE season-year window,
+        already reindexed onto the full season date range (see
+        `_wave_season_origin`/`_wave_season_end`); NaN = missing ERA5 day.
+        Calendar day order, 29 Feb included (matches the point series —
+        only the seasonal P-threshold *baseline* excises it, never the
+        detection series itself).
+    p_thresh, p_drop : (nlat, nlon) threshold fields for this epoch/level
+        (JJA P90/P75 or P95/P90 for heat; DJF P10/P25 or P5/P10 for cold).
+    is_warm : True for heatwaves (>=), False for coldwaves (<=).
+
+    Returns
+    -------
+    (intensity_to_date, duration_to_date) : both (n_days, nlat, nlon).
+    `intensity_to_date` is the running Kyselý K·days excess accumulated
+    from the (grid-cell-local) event's start THROUGH that day — the same
+    "sum of |T - p_thresh| on days that still pass p_thresh" formula as
+    the point ridge/stack, not the full-event total painted on every day.
+    Zero on any day not inside a confirmed (>=3-day) wave for that cell —
+    this is also what keeps a live 1-2 day candidate uncoloured (the
+    "Live edge" hindsight rule) with no extra logic.
+    `duration_to_date` (int16) is the matching day-count (1-based) elapsed
+    in that wave through that day; also 0 outside a confirmed wave.
+    """
+    temps = np.asarray(temps, dtype=np.float64)
+    n, nlat, nlon = temps.shape
+    p_thresh = np.broadcast_to(np.asarray(p_thresh, dtype=np.float64), (nlat, nlon))
+    p_drop = np.broadcast_to(np.asarray(p_drop, dtype=np.float64), (nlat, nlon))
+
+    finite = np.isfinite(temps)
+    if is_warm:
+        passes = finite & (temps >= p_thresh[None, :, :])
+        drop_fail = finite & (temps < p_drop[None, :, :])
+    else:
+        passes = finite & (temps <= p_thresh[None, :, :])
+        drop_fail = finite & (temps > p_drop[None, :, :])
+
+    # 3-day-ahead trigger ("all(temps[i:i+3] past p_thresh)" in the point
+    # loop) — fully vectorized, no day loop needed for this part.
+    trigger = np.zeros((n, nlat, nlon), dtype=bool)
+    if n >= 3:
+        trigger[: n - 2] = passes[: n - 2] & passes[1:n - 1] & passes[2:n]
+
+    excess = np.where(passes, np.abs(temps - p_thresh[None, :, :]), 0.0)
+
+    in_event = np.zeros((nlat, nlon), dtype=bool)
+    cand_count = np.zeros((nlat, nlon), dtype=np.int64)
+    cand_sum = np.zeros((nlat, nlon), dtype=np.float64)      # for the running mean
+    cum_intensity = np.zeros((nlat, nlon), dtype=np.float64)  # committed excess so far
+
+    out_intensity = np.zeros((n, nlat, nlon), dtype=np.float32)
+    out_duration = np.zeros((n, nlat, nlon), dtype=np.int16)
+
+    for t in range(n):
+        # --- Start a new candidate wherever eligible and not already active ---
+        can_start = (~in_event) & trigger[t]
+        if np.any(can_start):
+            in_event = in_event | can_start
+            cand_count = np.where(can_start, 0, cand_count)
+            cand_sum = np.where(can_start, 0.0, cand_sum)
+            cum_intensity = np.where(can_start, 0.0, cum_intensity)
+
+        if not np.any(in_event):
+            continue
+
+        # A missing ERA5 day ends the event right here WITHOUT including
+        # this day (point loop: `while j < n and not isnan(temps[j])`).
+        nan_break = in_event & ~finite[t]
+        if np.any(nan_break):
+            in_event = in_event & ~nan_break
+            cand_count = np.where(nan_break, 0, cand_count)
+            cand_sum = np.where(nan_break, 0.0, cand_sum)
+            cum_intensity = np.where(nan_break, 0.0, cum_intensity)
+
+        active = in_event
+        if not np.any(active):
+            continue
+
+        # Tentatively extend the candidate with today's value.
+        temp_t = temps[t]
+        new_count = cand_count + 1
+        new_sum = cand_sum + np.where(active, temp_t, 0.0)
+        new_mean = np.full_like(new_sum, np.nan)
+        np.divide(new_sum, new_count, out=new_mean, where=(active & (new_count > 0)))
+
+        mean_break = active & (
+            (new_mean < p_thresh) if is_warm else (new_mean > p_thresh)
+        )
+        today_drop_break = active & drop_fail[t]
+        do_break = active & (mean_break | today_drop_break)
+
+        # Non-breaking cells: commit the extension.
+        keep = active & ~do_break
+        cand_count = np.where(keep, new_count, cand_count)
+        cand_sum = np.where(keep, new_sum, cand_sum)
+        cum_intensity = np.where(keep, cum_intensity + np.where(keep, excess[t], 0.0), cum_intensity)
+
+        # Write today's running value for every committed day, INCLUDING
+        # days 1-2 of a brand-new candidate. This is safe (not a "live 1-2
+        # day candidate" leak) only because `trigger` already required
+        # days t, t+1, t+2 to all pass p_thresh before a candidate could
+        # ever start (`can_start`/`can_restart` above) -- and once all
+        # three of those pass individually, neither break test (mean below
+        # p_thresh, or a single day past the looser p_drop) can fire
+        # during them, since a mean of values all >= p_thresh cannot be
+        # < p_thresh (symmetric argument for cold). So every candidate
+        # that starts is *guaranteed* to reach >=3 committed days before
+        # any break is possible: there is no "started but never
+        # confirmed" case to retroactively zero out. This is also exactly
+        # what the point loop's finalize-time backfill does (writes
+        # cand[0..len-1] once len(cand) >= 3) -- the Wavogram's own ridge
+        # cumulative sum starts from day 1 of the event, not day 3.
+        # The genuine "Live edge" case (an in-progress candidate at the
+        # trailing, still-incomplete edge of the live season) is instead
+        # handled naturally by `trigger` itself: with fewer than 2 future
+        # days available in `temps`, `trigger` cannot be True there, so
+        # no candidate ever starts in the final two rows of the season
+        # window without season data confirming it first.
+        out_intensity[t] = np.where(keep, cum_intensity, 0.0).astype(np.float32)
+        out_duration[t] = np.where(keep, cand_count, 0).astype(np.int16)
+
+        # Breaking cells: pop today's day, reset. The point loop's `i = j`
+        # (no increment on break) lets the SAME breaking day immediately
+        # start a fresh candidate if it (and the next two days) still
+        # trigger — reproduce that same-day re-trigger here.
+        if np.any(do_break):
+            in_event = in_event & ~do_break
+            cand_count = np.where(do_break, 0, cand_count)
+            cand_sum = np.where(do_break, 0.0, cand_sum)
+            cum_intensity = np.where(do_break, 0.0, cum_intensity)
+
+            can_restart = do_break & trigger[t]
+            if np.any(can_restart):
+                in_event = in_event | can_restart
+                cand_count = np.where(can_restart, 1, cand_count)
+                cand_sum = np.where(can_restart, temp_t, cand_sum)
+                cum_intensity = np.where(can_restart, excess[t], cum_intensity)
+                # Restarted cells sit at count==1 today (< 3) -> today's
+                # own out_intensity/out_duration correctly stay 0.
+
+    return out_intensity, out_duration
+
+
 def _attach_wave_z500_anomalies(waves_data: list[dict], lat, lon, suffix: str) -> pd.Series | None:
     """Mean Z500 anomaly (dam) over each wave window vs that epoch's DOY mean.
 

@@ -27,6 +27,7 @@ from config import (
     COMPARE_DATES,
     AIFS_TXTN_WARNING,
     FORECAST_MODEL_IFS,
+    MAP_VIEW_PERSISTENCE,
     PERSISTENCE_LOOKBACK_PAD,
     PERSISTENCE_MAX_DAYS,
     TOP10_GRID_VERSION,
@@ -35,9 +36,18 @@ from config import (
     is_aifs_model,
     selected_forecast_model,
     is_daily_map_view,
+    is_wave_map_view,
     STANDARD_DEFAULTS,
 )
-from backend_analytics import compute_map_footprint, calculate_top10
+from backend_analytics import (
+    calculate_top10,
+    calculate_wave_top10,
+    compute_map_footprint,
+    compute_map_wave_footprint,
+    open_wave_status_store,
+    wave_intensity_grid,
+    wave_status_store_mtime,
+)
 from frontend_plots import (
     _MAP_OVERLAY_TOGGLES,
     _MSLP_HL_VERSION,
@@ -369,6 +379,38 @@ def _render_dates_footprint_banner(
         )
 
 
+def _wave_europe_clause(is_warm: bool, footprint: dict) -> str:
+    """Strong% and Extreme% INDEPENDENTLY (never nested/cumulative like the
+    Daily snapshot's tiers — Extreme is a separate Kyselý detection, not a
+    subset of Strong)."""
+    direction = "warm" if is_warm else "cold"
+    noun = "heatwave" if is_warm else "coldwave"
+    parts = []
+    for pct_key, tier, tier_label in (
+        ("strong_pct", "strong", "Strong (P90/10)" if is_warm else "Strong (P10/25)"),
+        ("extreme_pct", "extreme", "Extreme (P95/90)" if is_warm else "Extreme (P5/10)"),
+    ):
+        pct = footprint.get(pct_key)
+        if pct is None:
+            continue
+        text = f"{pct:.1f}% of Europe is inside a {tier_label} Kyselý {noun}"
+        parts.append(_phrase_chip(direction, tier, text))
+    return " and ".join(parts) if parts else f"no {noun} data available for this date"
+
+
+def _wave_footprint_banner(footprint: dict, is_warm: bool, baseline_label: str, day=None) -> str:
+    colder = baseline_label.startswith("1961")
+    lead = (
+        f"Against the colder historical reference period ({html.escape(baseline_label)})"
+        if colder
+        else f"Against the warmer recent reference period ({html.escape(baseline_label)})"
+    )
+    if day is not None:
+        stamp = pd.Timestamp(day).strftime("%d.%m.%Y")
+        lead = f"{lead}, on {html.escape(stamp)}"
+    return _banner_wrap(f"{lead}, {_wave_europe_clause(is_warm, footprint)}.")
+
+
 def _shift_map_compare_date(days: int) -> None:
     current = st.session_state.get("map_compare_date")
     if current is None:
@@ -647,13 +689,18 @@ def _render_expert_severity(
 
 def render_map_tracker(
     map_var_code, view_mode, persist_metric, top10_threshold, toggles, target_date, default_date,
-    map_is_archive=False, map_anchor_date=None,
+    map_is_archive=False, map_anchor_date=None, wave_is_warm=True, wave_level="Strong",
 ):
     ref_clim = load_reference_climatology()
     if ref_clim is None:
         st.error("Reference Climatology missing or corrupted! Please rebuild.")
         st.stop()
     syn_clim = load_synoptic_climatology()
+    wave_ds = open_wave_status_store() if is_wave_map_view(view_mode) else None
+    wave_mtime = wave_status_store_mtime()
+    marker_lat = st.session_state.get("map_marker_lat")
+    marker_lon = st.session_state.get("map_marker_lon")
+    marker_name = st.session_state.get("map_marker_name")
 
     # Archive Date (map_is_archive=True): anchor is the archive day itself
     # (short existing pad_past/pad_future window around it, not the live
@@ -792,7 +839,7 @@ def render_map_tracker(
             arch_label if st.session_state.get("_map_show_side") == "right" else live_label
         )
 
-    if not is_daily_map_view(view_mode):
+    if view_mode == MAP_VIEW_PERSISTENCE:
         _, pers_meta = _load_persistence_daily_series(
             (target_date - pd.Timedelta(days=PERSISTENCE_MAX_DAYS + PERSISTENCE_LOOKBACK_PAD)).strftime('%Y-%m-%d'),
             target_date.strftime('%Y-%m-%d'),
@@ -836,6 +883,16 @@ def render_map_tracker(
         st.markdown("<div class='atmopulse-map-table-gap'></div>", unsafe_allow_html=True)
         if period_label:
             st.markdown(f"**{period_label}**")
+        if df_c is None:
+            # Wave tracking: ONE table for the active direction only (LOCKED
+            # PRODUCT DECISIONS: "One table for active direction"), not a
+            # warm+cold pair like the Daily snapshot / Persistence views.
+            wcol, _rest = st.columns(2, gap="medium")
+            with wcol:
+                label = "Warm" if wave_is_warm else "Cold"
+                col = "Warm Impact (%)" if wave_is_warm else "Cold Impact (%)"
+                _render_impact_table(label, df_h, col)
+            return
         wcol, ccol = st.columns(2, gap="medium")
         with wcol:
             _render_impact_table("Warm", df_h, "Warm Impact (%)")
@@ -1016,6 +1073,73 @@ def render_map_tracker(
                                 footprint_b, active_tier, EPOCH_LABELS["B"],
                             )
 
+            elif is_wave_map_view(view_mode):
+                def _wfp(phys, date_str, epoch, anchor_str, mtime):
+                    return compute_map_wave_footprint(
+                        wave_ds, phys, date_str, wave_is_warm,
+                        epoch, map_var_code, source_mtime=wave_mtime,
+                    )
+
+                if map_layout == LAYOUT_SINGLE_MAP:
+                    if compare_dates:
+                        use_live = flicker_date_choice == live_label
+                        footprint_single = _wfp(
+                            map_phys_data if use_live else arch_phys,
+                            target_date_str if use_live else arch_date_str,
+                            date_epoch,
+                            anchor_date_str if use_live else arch_anchor_str,
+                            source_mtime if use_live else arch_mtime,
+                        )
+                        if footprint_single:
+                            banner_html = _wave_footprint_banner(
+                                footprint_single, wave_is_warm, EPOCH_LABELS[date_epoch],
+                            )
+                    else:
+                        active_epoch = epoch_from_label(flicker_epoch)
+                        footprint_single = _wfp(
+                            map_phys_data, target_date_str, active_epoch,
+                            anchor_date_str, source_mtime,
+                        )
+                        if footprint_single:
+                            banner_html = _wave_footprint_banner(
+                                footprint_single, wave_is_warm, EPOCH_LABELS[active_epoch],
+                            )
+                else:
+                    if compare_dates:
+                        footprint_a = _wfp(
+                            map_phys_data, target_date_str, date_epoch,
+                            anchor_date_str, source_mtime,
+                        )
+                        footprint_b = _wfp(
+                            arch_phys, arch_date_str, date_epoch,
+                            arch_anchor_str, arch_mtime,
+                        )
+                        if footprint_a:
+                            banner_left = _wave_footprint_banner(
+                                footprint_a, wave_is_warm, EPOCH_LABELS[date_epoch], target_date,
+                            )
+                        if footprint_b:
+                            banner_right = _wave_footprint_banner(
+                                footprint_b, wave_is_warm, EPOCH_LABELS[date_epoch], compare_date,
+                            )
+                    else:
+                        footprint_a = _wfp(
+                            map_phys_data, target_date_str, "A",
+                            anchor_date_str, source_mtime,
+                        )
+                        footprint_b = _wfp(
+                            map_phys_data, target_date_str, "B",
+                            anchor_date_str, source_mtime,
+                        )
+                        if footprint_a:
+                            banner_left = _wave_footprint_banner(
+                                footprint_a, wave_is_warm, EPOCH_LABELS["A"],
+                            )
+                        if footprint_b:
+                            banner_right = _wave_footprint_banner(
+                                footprint_b, wave_is_warm, EPOCH_LABELS["B"],
+                            )
+
             overlay_names = frozenset(
                 name for name, active in toggles.items()
                 if name in _MAP_OVERLAY_TOGGLES and active
@@ -1025,6 +1149,12 @@ def render_map_tracker(
             spell_days = int(toggles.get("spell_days", 6))
 
             def _cached_map_for(date_str, epoch, mtime, model, phys, anchor_str, full_width=False):
+                wave_arr = None
+                if is_wave_map_view(view_mode):
+                    wave_arr = wave_intensity_grid(
+                        wave_ds, phys, date_str, wave_is_warm, wave_level,
+                        epoch, map_var_code, source_mtime=wave_mtime,
+                    )
                 return get_cached_baseline_map(
                     date_str, epoch, map_var_code, view_mode,
                     persist_metric, top10_threshold,
@@ -1034,8 +1164,10 @@ def render_map_tracker(
                     spell_days=spell_days,
                     hl_version=_MSLP_HL_VERSION,
                     mslp_span_version=4,
+                    wave_is_warm=wave_is_warm, wave_level=wave_level, wave_store_mtime=wave_mtime,
+                    marker_lat=marker_lat, marker_lon=marker_lon, marker_name=marker_name,
                     _ref_data=ref_clim, _map_phys_data=phys,
-                    _syn_clim=syn_clim,
+                    _syn_clim=syn_clim, _wave_intensity=wave_arr,
                 )
 
             def _title_for(panel, when):
@@ -1044,6 +1176,15 @@ def render_map_tracker(
                 )
 
             def _top10(phys, date, epoch, anchor, mtime):
+                if is_wave_map_view(view_mode):
+                    date_str = pd.Timestamp(date).strftime("%Y-%m-%d")
+                    df = calculate_wave_top10(
+                        wave_ds, phys, date_str, wave_is_warm, wave_level,
+                        epoch, map_var_code,
+                        _get_country_weight_grid=get_country_weight_grid,
+                        source_mtime=wave_mtime,
+                    )
+                    return df, None  # render_top10_period reads df_c=None as "one table"
                 return calculate_top10(
                     ref_clim, phys, date,
                     st.session_state.toggles_warm, st.session_state.toggles_cold,

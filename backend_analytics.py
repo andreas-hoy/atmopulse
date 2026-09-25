@@ -20,10 +20,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+import xarray as xr
 
 from backend_maps import _synoptic_array, etccdi_doy_365
 from backend_narrative import spatial_extreme_footprint
-from config import DATA_ROOT, TOP10_MASK_VERSION, TOP10_MIN_PCT, is_daily_map_view, selected_forecast_model
+from config import (
+    DATA_ROOT, TOP10_MASK_VERSION, TOP10_MIN_PCT, WAVE_STATUS_ZARR, is_daily_map_view,
+    selected_forecast_model, wave_map_field,
+)
 
 # --- Pre-computed Analytics (batch_precompute_analytics.py) ---
 PRECOMPUTED_ANALYTICS_DIR: Path = DATA_ROOT / "Precomputed_Analytics"
@@ -473,3 +477,193 @@ def calculate_top10(
         baseline_type=baseline_type, map_var=map_var, anchor_date=anchor_date, _mask_version=_mask_version,
         _get_persistence_arrays=_get_persistence_arrays, _get_country_weight_grid=_get_country_weight_grid,
     )
+
+
+# ---------------------------------------------------------------------------
+# WAVE TRACKING (Map Tracker spatial Kyselý view) — reads the archive raster
+# written by batch_precompute_waves.py. Mirrors the Daily-snapshot footprint
+# / Top-10 patterns above, but:
+#   - Strong and Extreme are reported INDEPENDENTLY (never nested/cumulative
+#     like the Daily snapshot's Moderate<Strong<Extreme<Record tiers) —
+#     LOCKED PRODUCT DECISIONS: "Share of Europe reports BOTH Strong% and
+#     Extreme% independently".
+#   - Top-10 is ONE table for the currently-active direction (heat XOR
+#     cold) — "One table for active direction", not warm+cold side by side.
+#   - There is deliberately no Parquet fast-path here (v1 doesn't need one,
+#     per PRECOMPUTE: "No parquet required for v1") — the archive read
+#     itself is already a single cheap 2D slice off a map-optimal Zarr
+#     chunk (chunks: valid_time=1, latitude=-1, longitude=-1).
+#   - Dates outside the precomputed archive window (future/live-edge dates)
+#     return None / an empty DataFrame rather than raising — on-the-fly
+#     live-edge computation (current season only, merged like the IFS
+#     overlay) is a follow-up UI-phase task, not part of this backend pass.
+# ---------------------------------------------------------------------------
+
+def wave_status_store_mtime() -> float:
+    """Freshness token for `open_wave_status_store()`'s `st.cache_resource`,
+    same role as the `source_mtime` args threaded through the Daily-snapshot
+    functions above: bumps whenever `batch_precompute_waves.py` rewrites the
+    store (full run or incremental append), so a stale cached Dataset handle
+    (whose dims/coords were fixed at open time) is transparently reopened
+    instead of silently missing newly-written dates."""
+    try:
+        return WAVE_STATUS_ZARR.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+@st.cache_resource(show_spinner=False)
+def _open_wave_status_zarr(mtime: float = 0.0):
+    """`mtime` is intentionally the (only) hashed cache-key arg — see
+    `wave_status_store_mtime()` — so this is NOT a `_`-prefixed param."""
+    if not WAVE_STATUS_ZARR.exists():
+        return None
+    try:
+        return xr.open_zarr(WAVE_STATUS_ZARR, consolidated=True)
+    except Exception:
+        return None
+
+
+def open_wave_status_store():
+    """Public entry point: cached handle to the Wave_Status Zarr store,
+    auto-reopened whenever its mtime changes. Returns None if
+    `batch_precompute_waves.py` has never been run."""
+    return _open_wave_status_zarr(wave_status_store_mtime())
+
+
+def _wave_field_slice(_wave_ds, var_code, is_warm, level, baseline_type, target_date_str, lons, lats):
+    """2D (lat, lon) intensity-to-date array for one (var, direction, level,
+    epoch) on one date, reindexed onto the caller's map grid. None when the
+    store is missing, the field doesn't exist yet (e.g. TG/T850 not built),
+    the epoch is absent, or `target_date_str` falls outside the archive's
+    covered `valid_time` range (future / live-edge dates)."""
+    if _wave_ds is None:
+        return None
+    field = wave_map_field(var_code, is_warm, level, kind="int")
+    if field not in _wave_ds.data_vars:
+        return None
+    epoch = baseline_type if baseline_type in ("A", "B") else "B"
+    da = _wave_ds[field]
+    if "epoch" in da.dims:
+        if epoch not in da["epoch"].values:
+            return None
+        da = da.sel(epoch=epoch)
+    target = pd.Timestamp(target_date_str).normalize()
+    vt = da["valid_time"]
+    if target < pd.Timestamp(vt.min().values) or target > pd.Timestamp(vt.max().values):
+        return None
+    try:
+        day = da.sel(valid_time=target)
+    except KeyError:
+        return None
+    if lons is not None and lats is not None:
+        day = day.reindex(latitude=np.asarray(lats), longitude=np.asarray(lons), method="nearest")
+    return np.asarray(day.values, dtype=np.float64)
+
+
+@st.cache_data(show_spinner=False)
+def wave_intensity_grid(
+    _wave_ds, _map_phys_data, target_date_str, is_warm, level, baseline_type="B", map_var="TX", source_mtime=0.0,
+):
+    """
+    Public entry point: the exact same 2D intensity-to-date raster used
+    internally by `compute_map_wave_footprint`/`calculate_wave_top10`, for
+    the Map Tracker's own "Wave tracking" heatmap layer (`frontend_maps.
+    _add_wave_heatmap`) — guaranteeing the coloured cells and the reported
+    Share-of-Europe/Top-10 numbers are always built from the identical
+    mask. None when the store/grid/date isn't available (see
+    `_wave_field_slice`).
+    """
+    if _wave_ds is None or _map_phys_data is None:
+        return None
+    lons, lats = _synoptic_lonlat(_map_phys_data)
+    if lons is None or lats is None:
+        return None
+    return _wave_field_slice(_wave_ds, map_var, is_warm, level, baseline_type, target_date_str, lons, lats)
+
+
+@st.cache_data(show_spinner=False)
+def compute_map_wave_footprint(
+    _wave_ds, _map_phys_data, target_date_str, is_warm, baseline_type="B", map_var="TX", source_mtime=0.0,
+):
+    """
+    Area-weighted (cos(lat)) % of the European domain currently inside a
+    Kyselý wave of direction `is_warm`, for Strong and Extreme
+    INDEPENDENTLY (both always computed together — there is no toggle here,
+    unlike the Daily snapshot's per-tier `t_warm`/`t_cold` dicts, because
+    Strong/Extreme are separate detections, not nested severities).
+
+    Returns {"strong_pct": float | None, "extreme_pct": float | None}, with
+    a level's value `None` when that specific field isn't in the archive
+    yet (e.g. TG/T850 not built) or the whole dict `None` when neither
+    level nor the domain grid is available at all (missing store, missing
+    `_map_phys_data`, or `target_date_str` outside the precomputed window).
+    """
+    if _wave_ds is None or _map_phys_data is None:
+        return None
+    lons, lats = _synoptic_lonlat(_map_phys_data)
+    if lons is None or lats is None:
+        return None
+    lat2d = np.meshgrid(lons, lats)[1]
+    weights = np.cos(np.deg2rad(lat2d))
+
+    out: dict = {}
+    any_found = False
+    for level, key in (("Strong", "strong_pct"), ("Extreme", "extreme_pct")):
+        arr = _wave_field_slice(_wave_ds, map_var, is_warm, level, baseline_type, target_date_str, lons, lats)
+        if arr is None:
+            out[key] = None
+            continue
+        any_found = True
+        domain = np.isfinite(arr)
+        in_wave = domain & (arr > 0)
+        total_w = float(np.sum(weights, where=domain)) if domain.any() else 0.0
+        out[key] = 100.0 * float(np.sum(weights, where=in_wave)) / total_w if total_w > 0 else 0.0
+    return out if any_found else None
+
+
+@st.cache_data(show_spinner=False)
+def calculate_wave_top10(
+    _wave_ds, _map_phys_data, target_date_str, is_warm, level, baseline_type="B", map_var="TX",
+    _get_country_weight_grid=None, source_mtime=0.0,
+):
+    """
+    ONE ranked Top-10 table (Country, Impact %) for the currently-active
+    direction/level — "Area% of country cells currently in a wave at
+    selected Strong/Extreme level", same `TOP10_MIN_PCT` exclusion and
+    size-tiebreak ranking convention as `calculate_top10`. Unlike the Daily
+    snapshot's warm+cold pair, waves only ever have one active direction at
+    a time, so there is exactly one table, not two.
+
+    `_get_country_weight_grid` is passed in explicitly by the caller (its
+    owner, `page_map_tracker.py`, would otherwise create a circular import
+    if imported here directly) — same convention as
+    `_calc_calculate_top10_raw`'s `_get_country_weight_grid`.
+
+    Returns an empty DataFrame when the store/grid/weight-grid loader is
+    missing, or `target_date_str` falls outside the archive window.
+    """
+    if _wave_ds is None or _map_phys_data is None or _get_country_weight_grid is None:
+        return pd.DataFrame()
+    lons, lats = _synoptic_lonlat(_map_phys_data)
+    if lons is None or lats is None:
+        return pd.DataFrame()
+    arr = _wave_field_slice(_wave_ds, map_var, is_warm, level, baseline_type, target_date_str, lons, lats)
+    if arr is None:
+        return pd.DataFrame()
+
+    in_wave = np.isfinite(arr) & (arr > 0)
+    weights, sizes = _get_country_weight_grid(tuple(lons), tuple(lats))
+    col = "Warm Impact (%)" if is_warm else "Cold Impact (%)"
+    rows = []
+    for name, w in weights.items():
+        tot = float(w.sum())
+        if tot <= 0:
+            continue
+        pct = float((in_wave * w).sum() / tot * 100)
+        if pct >= TOP10_MIN_PCT:
+            rows.append({"Country": name, col: pct, "_size": sizes[name]})
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).sort_values(by=[col, "_size"], ascending=[False, False]).head(10)
+    return df[["Country", col]].reset_index(drop=True)
